@@ -1,0 +1,113 @@
+[project]
+name = "veloxloop"
+version = "0.1.0"
+description = "A modern, high-performance asyncio event loop implementation written from scratch in Rust"
+authors = [
+    {name = "Dang Van Nghiem",email = "vannghiem848@gmail.com"}
+]
+keywords = ["asyncio", "event-loop", "rust", "pyo3", "async"]
+license = {text = "BSD-3-Clause"}
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+    "Topic :: Internet :: WWW/HTTP :: WSGI :: Server",
+    "Topic :: Internet :: WWW/HTTP :: Dynamic Content",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Framework :: AsyncIO",
+    "Environment :: Web Environment",
+    "Typing :: Typed",
+]
+dependencies = [
+]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<4.0"
+
+[tool.poetry.group.dev]
+optional = true
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.5"
+pytest-codspeed = "^4.0.0"
+pytest-cov = "^7.0.0"
+ruff = "^0.13.0"
+black = "^25.1.0"
+isort = "^6.0.1"
+bandit = "^1.8.0"
+coverage = "^7.6.0"
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+module-name = 'veloxloop._veloxloop'
+bindings = 'pyo3'
+
+ignore_missing_imports = true
+
+[tool.coverage.run]
+source = ["veloxloop"]
+omit = [
+    "*/tests/*",
+    "*/benchmarks/*",
+    "*/__pycache__/*",
+    "*/target/*",
+    "*/build/*",
+    "*/dist/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+  | target
+)/
+'''
+
+[tool.isort]
+profile = "black"
+multi_line_output = 3
+include_trailing_comma = true
+force_grid_wrap = 0
+line_length = 88
+known_first_party = ["veloxloop"]
+

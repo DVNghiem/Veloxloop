@@ -1,0 +1,54 @@
+# Ruff configuration for Project, a backend framework with Python components
+# This file enforces linting and formatting rules for clean, maintainable code
+# Optimized for microservices, CQRS, Event Sourcing, and Saga Pattern
+
+# Global settings
+# Set maximum line length for linting and formatting
+line-length = 88
+
+[lint]
+# Select linting rules to enforce
+select = [
+    "E",   # pycodestyle errors (code style, e.g., spacing, naming)
+    "W",   # pycodestyle warnings (style issues, e.g., trailing whitespace)
+    "F",   # Pyflakes (logical errors, e.g., unused imports, undefined variables)
+    "I",   # isort (automatic import sorting)
+    "B",   # flake8-bugbear (detects bug-prone patterns, e.g., mutable default args)
+    "C4",  # flake8-comprehensions (best practices for list/dict comprehensions)
+    "D",   # pydocstyle (enforces Google-style docstrings for clarity)
+    "UP",  # pyupgrade (ensures modern Python syntax, e.g., f-strings over .format())
+    "PT",  # flake8-pytest-style (pytest conventions for testing)
+    "RUF", # Ruff-specific rules (Project-specific best practices)
+]
+# Ignore rules that conflict or are less relevant for Project
+ignore = [
+    "D203", # Disable conflicting docstring rule (1 blank line before class docstring)
+    "D213", # Disable multi-line docstring summary placement rule
+    "W291", # Ignore trailing whitespace warnings
+    "D212", # Ignore docstring indentation rule (Project uses 4 spaces)
+]
+
+# Per-file ignore rules for specific contexts
+[lint.per-file-ignores]
+# Skip docstring checks in test files to reduce boilerplate
+"tests/**" = ["D"]
+# Skip import sorting in __init__.py for flexibility
+"__init__.py" = ["I001"]
+
+# Formatting settings
+[format]
+# Use single quotes for strings to align with Python community standards
+quote-style = "single"
+# Format inline code in docstrings for better readability
+docstring-code-format = true
+# Set line length for docstring code formatting
+docstring-code-line-length = 88
+# Use 4-space indentation (Ruff's default, no need for indent-width)
+indent-style = "space"
+
+# isort settings for import sorting
+[lint.isort]
+# Group imports by type (standard, third-party, local)
+known-first-party = ["Project"]
+# Sort imports case-sensitively for consistency
+case-sensitive = true

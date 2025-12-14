@@ -1,0 +1,42 @@
+[package]
+name = "veloxloop"
+version = "0.1.0"
+edition = "2024"
+description = "A modern, high-performance asyncio event loop implementation written from scratch in Rust"
+authors = ["Dang Van Nghiem <martin@smartsolution.id.vn>"]
+license = "BSD-3-Clause"
+readme = "README.md"
+keywords = ["asyncio", "event-loop", "rust", "pyo3", "async"]
+
+[lib]
+name = "_veloxloop"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27.2", features = ["extension-module", "generate-import-lib", "experimental-async"] }
+pyo3-async-runtimes = { version = "0.27.0", features = ["tokio-runtime"] }
+mimalloc = { version = "0.1.48", optional = true }
+polling = "3"
+slab = "0.4"
+once_cell = "1.19"
+thiserror = "2.0.17"
+priority-queue = "2.0"
+parking_lot = "0.12"
+
+[target.'cfg(not(any(target_env = "musl", target_os = "freebsd", target_os = "openbsd", target_os = "windows")))'.dependencies]
+tikv-jemallocator = { version = "0.6.1", default-features = false, features = ["disable_initial_exec_tls"] }
+
+[build-dependencies]
+pyo3-build-config = "0.27.2"
+
+[features]
+mimalloc = ["dep:mimalloc"]
+
+[profile.release]
+codegen-units = 1
+debug = false
+incremental = false
+lto = "fat"
+opt-level = 3
+panic = "abort"
+strip = "debuginfo"
