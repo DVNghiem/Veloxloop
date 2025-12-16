@@ -1,6 +1,10 @@
 import asyncio
 import veloxloop
-import sys
+import pytest
+import time
+
+# Install VeloxLoop Policy!
+veloxloop.install()
 
 async def test_lifecycle():
     print("Running test_lifecycle")
@@ -16,56 +20,99 @@ async def test_lifecycle():
     await asyncio.sleep(0.1)
     end = loop.time()
     print(f"Slept {end - start:.4f}s (expected ~0.1s)")
+    assert 0.09 <= (end - start) <= 0.2
 
 async def test_tcp_echo():
     print("Running test_tcp_echo")
     
     async def handle_echo(reader, writer):
-        print("Server accepted connection")
         data = await reader.read(100)
-        print(f"Server received: {data}")
         writer.write(data)
         await writer.drain()
-        print("Server sent data back")
         writer.close()
         await writer.wait_closed()
 
-    server = await asyncio.start_server(handle_echo, '127.0.0.1', 8888)
+    server = await asyncio.start_server(handle_echo, '127.0.0.1', 0)
     addr = server.sockets[0].getsockname()
-    print(f"Serving on {addr}")
+    print(f'Serving on {addr}')
 
     async with server:
-        # Client
-        print("Connecting to server...")
-        reader, writer = await asyncio.open_connection('127.0.0.1', 8888)
-        message = b"Hello Velox!"
-        
-        print("Client writing...")
-        writer.write(message)
+        reader, writer = await asyncio.open_connection('127.0.0.1', addr[1])
+        writer.write(b'Hello World!')
         await writer.drain()
-        
-        print("Client reading...")
+
         data = await reader.read(100)
-        print(f"Client received: {data}")
-        assert data == message
-        
-        print("Closing client...")
+        print(f'Received: {data.decode()}')
+        assert data == b'Hello World!'
+
         writer.close()
         await writer.wait_closed()
+
+async def test_concurrency():
+    print("Running test_concurrency")
+    async def fast_task(i):
+        await asyncio.sleep(0.01)
+        return i
+
+    tasks = [asyncio.create_task(fast_task(i)) for i in range(100)]
+    results = await asyncio.gather(*tasks)
+    assert len(results) == 100
+    assert sum(results) == 4950
+
+async def test_cancellation():
+    print("Running test_cancellation")
+    async def forever():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            print("Task cancelled")
+            raise
+
+    task = asyncio.create_task(forever())
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+async def test_large_payload():
+    print("Running test_large_payload")
+    size = 1024 * 1024 # 1MB
+    payload = b'a' * size
+    
+    async def handle_echo(reader, writer):
+        data = await reader.readexactly(size)
+        writer.write(data)
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handle_echo, '127.0.0.1', 0)
+    addr = server.sockets[0].getsockname()
+
+    async with server:
+        reader, writer = await asyncio.open_connection('127.0.0.1', addr[1])
+        writer.write(payload)
+        await writer.drain()
+
+        data = await reader.readexactly(size)
+        assert data == payload
         
-    print("Echo test passed")
+        writer.close()
+        await writer.wait_closed()
 
-async def main():
-    print(f"Using loop: {asyncio.get_running_loop()}")
-    await test_lifecycle()
-    await test_tcp_echo()
+async def test_call_soon_threadsafe():
+    print("Running test_call_soon_threadsafe")
+    loop = asyncio.get_running_loop()
+    fut = asyncio.Future()
+    
+    def callback():
+        print("Threadsafe callback called")
+        loop.call_soon_threadsafe(lambda: fut.set_result("success"))
 
-if __name__ == "__main__":
-    veloxloop.install()
-    try:
-        asyncio.run(main())
-    except Exception as e:
-        print(f"Test failed: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    import threading
+    t = threading.Thread(target=callback)
+    t.start()
+    t.join()
+    
+    res = await fut
+    assert res == "success"

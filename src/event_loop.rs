@@ -23,6 +23,8 @@ pub struct VeloxLoop {
     callbacks: Arc<CallbackQueue>,
     timers: Mutex<Timers>,
     running: AtomicBool,
+    stopped: AtomicBool,
+    closed: AtomicBool,
     debug: AtomicBool,
     // We need to track time, asyncio uses loop.time() which is monotonic float seconds.
     // Rust Instant is opaque. We'll verify against a baseline.
@@ -42,6 +44,8 @@ impl VeloxLoop {
             callbacks: Arc::new(CallbackQueue::new(poller)),
             timers: Mutex::new(Timers::new()),
             running: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             debug: AtomicBool::new(debug.unwrap_or(false)),
             start_time: Instant::now(),
         })
@@ -59,26 +63,35 @@ impl VeloxLoop {
     // Lifecycle
     fn run_forever(&self, py: Python<'_>) -> VeloxResult<()> {
         self.running.store(true, Ordering::SeqCst);
+        self.stopped.store(false, Ordering::SeqCst);
         
         // Use polling::Events
         let mut events = polling::Events::new();
         
-        while self.running.load(Ordering::SeqCst) {
+        while self.running.load(Ordering::SeqCst) && !self.stopped.load(Ordering::SeqCst) {
             // 1. Run scheduled callbacks
             // We call the internal run_once which is NOT a pymethod
             self._run_once(py, &mut events)?;
+            
+            // Check if stopped after processing callbacks (future might be done)
+            if self.stopped.load(Ordering::SeqCst) {
+                break;
+            }
             
             // Allow Python signals (Ctrl+C) to interrupt
             if let Err(e) = py.check_signals() {
                 return Err(VeloxError::Python(e));
             }
         }
+        
+        self.running.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     // Basic I/O methods
 
-    fn add_reader(&self, py: Python<'_>, fd: RawFd, callback: PyObject) -> PyResult<()> {
+     fn add_reader(&self, py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
+        eprintln!("DEBUG: add_reader fd={}", fd);
         let poller = self.poller.clone();
         
         // Lock handles once
@@ -88,17 +101,18 @@ impl VeloxLoop {
         
         // Add or modify
         handles.add_reader(fd, callback);
-        drop(handles); // Drop lock before poller (avoid potential deadlock though unlikely here)
+        drop(handles); // Drop lock before poller
         
         // Update Poller
         let mut ev = polling::Event::readable(fd as usize);
         if writer_exists {
             ev.writable = true; 
         }
-        
         if !reader_exists && !writer_exists {
+             eprintln!("DEBUG: registering fd={}", fd);
              unsafe { poller.register(fd, ev)?; }
         } else {
+             eprintln!("DEBUG: modifying fd={}", fd);
              unsafe { poller.modify(fd, ev)?; }
         }
         Ok(())
@@ -124,7 +138,7 @@ impl VeloxLoop {
         }
     }
     
-    fn add_writer(&self, py: Python<'_>, fd: RawFd, callback: PyObject) -> PyResult<()> {
+    fn add_writer(&self, py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
         let poller = self.poller.clone();
         
         let mut handles = self.handles.lock();
@@ -168,18 +182,18 @@ impl VeloxLoop {
     // Callbacks
     // Callbacks
     #[pyo3(signature = (callback, *args, context=None))]
-    fn call_soon(&self, callback: PyObject, args: Vec<PyObject>, context: Option<PyObject>) {
+    fn call_soon(&self, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) {
         self.callbacks.push(Callback { callback, args, context });
     }
     
     #[pyo3(signature = (callback, *args, context=None))]
-    fn call_soon_threadsafe(&self, callback: PyObject, args: Vec<PyObject>, context: Option<PyObject>) {
+    fn call_soon_threadsafe(&self, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) {
          self.callbacks.push(Callback { callback, args, context });
          // Push naturally notifies.
     }
     
     #[pyo3(signature = (delay, callback, *args, context=None))]
-    fn call_later(&self, delay: f64, callback: PyObject, args: Vec<PyObject>, context: Option<PyObject>) -> u64 {
+    fn call_later(&self, delay: f64, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) -> u64 {
         let now = (self.time() * 1_000_000_000.0) as u64;
         let delay_ns = (delay * 1_000_000_000.0) as u64;
         let when = now + delay_ns;
@@ -187,13 +201,32 @@ impl VeloxLoop {
     }
     
     #[pyo3(signature = (when, callback, *args, context=None))]
-    fn call_at(&self, when: f64, callback: PyObject, args: Vec<PyObject>, context: Option<PyObject>) -> u64 {
+    fn call_at(&self, when: f64, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) -> u64 {
          let when_ns = (when * 1_000_000_000.0) as u64;
          self.timers.lock().insert(when_ns, callback, args, context)
     }
 
     fn _cancel_timer(&self, timer_id: u64) {
         self.timers.lock().remove(timer_id);
+    }
+
+    // Lifecycle methods
+    fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
     }
 
     // --- Networking ---
@@ -206,65 +239,68 @@ impl VeloxLoop {
     }
 
     #[pyo3(signature = (protocol_factory, host=None, port=None, **_kwargs))]
-    fn create_connection(slf: &Bound<'_, Self>, protocol_factory: PyObject, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<PyObject> {
+    fn create_connection(slf: &Bound<'_, Self>, protocol_factory: Py<PyAny>, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<PyObject> {
         let py = slf.py();
-        let self_ = slf.borrow(); // Use borrow for mutable class
+        // let self_ = slf.borrow(); // We don't need borrow of self anymore for this logic (mostly)
         
         let host = host.unwrap_or("127.0.0.1");
         let port = port.unwrap_or(0);
+        let addr_str = format!("{}:{}", host, port);
         
-        // 1. Resolve (blocking for now)
-        let addr: String = format!("{}:{}", host, port);
+        // Resolve address (blocking for now - DNS resolution is blocking in this MVP)
+        // using std::net::ToSocketAddrs.
+        let mut addrs = std::net::ToSocketAddrs::to_socket_addrs(&addr_str)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+            
+        let addr = addrs.next().ok_or_else(|| PyErr::new::<pyo3::exceptions::PyOSError, _>("No address found"))?;
+        
+        // Use socket2 for non-blocking connect
+        use socket2::{Socket, Domain, Type};
+        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let socket = Socket::new(domain, Type::STREAM, None)
+             .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+             
+        socket.set_nonblocking(true)
+             .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+             
         // Connect
-        let stream = std::net::TcpStream::connect(&addr)?;
-        stream.set_nonblocking(true)?;
+        match socket.connect(&addr.into()) {
+            Ok(_) => {
+                // Immediate success?
+                // Should still go through callback path to be consistent or handle here?
+                // Let's assume generic path handle it via EINPROGRESS usually.
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(115) => {
+                // Expected (115 is EINPROGRESS on Linux)
+            }
+            Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string())),
+        }
         
-        // 2. Create Protocol
-        let protocol = protocol_factory.call0(py)?;
-        
-        // 3. Create Transport
-        let loop_obj = slf.clone().unbind();
-        // Clone loop_obj ref for transport
-        let loop_ref = loop_obj.clone_ref(py);
-        
-        // Get FD before move
+        let stream: std::net::TcpStream = socket.into();
         let fd = stream.as_raw_fd();
         
-        // transport uses loop_ref (PyObject)
-        let transport = TcpTransport::new(py, loop_ref.into_any(), stream, protocol.clone_ref(py))?;
-        let transport_py = Py::new(py, transport)?;
+        // Create Future
+        // Use self.create_future() via Python wrapper to avoid importing asyncio here
+        let fut = slf.call_method0("create_future")?;
         
-        // 4. Tie together
-        protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;
+        // Create Callback
+        use crate::transports::tcp::AsyncConnectCallback;
+        let loop_obj = slf.clone().unbind();
+        let fut_obj = fut.clone().unbind(); 
+        let callback = AsyncConnectCallback::new(loop_obj.clone_ref(py).into_any(), fut_obj.clone_ref(py), protocol_factory, stream);
+        let callback_py = Py::new(py, callback)?;
         
-        // 5. Register Reader
-        let read_ready = transport_py.getattr(py, "_read_ready")?;
-        // self_.add_reader(py, fd, read_ready)?; // Use self_ to call internal method?
-        // Wait, remove usage of loop_obj.call_method1("add_reader").
-        // We can call Rust method directly if we have access.
-        // But add_reader is defined on &VeloxLoop (self_).
-        // self_.add_reader(py, fd, read_ready)?; 
-        // NOTE: add_reader updates implementation state.
-        self_.add_reader(py, fd, read_ready)?; 
-        
-
-        
-        // Wrap in Future? 
-        // For now return tuple to satisfy signature if user awaits it? No, await expects awaitable.
-        // We return a "Real" future?
-        // Or just return the result and let Python crash if it tries to await a tuple?
-        // User asked for "asyncio.Future".
-        // Use `asyncio.Future` from Python.
-        let asyncio = py.import("asyncio")?;
-        let fut = asyncio.call_method0("Future")?;
-        let res = PyTuple::new(py, &[transport_py.clone_ref(py).into_any(), protocol])?;
-        fut.call_method1("set_result", (res,))?;
+        // Register Writer (for Connect)
+        // We need to call add_writer on the loop.
+        // slf is &Bound<Self>. We can call Python method "add_writer" on it (exposed via base implementation inheritance if it worked completely via python, but here slf IS the VeloxLoop instance).
+        // Since VeloxLoop has add_writer pymethod, we can call it.
+        slf.call_method1("add_writer", (fd, callback_py))?;
         
         Ok(fut.into())
-    }
+    }    
 
     #[pyo3(signature = (protocol_factory, host=None, port=None, **_kwargs))]
-    fn create_server(slf: &Bound<'_, Self>, protocol_factory: PyObject, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<PyObject> {
+    fn create_server(slf: &Bound<'_, Self>, protocol_factory: Py<PyAny>, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<PyObject> {
         let py = slf.py();
         let loop_obj = slf.clone().unbind();
         
@@ -293,19 +329,15 @@ impl VeloxLoop {
         let self_ = slf.borrow();
         self_.add_reader(py, fd, on_accept)?;
         
-        // 4. Return Server object (wrapped in Future?)
-        // asyncio.start_server returns a coroutine that returns a Server object.
-        // We replicate that.
-        let asyncio = py.import("asyncio")?;
-        let fut = asyncio.call_method0("Future")?;
-        fut.call_method1("set_result", (server,))?;
+        // 4. Return Server object wrapped in completed future
+        let fut = crate::transports::tcp::CompletedFuture::new(server.into());
         
-        Ok(fut.into())
+        Ok(Py::new(py, fut)?.into())
     }
 }
 
 impl VeloxLoop {
-    fn get_loop_obj(&self, _py: Python<'_>) -> PyResult<PyObject> {
+    fn get_loop_obj(&self, _py: Python<'_>) -> PyResult<Py<PyAny>> {
         // This is hard without `slf`.
         // We will assume the user passes the loop or we fix signature.
         Err(VeloxError::RuntimeError("Creating connection requires bound loop".into()).into())
@@ -326,7 +358,10 @@ impl VeloxLoop {
                      Some(Duration::from_secs(0))
                  }
              } else {
-                 None
+                 // Default to a small timeout to avoid blocking indefinitely
+                 // This allows the loop to check for stop() calls
+                 // Use 10ms for better responsiveness
+                 Some(Duration::from_millis(10))
              }
          };
          
@@ -341,24 +376,30 @@ impl VeloxLoop {
          
          // 3. Process I/O Events
          for event in events.iter() {
+
              let fd = event.key as std::os::fd::RawFd;
              
              if event.readable {
-                 let callback = {
-                     let handles = self.handles.lock();
-                     if let Some(handle) = handles.get_reader(fd) {
-                         if !handle.cancelled {
-                              Some(handle.callback.clone_ref(py))
-                         } else {
-                              None
-                         }
-                     } else {
-                         None
-                     }
-                 };
+                  let callback = {
+                      let handles = self.handles.lock();
+                      if let Some(handle) = handles.get_reader(fd) {
+                          if !handle.cancelled {
+                               // eprintln!("DEBUG: Found readable callback for fd={}", fd);
+                               Some(handle.callback.clone_ref(py))
+                          } else {
+                               None
+                          }
+                      } else {
+                          None
+                      }
+                  };
                  
                  if let Some(cb) = callback {
-                      let _ = cb.call0(py); 
+                      if let Err(e) = cb.call0(py) {
+                          e.print(py);
+                      } else {
+                          // eprintln!("DEBUG: callback executed successfully");
+                      }
                  }
              }
              if event.writable {
@@ -374,10 +415,32 @@ impl VeloxLoop {
                          None
                      }
                  };
+                                  if let Some(cb) = callback {
+                       if let Err(e) = cb.call0(py) {
+                           e.print(py);
+                       }
+                  }
+             }
+             
+             // Re-arm (Oneshot support for polling v3)
+             let handles = self.handles.lock();
+             let r = handles.get_reader(fd).is_some();
+             let w = handles.get_writer(fd).is_some();
+             drop(handles);
+             
+             if r || w {
+                 let ev = if r && w {
+                      let mut e = polling::Event::readable(fd as usize);
+                      e.writable = true;
+                      e
+                 } else if r {
+                      polling::Event::readable(fd as usize)
+                 } else {
+                      polling::Event::writable(fd as usize)
+                 };
                  
-                 if let Some(cb) = callback {
-                      let _ = cb.call0(py);
-                 }
+                 // Ignore errors (e.g. if concurrently closed)
+                 unsafe { let _ = self.poller.modify(fd, ev); }
              }
          }
                   // 4. Process Timers

@@ -6,7 +6,11 @@ import threading
 
 class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
     def get_debug(self):
-        return True
+        return getattr(self, '_debug', False)
+
+    def set_debug(self, enabled):
+        self._debug = enabled
+
         
     def create_task(self, coro, *, name=None, context=None):
         print(f"DEBUG: create_task {coro}", file=sys.stderr)
@@ -70,6 +74,25 @@ class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
         else:
             print(f"{message}", file=sys.stderr)
 
+    async def shutdown_asyncgens(self):
+        """Shutdown async generators"""
+        # For now, just return without doing anything
+        # In a complete implementation, this would track and close async generators
+        pass
+
+    async def shutdown_default_executor(self, timeout=None):
+        """Shutdown the default executor"""
+        # For now, just return without doing anything
+        # In a complete implementation, this would shutdown the thread pool executor
+        pass
+
+    def _timer_handle_cancelled(self, handle):
+        """Notification that a TimerHandle has been cancelled"""
+        # This is called when a timer handle is cancelled
+        # For VeloxTimerHandle, the cancel() method already calls _cancel_timer
+        # So we don't need to do anything here
+        pass
+
 class VeloxTimerHandle(asyncio.TimerHandle):
     def __init__(self, timer_id, when, loop, callback, args, context):
         super().__init__(when, callback, args, loop, context)
@@ -110,7 +133,8 @@ class VeloxLoopPolicy(_VeloxLoopPolicyImpl, asyncio.AbstractEventLoopPolicy):
         self._local.loop = loop
 
     def new_event_loop(self):
-        return super().new_event_loop()
+        # Return the Python-wrapped VeloxLoop, not the raw Rust implementation
+        return VeloxLoop(debug=False)
 
 def install():
     asyncio.set_event_loop_policy(VeloxLoopPolicy())

@@ -5,9 +5,9 @@ use std::sync::Arc;
 use crate::poller::LoopPoller;
 
 pub struct Callback {
-    pub callback: PyObject,
-    pub args: Vec<PyObject>, // Minimal args, usually Context + Args
-    pub context: Option<PyObject>,
+    pub callback: Py<PyAny>,
+    pub args: Vec<Py<PyAny>>, // Minimal args, usually Context + Args
+    pub context: Option<Py<PyAny>>,
 }
 
 pub struct CallbackQueue {

@@ -10,8 +10,8 @@ pub enum HandleType {
 
 pub struct Handle {
     pub fd: RawFd,
-    pub callback: PyObject,
-    pub args: Option<PyObject>, // Optional args for the callback
+    pub callback: Py<PyAny>,
+    pub args: Option<Vec<Py<PyAny>>>, // Optional args for the callback
     pub cancelled: bool,
 }
 
@@ -37,7 +37,7 @@ impl IoHandles {
         }
     }
 
-    pub fn add_reader(&mut self, fd: RawFd, callback: PyObject) {
+    pub fn add_reader(&mut self, fd: RawFd, callback: Py<PyAny>) {
         let entry = self.fd_map.entry(fd).or_insert((None, None));
         
         if let Some(key) = entry.0 {
@@ -73,7 +73,7 @@ impl IoHandles {
         false
     }
 
-    pub fn add_writer(&mut self, fd: RawFd, callback: PyObject) {
+    pub fn add_writer(&mut self, fd: RawFd, callback: Py<PyAny>) {
          let entry = self.fd_map.entry(fd).or_insert((None, None));
         
         if let Some(key) = entry.1 {

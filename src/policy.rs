@@ -2,16 +2,23 @@ use pyo3::prelude::*;
 use crate::event_loop::VeloxLoop;
 
 #[pyclass(module = "veloxloop", subclass)]
-pub struct VeloxLoopPolicy;
+pub struct VeloxLoopPolicy {
+    loop_factory: Option<Py<PyAny>>,
+    local: Py<PyAny>, // threading.local() object
+}
 
 #[pymethods]
 impl VeloxLoopPolicy {
+    #[pyo3(signature = (loop_factory=None))]
     #[new]
-    fn new() -> Self {
-        Self {}
+    fn new(py: Python<'_>, loop_factory: Option<Py<PyAny>>) -> PyResult<Self> {
+        Ok(Self {
+            loop_factory,
+            local: py.import("threading")?.call_method0("local")?.into_any().into(),
+        })
     }
 
-    fn get_event_loop(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn get_event_loop(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // We defer to DefaultEventLoopPolicy logic or implementing simple one.
         // Standard policy manages thread-local loop.
         // For simple Rust implementation without inheriting:
@@ -26,10 +33,10 @@ impl VeloxLoopPolicy {
         Err(pyo3::exceptions::PyNotImplementedError::new_err("get_event_loop not fully impl in Rust yet"))
     }
     
-    fn new_event_loop(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let veloxloop = py.import("veloxloop")?;
-        let loop_class = veloxloop.getattr("VeloxLoop")?;
-        Ok(loop_class.call0()?.into_any().into())
+    fn new_event_loop(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // Create VeloxLoop instance directly in Rust
+        let loop_instance = VeloxLoop::new(None)?;
+        Ok(Py::new(py, loop_instance)?.into())
     }
     
     // We might need to inherit from asyncio.AbstractEventLoopPolicy

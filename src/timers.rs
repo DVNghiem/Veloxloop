@@ -4,9 +4,9 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 
 pub struct TimerEntry {
-    pub callback: PyObject,
-    pub args: Vec<PyObject>,
-    pub context: Option<PyObject>,
+    pub callback: Py<PyAny>,
+    pub args: Vec<Py<PyAny>>,
+    pub context: Option<Py<PyAny>>,
 }
 
 pub struct Timers {
@@ -25,7 +25,7 @@ impl Timers {
         }
     }
 
-    pub fn insert(&mut self, when: u64, callback: PyObject, args: Vec<PyObject>, context: Option<PyObject>) -> u64 {
+    pub fn insert(&mut self, when: u64, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
 
