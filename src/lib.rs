@@ -10,6 +10,7 @@ mod policy;
 mod transports;
 mod executor;
 mod streams;
+mod socket;
 
 use event_loop::VeloxLoop;
 use transports::tcp::{TcpTransport, TcpServer, SocketWrapper};
@@ -19,6 +20,7 @@ use transports::future::CompletedFuture;
 use callbacks::AsyncConnectCallback;
 use policy::VeloxLoopPolicy;
 use streams::{StreamReader, StreamWriter};
+use socket::SocketOptions;
 
 #[pymodule(gil_used = false)]
 fn _veloxloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -35,5 +37,6 @@ fn _veloxloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VeloxLoopPolicy>()?;
     m.add_class::<StreamReader>()?;
     m.add_class::<StreamWriter>()?;
+    m.add_class::<SocketOptions>()?;
     Ok(())
 }

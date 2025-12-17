@@ -160,7 +160,58 @@ impl TcpServer {
         }
         Ok(())
     }
-    
+
+    /// Set SO_REUSEADDR option on the server socket
+    fn set_reuse_address(&self, enabled: bool) -> PyResult<()> {
+        if let Some(listener) = self.listener.as_ref() {
+            use std::os::unix::io::AsRawFd;
+            use libc::{setsockopt, SOL_SOCKET, SO_REUSEADDR};
+            
+            let fd = listener.as_raw_fd();
+            unsafe {
+                let optval: libc::c_int = if enabled { 1 } else { 0 };
+                let ret = setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_REUSEADDR,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        format!("Failed to set SO_REUSEADDR: {}", std::io::Error::last_os_error()),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set SO_REUSEPORT option on the server socket (Unix only, not Solaris)
+    #[cfg(all(unix, not(target_os = "solaris")))]
+    fn set_reuse_port(&self, enabled: bool) -> PyResult<()> {
+        if let Some(listener) = self.listener.as_ref() {
+            use std::os::unix::io::AsRawFd;
+            
+            let fd = listener.as_raw_fd();
+            unsafe {
+                let optval: libc::c_int = if enabled { 1 } else { 0 };
+                let ret = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEPORT,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        format!("Failed to set SO_REUSEPORT: {}", std::io::Error::last_os_error()),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
     /// Serve forever - runs the server until explicitly closed
     /// This method implements asyncio.Server.serve_forever() behavior
     fn serve_forever(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -483,6 +534,165 @@ impl TcpTransport {
         
         // Delegate to trait implementation
         StreamTransport::read_ready(&mut *self_, py)
+    }
+
+    /// Set TCP_NODELAY option on the socket
+    fn set_tcp_nodelay(&self, enabled: bool) -> PyResult<()> {
+        if let Some(stream) = self.stream.as_ref() {
+            use std::os::unix::io::AsRawFd;
+            use libc::{setsockopt, IPPROTO_TCP, TCP_NODELAY};
+            
+            let fd = stream.as_raw_fd();
+            unsafe {
+                let optval: libc::c_int = if enabled { 1 } else { 0 };
+                let ret = setsockopt(
+                    fd,
+                    IPPROTO_TCP,
+                    TCP_NODELAY,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        format!("Failed to set TCP_NODELAY: {}", std::io::Error::last_os_error()),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set SO_KEEPALIVE option on the socket
+    fn set_keepalive(&self, enabled: bool) -> PyResult<()> {
+        if let Some(stream) = self.stream.as_ref() {
+            use std::os::unix::io::AsRawFd;
+            use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE};
+            
+            let fd = stream.as_raw_fd();
+            unsafe {
+                let optval: libc::c_int = if enabled { 1 } else { 0 };
+                let ret = setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_KEEPALIVE,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        format!("Failed to set SO_KEEPALIVE: {}", std::io::Error::last_os_error()),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set SO_REUSEADDR option on the socket
+    fn set_reuse_address(&self, enabled: bool) -> PyResult<()> {
+        if let Some(stream) = self.stream.as_ref() {
+            use std::os::unix::io::AsRawFd;
+            use libc::{setsockopt, SOL_SOCKET, SO_REUSEADDR};
+            
+            let fd = stream.as_raw_fd();
+            unsafe {
+                let optval: libc::c_int = if enabled { 1 } else { 0 };
+                let ret = setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_REUSEADDR,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        format!("Failed to set SO_REUSEADDR: {}", std::io::Error::last_os_error()),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set TCP keep-alive time (idle time before first probe in seconds)
+    #[cfg(target_os = "linux")]
+    fn set_keepalive_time(&self, seconds: u32) -> PyResult<()> {
+        if let Some(stream) = self.stream.as_ref() {
+            use std::os::unix::io::AsRawFd;
+            use libc::{setsockopt, IPPROTO_TCP};
+            
+            let fd = stream.as_raw_fd();
+            unsafe {
+                let optval = seconds as libc::c_int;
+                let ret = setsockopt(
+                    fd,
+                    IPPROTO_TCP,
+                    libc::TCP_KEEPIDLE,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        format!("Failed to set TCP_KEEPIDLE: {}", std::io::Error::last_os_error()),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set TCP keep-alive interval between probes (in seconds)
+    #[cfg(target_os = "linux")]
+    fn set_keepalive_interval(&self, seconds: u32) -> PyResult<()> {
+        if let Some(stream) = self.stream.as_ref() {
+            use std::os::unix::io::AsRawFd;
+            use libc::{setsockopt, IPPROTO_TCP};
+            
+            let fd = stream.as_raw_fd();
+            unsafe {
+                let optval = seconds as libc::c_int;
+                let ret = setsockopt(
+                    fd,
+                    IPPROTO_TCP,
+                    libc::TCP_KEEPINTVL,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        format!("Failed to set TCP_KEEPINTVL: {}", std::io::Error::last_os_error()),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set TCP keep-alive probe count
+    #[cfg(target_os = "linux")]
+    fn set_keepalive_count(&self, count: u32) -> PyResult<()> {
+        if let Some(stream) = self.stream.as_ref() {
+            use std::os::unix::io::AsRawFd;
+            use libc::{setsockopt, IPPROTO_TCP};
+            
+            let fd = stream.as_raw_fd();
+            unsafe {
+                let optval = count as libc::c_int;
+                let ret = setsockopt(
+                    fd,
+                    IPPROTO_TCP,
+                    libc::TCP_KEEPCNT,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        format!("Failed to set TCP_KEEPCNT: {}", std::io::Error::last_os_error()),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
