@@ -71,24 +71,19 @@ impl StreamTransport {
     }
     
     fn _read_ready(&mut self, py: Python<'_>) -> PyResult<()> {
-        if let Some(stream) = self.stream.as_ref() {
-            // Use large buffer for better performance
-            let mut buf = [0u8; 65536];
-            let mut s = stream;
-            
+        if let Some(stream) = self.stream.as_mut() {
             // Read loop: continue reading until WouldBlock to maximize throughput
             loop {
-                match Read::read(&mut s, &mut buf) {
+                // Use zero-copy read directly into StreamReader buffer
+                match self.reader.bind(py).borrow().read_from_socket(py, stream) {
                     Ok(0) => {
                         // EOF
                         self.reader.bind(py).borrow().feed_eof(py)?;
                         self.close(py)?;
                         break;
                     }
-                    Ok(n) => {
-                        // Feed data directly to StreamReader with Python context
-                        self.reader.bind(py).borrow().feed_data(py, &buf[..n])?;
-                        // Continue loop to read more data if available
+                    Ok(_) => {
+                        // Data read and fed, continue reading
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                         break; // No more data, exit loop

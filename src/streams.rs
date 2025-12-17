@@ -1,6 +1,7 @@
 #[allow(unused)]
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use pyo3::IntoPyObjectExt; // Fix for into_py_any
 use std::sync::Arc;
 use parking_lot::Mutex;
 use memchr::memchr;
@@ -8,16 +9,16 @@ use crate::transports::future::PendingFuture;
 
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct StreamReader {
-    /// Internal buffer for read data
-    buffer: Arc<Mutex<Vec<u8>>>,
+    inner: Arc<Mutex<StreamReaderInner>>,
     /// Maximum buffer size before pausing
     limit: usize,
-    /// EOF flag
-    eof: Arc<Mutex<bool>>,
-    /// Exception to raise on next read (if any)
-    exception: Arc<Mutex<Option<String>>>,
-    /// Pending futures waiting for data
-    waiters: Arc<Mutex<Vec<(WaiterType, Py<PendingFuture>)>>>,
+}
+
+struct StreamReaderInner {
+    buffer: Vec<u8>,
+    eof: bool,
+    exception: Option<String>,
+    waiters: Vec<(WaiterType, Py<PendingFuture>)>,
 }
 
 #[derive(Clone)]
@@ -35,11 +36,13 @@ impl StreamReader {
         const DEFAULT_LIMIT: usize = 64 * 1024; // 64 KB default
         
         Self {
-            buffer: Arc::new(Mutex::new(Vec::new())),
+            inner: Arc::new(Mutex::new(StreamReaderInner {
+                buffer: Vec::with_capacity(DEFAULT_LIMIT),
+                eof: false,
+                exception: None,
+                waiters: Vec::new(),
+            })),
             limit: limit.unwrap_or(DEFAULT_LIMIT),
-            eof: Arc::new(Mutex::new(false)),
-            exception: Arc::new(Mutex::new(None)),
-            waiters: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -49,9 +52,10 @@ impl StreamReader {
             return Ok(());
         }
         
-        let mut buffer = self.buffer.lock();
-        buffer.extend_from_slice(data);
-        drop(buffer);
+        {
+            let mut inner = self.inner.lock();
+            inner.buffer.extend_from_slice(data);
+        }
         
         // Try to satisfy waiting futures
         self._wakeup_waiters(py)?;
@@ -60,161 +64,142 @@ impl StreamReader {
 
     /// Signal EOF and wake up all waiters
     pub fn feed_eof(&self, py: Python<'_>) -> PyResult<()> {
-        *self.eof.lock() = true;
+        {
+            let mut inner = self.inner.lock();
+            inner.eof = true;
+        }
         self._wakeup_waiters(py)?;
         Ok(())
     }
     
     /// Internal method to wake up waiting futures
-    fn _wakeup_waiters(&self, py: Python<'_>) -> PyResult<()> {
-        let mut waiters = self.waiters.lock();
-        let mut i = 0;
+    fn _wakeup_waiters(&self, py: Python<'_>,) -> PyResult<()> {
+        // Collect satisfied futures to avoid holding the lock while calling Python code
+        let mut ready_waiters = Vec::new();
+        let mut error_waiters = Vec::new();
         
-        while i < waiters.len() {
-            let (waiter_type, future) = &waiters[i];
+        {
+            let mut inner_guard = self.inner.lock();
+            let inner = &mut *inner_guard;
             
-            // Try to fulfill this waiter
-            let result = match waiter_type {
-                WaiterType::ReadLine => self._try_readline(py),
-                WaiterType::ReadUntil(sep) => self._try_readuntil(py, sep),
-                WaiterType::ReadExactly(n) => self._try_readexactly(py, *n),
-            };
-            
-            match result {
-                Ok(Some(data)) => {
-                    // We have data, set the future result
-                    future.bind(py).borrow().set_result(py, data)?;
-                    waiters.remove(i);
-                    // Don't increment i since we removed an element
+            // Check for exception first
+            if let Some(exc_msg) = &inner.exception {
+                // All waiters get error
+                for (_, future) in inner.waiters.drain(..) {
+                    error_waiters.push((future, exc_msg.clone()));
                 }
-                Ok(None) => {
-                    // Not ready yet
-                    i += 1;
-                }
-                Err(e) => {
-                    // Error occurred, set exception on future
-                    let exc = e.value(py).clone().into_any().unbind();
-                    future.bind(py).borrow().set_exception(py, exc)?;
-                    waiters.remove(i);
+            } else {
+                // Split borrows to allow independent access to buffer and waiters
+                let eof = inner.eof;
+                let buffer = &mut inner.buffer;
+                let waiters = &mut inner.waiters;
+                
+                let mut i = 0;
+                while i < waiters.len() {
+                    let should_remove = {
+                        let waiter_type = &waiters[i].0;
+                        match waiter_type {
+                            WaiterType::ReadLine => Self::_try_readuntil_inner(buffer, eof, b"\n"),
+                            WaiterType::ReadUntil(sep) => Self::_try_readuntil_inner(buffer, eof, sep),
+                            WaiterType::ReadExactly(n) => Self::_try_readexactly_inner(buffer, eof, *n),
+                        }?
+                    };
+                    
+                    if let Some(data) = should_remove {
+                        let (_, future) = waiters.remove(i);
+                        ready_waiters.push((future, data));
+                    } else {
+                        i += 1;
+                    }
                 }
             }
+        }
+        
+        // Dispatch results outside lock
+        for (future, data) in ready_waiters {
+            let bytes = PyBytes::new(py, &data);
+            future.bind(py).borrow().set_result(py, bytes.into())?;
+        }
+        
+        for (future, msg) in error_waiters {
+             // Correctly create exception object
+             let exc = pyo3::exceptions::PyRuntimeError::new_err(msg).into_py_any(py)?;
+             future.bind(py).borrow().set_exception(py, exc)?;
         }
         
         Ok(())
     }
     
-    /// Try to read a line without blocking (returns None if not available)
     fn _try_readline(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         self._try_readuntil(py, b"\n")
     }
     
-    /// Try to read until separator without blocking
-    /// Optimized with SIMD-accelerated search for single-byte separators
     fn _try_readuntil(&self, py: Python<'_>, separator: &[u8]) -> PyResult<Option<Py<PyAny>>> {
-        // Check for exception first
-        if let Some(exc_msg) = self.exception.lock().as_ref() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(exc_msg.clone()));
+        let mut inner = self.inner.lock();
+        if let Some(msg) = &inner.exception {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(msg.clone()));
         }
-        
-        let mut buffer = self.buffer.lock();
-        
-        // Find the separator - use SIMD-accelerated memchr for single-byte (common case: newline)
-        let pos = if separator.len() == 1 {
-            memchr(separator[0], &buffer)
+        let eof = inner.eof;
+        if let Some(data) = Self::_try_readuntil_inner(&mut inner.buffer, eof, separator)? {
+             let bytes = PyBytes::new(py, &data);
+             Ok(Some(bytes.into()))
         } else {
-            // Multi-byte separator: use windows iterator
-            buffer.windows(separator.len())
-                .position(|window| window == separator)
-        };
-        
-        if let Some(pos) = pos {
-            let end = pos + separator.len();
-            // Create PyBytes directly from slice to avoid intermediate Vec allocation
-            let bytes = PyBytes::new(py, &buffer[..end]);
-            buffer.drain(..end);
-            return Ok(Some(bytes.into()));
+             Ok(None)
         }
-        
-        // Separator not found - check EOF while still holding buffer lock
-        let is_eof = *self.eof.lock();
-        if is_eof {
-            // Return all data if at EOF
-            if buffer.is_empty() {
-                return Ok(Some(PyBytes::new(py, &[]).into()));
-            }
-            let bytes = PyBytes::new(py, &buffer);
-            buffer.clear();
-            return Ok(Some(bytes.into()));
-        }
-        
-        // Not ready yet
-        Ok(None)
     }
     
-    /// Try to read exactly n bytes without blocking
     fn _try_readexactly(&self, py: Python<'_>, n: usize) -> PyResult<Option<Py<PyAny>>> {
-        // Check for exception first
-        if let Some(exc_msg) = self.exception.lock().as_ref() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(exc_msg.clone()));
+        let mut inner = self.inner.lock();
+        if let Some(msg) = &inner.exception {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(msg.clone()));
         }
-        
-        let mut buffer = self.buffer.lock();
-        
-        if buffer.len() >= n {
-            // Create PyBytes directly from slice to avoid intermediate allocation
-            let bytes = PyBytes::new(py, &buffer[..n]);
-            buffer.drain(..n);
-            return Ok(Some(bytes.into()));
+        let eof = inner.eof;
+        if let Some(data) = Self::_try_readexactly_inner(&mut inner.buffer, eof, n)? {
+             let bytes = PyBytes::new(py, &data);
+             Ok(Some(bytes.into()))
+        } else {
+             Ok(None)
         }
-        
-        // Check EOF while still holding buffer lock
-        let is_eof = *self.eof.lock();
-        if is_eof {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Not enough data: expected {}, got {}", n, buffer.len())
-            ));
-        }
-        
-        // Not ready yet
-        Ok(None)
     }
 
     /// Set an exception message to be raised on next read
     pub fn set_exception(&self, message: String) -> PyResult<()> {
-        *self.exception.lock() = Some(message);
+        let mut inner = self.inner.lock();
+        inner.exception = Some(message);
         Ok(())
     }
 
     /// Get the current exception message (if any)
     pub fn exception(&self) -> Option<String> {
-        self.exception.lock().clone()
+        self.inner.lock().exception.clone()
     }
 
     /// Check if at EOF
     pub fn at_eof(&self) -> bool {
-        *self.eof.lock() && self.buffer.lock().is_empty()
+        let inner = self.inner.lock();
+        inner.eof && inner.buffer.is_empty()
     }
 
     /// Read up to n bytes
     #[pyo3(signature = (n=-1))]
     pub fn read(&self, py: Python<'_>, n: isize) -> PyResult<Py<PyAny>> {
+        let mut inner = self.inner.lock();
+        
         // Check for exception
-        if let Some(exc_msg) = self.exception.lock().take() {
+        if let Some(exc_msg) = inner.exception.take() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(exc_msg));
         }
         
-        let mut buffer = self.buffer.lock();
-        
         if n < 0 {
             // Read all available data
-            let data = buffer.drain(..).collect::<Vec<u8>>();
+            let data = inner.buffer.drain(..).collect::<Vec<u8>>();
             let bytes = PyBytes::new(py, &data);
             return Ok(bytes.into());
         }
         
         let n = n as usize;
-        let available = buffer.len().min(n);
-        let data = buffer.drain(..available).collect::<Vec<u8>>();
+        let available = inner.buffer.len().min(n);
+        let data = inner.buffer.drain(..available).collect::<Vec<u8>>();
         let bytes = PyBytes::new(py, &data);
         
         Ok(bytes.into())
@@ -228,7 +213,7 @@ impl StreamReader {
             None => {
                 // Create a pending future
                 let future = Py::new(py, PendingFuture::new())?;
-                self.waiters.lock().push((WaiterType::ReadExactly(n), future.clone_ref(py)));
+                self.inner.lock().waiters.push((WaiterType::ReadExactly(n), future.clone_ref(py)));
                 Ok(future.into_any())
             }
         }
@@ -249,7 +234,7 @@ impl StreamReader {
             None => {
                 // Create a pending future
                 let future = Py::new(py, PendingFuture::new())?;
-                self.waiters.lock().push((WaiterType::ReadUntil(separator.to_vec()), future.clone_ref(py)));
+                self.inner.lock().waiters.push((WaiterType::ReadUntil(separator.to_vec()), future.clone_ref(py)));
                 Ok(future.into_any())
             }
         }
@@ -263,7 +248,7 @@ impl StreamReader {
             None => {
                 // Create a pending future
                 let future = Py::new(py, PendingFuture::new())?;
-                self.waiters.lock().push((WaiterType::ReadLine, future.clone_ref(py)));
+                self.inner.lock().waiters.push((WaiterType::ReadLine, future.clone_ref(py)));
                 Ok(future.into_any())
             }
         }
@@ -276,13 +261,94 @@ impl StreamReader {
 
     /// Get current buffer size
     pub fn buffer_size(&self) -> usize {
-        self.buffer.lock().len()
+        self.inner.lock().buffer.len()
     }
 
     fn __repr__(&self) -> String {
-        let buffer_len = self.buffer.lock().len();
-        let eof = *self.eof.lock();
-        format!("<StreamReader buffer_len={} eof={}>", buffer_len, eof)
+        let inner = self.inner.lock();
+        format!("<StreamReader buffer_len={} eof={}>", inner.buffer.len(), inner.eof)
+    }
+}
+
+impl StreamReader {
+    // Helper method for readuntil logic operating on raw buffer
+    fn _try_readuntil_inner(buffer: &mut Vec<u8>, eof: bool, separator: &[u8]) -> PyResult<Option<Vec<u8>>> {
+        let pos = if separator.len() == 1 {
+            memchr(separator[0], &buffer)
+        } else {
+            buffer.windows(separator.len())
+                .position(|window| window == separator)
+        };
+        
+        if let Some(pos) = pos {
+            let end = pos + separator.len();
+            let data = buffer.drain(..end).collect();
+            return Ok(Some(data));
+        }
+        
+        if eof {
+            if buffer.is_empty() {
+                return Ok(Some(Vec::new()));
+            }
+            let data = buffer.drain(..).collect();
+            return Ok(Some(data));
+        }
+        
+        Ok(None)
+    }
+    
+    // Helper for readexactly logic
+    fn _try_readexactly_inner(buffer: &mut Vec<u8>, eof: bool, n: usize) -> PyResult<Option<Vec<u8>>> {
+        if buffer.len() >= n {
+            let data = buffer.drain(..n).collect();
+            return Ok(Some(data));
+        }
+        
+        if eof {
+             return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Not enough data: expected {}, got {}", n, buffer.len())
+            ));
+        }
+        
+        Ok(None)
+    }
+    
+    // Zero-copy read from socket
+    pub(crate) fn read_from_socket(&self, py: Python<'_>, stream: &mut std::net::TcpStream) -> std::io::Result<usize> {
+         // Reserve internal buffer and read directly
+         let mut inner = self.inner.lock();
+         let buffer = &mut inner.buffer;
+         
+         // Try to read into spare capacity or reserve more
+         // We want to read a reasonable chunk, e.g. 64KB
+         let chunk_size = 65536;
+         buffer.reserve(chunk_size);
+         
+         // Unsafe access to unused capacity to avoid initialization cost
+         let len = buffer.len();
+         let cap = buffer.capacity();
+         let spare = unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().add(len), cap - len) };
+         
+         let n = std::io::Read::read(stream, spare)?;
+         
+         if n > 0 {
+             unsafe { buffer.set_len(len + n) };
+         }
+         
+         // Early return if no data read (EOF is handled differently or n=0)
+         if n == 0 {
+             return Ok(0);
+         }
+         
+         // Drop lock before waking waiters to allow them to proceed
+         drop(inner);
+         
+         // Try to wakeup waiters
+         if let Err(e) = self._wakeup_waiters(py) {
+             return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()));
+         }
+         
+         Ok(n)
     }
 }
 
