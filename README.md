@@ -71,3 +71,23 @@ The following asyncio features are **not yet implemented** and are planned for f
 ### Compatibility & Standards
 - [ ] **PEP 567 context variables** - Full context support in all callbacks
 - [ ] **ProactorEventLoop equivalence** - Windows proactor-style operations
+
+## Benchmarks
+
+VeloxLoop includes a comprehensive benchmark suite to compare performance against asyncio and uvloop. The benchmarks measure:
+
+- **Raw socket performance** - TCP echo using `sock_recv`/`sock_sendall`
+- **Stream performance** - TCP echo using `asyncio.StreamReader`/`StreamWriter`
+- **Protocol performance** - TCP echo using `asyncio.Protocol`
+
+Each benchmark tests three message sizes (1KB, 10KB, 100KB) and measures throughput, latency, and percentiles.
+
+### Running Benchmarks
+
+```bash
+cd benchmarks
+pip install -r requirements.txt
+python run.py all
+```
+
+See [benchmarks/README.md](benchmarks/README.md) for detailed documentation.

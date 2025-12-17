@@ -3,6 +3,8 @@ from ._veloxloop import VeloxLoop as _VeloxLoopImpl
 from ._veloxloop import VeloxLoopPolicy as _VeloxLoopPolicyImpl
 import threading
 
+__version__ = "0.1.0"
+
 class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
     def get_debug(self):
         return getattr(self, '_debug', False)
@@ -117,4 +119,9 @@ class VeloxLoopPolicy(_VeloxLoopPolicyImpl, asyncio.AbstractEventLoopPolicy):
 def install():
     asyncio.set_event_loop_policy(VeloxLoopPolicy())
 
+def new_event_loop():
+    """Create a new VeloxLoop event loop instance."""
+    return VeloxLoop(debug=False)
+
+__all__ = ['VeloxLoop', 'VeloxLoopPolicy', 'VeloxTimerHandle', 'install', 'new_event_loop', '__version__']
 __all__ = ('VeloxLoop', 'VeloxLoopPolicy', 'install')

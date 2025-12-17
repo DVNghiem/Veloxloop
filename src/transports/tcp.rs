@@ -62,6 +62,59 @@ impl SocketWrapper {
             SocketAddr::V4(_) => Ok(None),
         }
     }
+
+    /// Set socket options
+    /// This is a simplified implementation that supports common options
+    #[cfg(unix)]
+    fn setsockopt(&self, level: i32, optname: i32, value: i32) -> PyResult<()> {
+        use libc::setsockopt;
+        
+        unsafe {
+            let optval = value as libc::c_int;
+            let ret = setsockopt(
+                self.fd,
+                level,
+                optname,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&optval) as libc::socklen_t,
+            );
+            if ret != 0 {
+                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                    format!(
+                        "Failed to set socket option: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Set socket options (Windows version)
+    #[cfg(windows)]
+    fn setsockopt(&self, level: i32, optname: i32, value: i32) -> PyResult<()> {
+        use winapi::um::winsock2::setsockopt;
+        
+        unsafe {
+            let optval = value as i32;
+            let ret = setsockopt(
+                self.fd as usize,
+                level,
+                optname,
+                &optval as *const _ as *const i8,
+                std::mem::size_of_val(&optval) as i32,
+            );
+            if ret != 0 {
+                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                    format!(
+                        "Failed to set socket option: {}",
+                        std::io::Error::last_os_error()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl SocketWrapper {

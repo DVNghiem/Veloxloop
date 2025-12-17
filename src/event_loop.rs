@@ -653,6 +653,197 @@ impl VeloxLoop {
         Ok(future.into_any())
     }
 
+    fn sock_accept(slf: &Bound<'_, Self>, sock: Py<PyAny>) -> PyResult<Py<PyAny>> {
+        use crate::callbacks::SockAcceptCallback;
+        
+        let py = slf.py();
+        let self_ = slf.borrow();
+        
+        // Get the socket's file descriptor
+        let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
+        
+        // Try to accept immediately (non-blocking)
+        unsafe {
+            let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+            let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            
+            let client_fd = libc::accept(
+                fd,
+                &mut addr as *mut _ as *mut libc::sockaddr,
+                &mut addr_len
+            );
+            
+            if client_fd >= 0 {
+                // Success - create Python socket object and return immediately
+                use pyo3::types::{PyString, PyInt, PyTuple};
+                
+                let socket_module = py.import("socket")?;
+                let client_sock = socket_module.call_method1("fromfd", (client_fd, 2, 1))?;
+                
+                // Set non-blocking on client socket
+                let flags = libc::fcntl(client_fd, libc::F_GETFL, 0);
+                if flags >= 0 {
+                    libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                }
+                
+                // Parse the address
+                let addr_tuple = if addr_len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
+                    let addr_in = &*((&addr) as *const _ as *const libc::sockaddr_in);
+                    if addr_in.sin_family == libc::AF_INET as u16 {
+                        let ip = u32::from_be(addr_in.sin_addr.s_addr);
+                        let port = u16::from_be(addr_in.sin_port);
+                        let ip_str = format!("{}.{}.{}.{}", 
+                            (ip >> 24) & 0xff, 
+                            (ip >> 16) & 0xff, 
+                            (ip >> 8) & 0xff, 
+                            ip & 0xff
+                        );
+                        let ip_py = PyString::new(py, &ip_str);
+                        let port_py = PyInt::new(py, port);
+                        PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
+                    } else {
+                        let ip_py = PyString::new(py, "");
+                        let port_py = PyInt::new(py, 0);
+                        PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
+                    }
+                } else {
+                    let ip_py = PyString::new(py, "");
+                    let port_py = PyInt::new(py, 0);
+                    PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
+                };
+                
+                let result = PyTuple::new(py, vec![client_sock.as_any(), addr_tuple.as_any()])?;
+                
+                let fut = PendingFuture::new();
+                fut.set_result(py, result.into())?;
+                return Ok(Py::new(py, fut)?.into_any());
+            }
+            
+            let err = std::io::Error::last_os_error();
+            match err.kind() {
+                std::io::ErrorKind::WouldBlock => {
+                    // Expected: no pending connection
+                }
+                _ if err.raw_os_error() == Some(libc::EAGAIN) => {
+                    // Expected: no pending connection
+                }
+                _ => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string()));
+                }
+            }
+        }
+        
+        // No pending connection - wait for socket to become readable
+        let future = self_.create_future(py)?;
+        let loop_ref = slf.clone().unbind();
+        
+        let callback_obj = SockAcceptCallback::new(loop_ref, future.clone_ref(py), fd);
+        let callback = Py::new(py, callback_obj)?;
+        
+        self_.add_reader(py, fd, callback.into_any())?;
+        
+        Ok(future.into_any())
+    }
+
+    fn sock_recv(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
+        use crate::callbacks::SockRecvCallback;
+        use pyo3::types::PyBytes;
+        
+        let py = slf.py();
+        let self_ = slf.borrow();
+        
+        let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
+        
+        // Try to recv immediately
+        let mut buf = vec![0u8; nbytes];
+        unsafe {
+            let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
+            
+            if n >= 0 {
+                buf.truncate(n as usize);
+                let bytes = PyBytes::new(py, &buf);
+                let fut = PendingFuture::new();
+                fut.set_result(py, bytes.into())?;
+                return Ok(Py::new(py, fut)?.into_any());
+            }
+            
+            let err = std::io::Error::last_os_error();
+            match err.kind() {
+                std::io::ErrorKind::WouldBlock => {}
+                _ if err.raw_os_error() == Some(libc::EAGAIN) => {}
+                _ => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string()));
+                }
+            }
+        }
+        
+        // Would block - wait for readable
+        let future = self_.create_future(py)?;
+        let loop_ref = slf.clone().unbind();
+        
+        let callback_obj = SockRecvCallback::new(loop_ref, future.clone_ref(py), fd, nbytes);
+        let callback = Py::new(py, callback_obj)?;
+        
+        self_.add_reader(py, fd, callback.into_any())?;
+        
+        Ok(future.into_any())
+    }
+
+    fn sock_sendall(slf: &Bound<'_, Self>, sock: Py<PyAny>, data: &[u8]) -> PyResult<Py<PyAny>> {
+        use crate::callbacks::SockSendallCallback;
+                                                                                                                                                            
+        let py = slf.py();
+        let self_ = slf.borrow();
+        
+        let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
+        let data_vec = data.to_vec();
+        
+        // Try to send all data immediately
+        let mut total_sent = 0;
+        while total_sent < data_vec.len() {
+            unsafe {
+                let n = libc::send(
+                    fd, 
+                    data_vec[total_sent..].as_ptr() as *const libc::c_void, 
+                    data_vec.len() - total_sent, 
+                    0
+                );
+                
+                if n > 0 {
+                    total_sent += n as usize;
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    match err.kind() {
+                        std::io::ErrorKind::WouldBlock => break,
+                        _ if err.raw_os_error() == Some(libc::EAGAIN) => break,
+                        _ => {
+                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+        
+        if total_sent == data_vec.len() {
+            // All data sent
+            let fut = PendingFuture::new();
+            fut.set_result(py, py.None())?;
+            return Ok(Py::new(py, fut)?.into_any());
+        }
+        
+        // Need to wait for writable
+        let future = self_.create_future(py)?;
+        let loop_ref = slf.clone().unbind();
+        let remaining_data = data_vec[total_sent..].to_vec();
+        
+        let callback_obj = SockSendallCallback::new(loop_ref, future.clone_ref(py), fd, remaining_data, 0);
+        let callback = Py::new(py, callback_obj)?;
+        
+        self_.add_writer(py, fd, callback.into_any())?;
+        
+        Ok(future.into_any())
+    }
+
     #[pyo3(signature = (protocol_factory, host=None, port=None, **_kwargs))]
     fn create_connection(slf: &Bound<'_, Self>, protocol_factory: Py<PyAny>, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
