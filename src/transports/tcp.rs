@@ -8,6 +8,7 @@ use parking_lot::Mutex;
 use crate::utils::VeloxResult;
 use crate::event_loop::VeloxLoop;
 use super::future::{CompletedFuture, PendingFuture};
+use crate::transports::{TransportFactory, DefaultTransportFactory, StreamTransport, Transport};
 
 // Pure Rust socket wrapper to avoid importing Python's socket module
 #[pyclass(module = "veloxloop._veloxloop")]
@@ -135,15 +136,22 @@ impl TcpServer {
                 Ok((stream, _addr)) => {
                     // Create protocol
                      let protocol = self.protocol_factory.call0(py)?;
-                     // Create Transport
-                     let transport = TcpTransport::new(self.loop_.clone_ref(py), stream, protocol.clone_ref(py))?;
-                     let transport_py = Py::new(py, transport)?;
+                     // Create Transport using factory
+                     let factory = DefaultTransportFactory;
+                     let loop_py = self.loop_.clone_ref(py).into_any();
+                     
+                     let transport_py = factory.create_tcp(
+                         py,
+                         loop_py,
+                         stream,
+                         protocol.clone_ref(py),
+                     )?;
                      
                      // Connection made
                      protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;
                      // Start reading
                      let read_ready = transport_py.getattr(py, "_read_ready")?;
-                     let fd = transport_py.borrow(py).fd;
+                     let fd = transport_py.getattr(py, "fileno")?.call0(py)?.extract::<i32>(py)?;
                      self.loop_.bind(py).borrow().add_reader(py, fd, read_ready)?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
@@ -198,12 +206,11 @@ pub struct TcpTransport {
     write_buffer_low: usize,
 }
 
-#[pymethods]
-impl TcpTransport {
-    #[pyo3(signature = (name, default=None))]
+
+// Implement Transport trait for TcpTransport
+impl crate::transports::Transport for TcpTransport {
     fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
-        // Implement peername, sockname, socket, etc.
-        // Based on asyncio transport protocol
+        // Delegate to the pymethods implementation
         match name {
             "peername" => {
                 if let Some(stream) = self.stream.as_ref() {
@@ -231,34 +238,74 @@ impl TcpTransport {
                 }
                 Ok(default.unwrap_or_else(|| py.None()))
             }
-            "compression" => {
-                // No compression support
-                Ok(default.unwrap_or_else(|| py.None()))
-            }
-            "cipher" => {
-                // No SSL support yet
-                Ok(default.unwrap_or_else(|| py.None()))
-            }
-            "peercert" => {
-                // No SSL support yet
-                Ok(default.unwrap_or_else(|| py.None()))
-            }
-            "sslcontext" => {
-                // No SSL support yet
-                Ok(default.unwrap_or_else(|| py.None()))
-            }
             _ => Ok(default.unwrap_or_else(|| py.None()))
         }
     }
+    
+    fn is_closing(&self) -> bool {
+        self.closing
+    }
+    
+    fn get_fd(&self) -> RawFd {
+        self.fd
+    }
+    
+}
 
+// Implement StreamTransport trait for TcpTransport
+impl crate::transports::StreamTransport for TcpTransport {
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.closing {
+            return Ok(());
+        }
+        
+        self.closing = true;
+        
+        if self.write_buffer.is_empty() {
+            self.force_close(py)?;
+        } else {
+            // Writer will be added to flush buffer
+        }
+        Ok(())
+    }
+    
+    fn force_close(&mut self, py: Python<'_>) -> PyResult<()> {
+        self._force_close(py)
+    }
+    
+    fn write(&mut self, _py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        if let Some(mut stream) = self.stream.as_ref() {
+            match stream.write(data) {
+                Ok(n) if n == data.len() => {
+                    // All written
+                }
+                Ok(n) => {
+                    // Partial write
+                    self.write_buffer.extend_from_slice(&data[n..]);
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    self.write_buffer.extend_from_slice(data);
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    fn write_eof(&mut self) -> PyResult<()> {
+        if let Some(stream) = self.stream.as_ref() {
+            stream.shutdown(std::net::Shutdown::Write)?;
+        }
+        Ok(())
+    }
+    
     fn get_write_buffer_size(&self) -> usize {
         self.write_buffer.len()
     }
     
-    #[pyo3(signature = (high=None, low=None))]
     fn set_write_buffer_limits(&mut self, py: Python<'_>, high: Option<usize>, low: Option<usize>) -> PyResult<()> {
-        // Set the high and low watermarks for the write buffer
-        // Default values are defined in asyncio: high=64KB, low=high//2 if not specified
         const DEFAULT_HIGH: usize = 64 * 1024;
         
         let high_limit = high.unwrap_or(DEFAULT_HIGH);
@@ -273,7 +320,6 @@ impl TcpTransport {
         self.write_buffer_high = high_limit;
         self.write_buffer_low = low_limit;
         
-        // Call _maybe_pause_protocol() if buffer size exceeds high water mark
         if self.write_buffer.len() > self.write_buffer_high {
             let _ = self.protocol.call_method0(py, "pause_writing");
         }
@@ -281,15 +327,90 @@ impl TcpTransport {
         Ok(())
     }
     
-    fn write_eof(&mut self) -> PyResult<()> {
+    fn read_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(stream) = self.stream.as_ref() {
-            stream.shutdown(std::net::Shutdown::Write)?;
+            let mut buf = [0u8; 4096];
+            let mut s = stream;
+            match std::io::Read::read(&mut s, &mut buf) {
+                Ok(0) => {
+                    // EOF
+                    if let Ok(res) = self.protocol.call_method0(py, "eof_received") {
+                        if let Ok(keep_open) = res.extract::<bool>(py) {
+                            if !keep_open {
+                                self.close(py)?;
+                            }
+                        } else {
+                            self.close(py)?;
+                        }
+                    } else {
+                        self.close(py)?;
+                    }
+                }
+                Ok(n) => {
+                    let py_data = PyBytes::new(py, &buf[..n]);
+                    self.protocol.call_method1(py, "data_received", (py_data,))?;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(())
     }
+    
+    fn write_ready(&mut self, py: Python<'_>) -> PyResult<()> {
+        if let Some(mut stream) = self.stream.as_ref() {
+            if !self.write_buffer.is_empty() {
+                match stream.write(&self.write_buffer) {
+                    Ok(n) => {
+                        self.write_buffer.drain(0..n);
+                        if self.write_buffer.is_empty() {
+                            let fd = self.fd;
+                            self.loop_.bind(py).borrow().remove_writer(py, fd)?;
+                        }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(e) => {
+                        return Err(e.into());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl TcpTransport {
+    #[pyo3(signature = (name, default=None))]
+    fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        // Delegate to trait implementation
+        Transport::get_extra_info(self, py, name, default)
+    }
+
+    fn get_write_buffer_size(&self) -> usize {
+        // Delegate to trait implementation
+        StreamTransport::get_write_buffer_size(self)
+    }
+    
+    #[pyo3(signature = (high=None, low=None))]
+    fn set_write_buffer_limits(&mut self, py: Python<'_>, high: Option<usize>, low: Option<usize>) -> PyResult<()> {
+        // Delegate to trait implementation
+        StreamTransport::set_write_buffer_limits(self, py, high, low)
+    }
+    
+    fn write_eof(&mut self) -> PyResult<()> {
+        // Delegate to trait implementation
+        StreamTransport::write_eof(self)
+    }
 
     fn is_closing(&self) -> bool {
-        self.closing
+        // Delegate to trait implementation
+        Transport::is_closing(self)
+    }
+    
+    fn fileno(&self) -> RawFd {
+        // Delegate to trait implementation
+        Transport::get_fd(self)
     }
 
     fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
@@ -302,21 +423,16 @@ impl TcpTransport {
         }
         
         let needs_writer;
-        let should_force_close;
         
         {
              let mut self_ = slf.borrow_mut();
-             self_.closing = true;
-             should_force_close = self_.write_buffer.is_empty();
+             // Delegate to trait implementation
+             StreamTransport::close(&mut *self_, py)?;
              needs_writer = !self_.write_buffer.is_empty();
         }
         
-        if should_force_close {
-             let mut self_ = slf.borrow_mut();
-             self_._force_close(py)?;
-        } else if needs_writer {
+        if needs_writer {
              // Ensure writer is active to flush buffer
-             // Logic similar to write()
              let self_ = slf.borrow();
              let fd = self_.fd;
              let method = slf.getattr("_write_ready")?;
@@ -342,109 +458,31 @@ impl TcpTransport {
 
     fn write(slf: &Bound<'_, Self>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
         let bytes = data.as_bytes();
-
         let mut self_ = slf.borrow_mut();
         
-        // Try writing directly
-        if let Some(mut stream) = self_.stream.as_ref() {
-             // Non-blocking write
-             match stream.write(bytes) {
-                 Ok(n) if n == bytes.len() => {
-                     // All written
-                 }
-                 Ok(n) => {
-                     // Partial write
-                     self_.write_buffer.extend_from_slice(&bytes[n..]);
-                     // Register writer
-                     drop(self_); // Drop mutable borrow
-                     slf.borrow().add_writer(slf)?;
-                 }
-                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                     self_.write_buffer.extend_from_slice(bytes);
-                     // Register writer
-                     drop(self_);
-                     slf.borrow().add_writer(slf)?;
-                 }
-                 Err(e) => {
-                     // Report error to protocol?
-                     return Err(e.into());
-                 }
-             }
+        // Delegate to trait implementation
+        StreamTransport::write(&mut *self_, slf.py(), bytes)?;
+        
+        // Register writer if needed
+        if !self_.write_buffer.is_empty() {
+            drop(self_);
+            slf.borrow().add_writer(slf)?;
         }
         Ok(())
     }
     
     // Internal callback called by loop when writable
     fn _write_ready(&mut self, py: Python<'_>) -> PyResult<()> {
-        if let Some(mut stream) = self.stream.as_ref() {
-            if !self.write_buffer.is_empty() {
-                match stream.write(&self.write_buffer) {
-                    Ok(n) => {
-                         self.write_buffer.drain(0..n);
-                         if self.write_buffer.is_empty() {
-                              let fd = self.fd;
-                              self.loop_.bind(py).borrow().remove_writer(py, fd)?;
-                         }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Still waiting
-                    }
-                    Err(e) => {
-                         // Error, maybe close?
-                         // self.close(py)?; 
-                         return Err(e.into());
-                    }
-                }
-            }
-        }
-        Ok(())
+        // Delegate to trait implementation
+        StreamTransport::write_ready(self, py)
     }
 
     fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
+        let mut self_ = slf.borrow_mut();
         
-        let (read_result, protocol) = {
-             let self_ = slf.borrow();
-             let protocol = self_.protocol.clone_ref(py);
-             
-             if let Some(stream) = self_.stream.as_ref() {
-                  let mut buf = [0u8; 4096];
-                  // Read using &TcpStream impl of Read (which works for shared reference)
-                  
-                  // Use io::Read logic
-                  let mut s = stream; // s is &TcpStream
-                  match std::io::Read::read(&mut s, &mut buf) {
-                      Ok(0) => (Ok(None), protocol),
-                      Ok(n) => (Ok(Some(Vec::from(&buf[..n]))), protocol),
-                      Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-                      Err(e) => (Err(e), protocol),
-                  }
-             } else {
-                  return Ok(());
-             }
-        };
-        
-        match read_result {
-             Ok(Some(data)) => {
-                  let py_data = PyBytes::new(py, &data);
-                  protocol.call_method1(py, "data_received", (py_data,))?;
-             }
-             Ok(None) => {
-                  if let Ok(res) = protocol.call_method0(py, "eof_received") {
-                       if let Ok(keep_open) = res.extract::<bool>(py) {
-                           if !keep_open {
-                               Self::close(&slf)?;
-                           }
-                       } else {
-                           Self::close(&slf)?;
-                       }
-                  } else {
-                       Self::close(&slf)?;
-                  }
-             }
-             Err(e) => return Err(e.into()),
-        }
-        Ok(())
+        // Delegate to trait implementation
+        StreamTransport::read_ready(&mut *self_, py)
     }
 }
 

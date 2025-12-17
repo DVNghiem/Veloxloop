@@ -7,6 +7,7 @@ use parking_lot::Mutex;
 
 use crate::utils::VeloxResult;
 use crate::event_loop::VeloxLoop;
+use crate::transports::{Transport, DatagramTransport};
 
 /// Pure Rust UDP socket wrapper to avoid importing Python's socket module
 #[pyclass(module = "veloxloop._veloxloop")]
@@ -64,14 +65,9 @@ pub struct UdpTransport {
     allow_broadcast: bool,
 }
 
-#[pymethods]
-impl UdpTransport {
-    /// Convert a SocketAddr to a Python tuple
-    /// For IPv4: (ip, port)
-    /// For IPv6: (ip, port, flowinfo, scope_id)
-    /// This is a helper for get_extra_info to format addresses properly
-    
-    #[pyo3(signature = (name, default=None))]
+
+// Implement Transport trait for UdpTransport
+impl crate::transports::Transport for UdpTransport {
     fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match name {
             "socket" => {
@@ -96,9 +92,115 @@ impl UdpTransport {
             _ => Ok(default.unwrap_or_else(|| py.None()))
         }
     }
-
+    
     fn is_closing(&self) -> bool {
         self.closing
+    }
+    
+    fn get_fd(&self) -> RawFd {
+        self.fd
+    }
+}
+
+// Implement DatagramTransport trait for UdpTransport
+impl crate::transports::DatagramTransport for UdpTransport {
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.closing {
+            return Ok(());
+        }
+        
+        self.closing = true;
+        self._force_close(py)?;
+        Ok(())
+    }
+    
+    fn sendto(&self, _py: Python<'_>, data: &[u8], addr: Option<(String, u16)>) -> PyResult<()> {
+        if self.closing {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Cannot send on closing transport"
+            ));
+        }
+        
+        let socket_guard = self.socket.lock();
+        if let Some(socket) = socket_guard.as_ref() {
+            let result = if let Some((ip, port)) = addr {
+                let target_addr: std::net::SocketAddr = format!("{}:{}", ip, port)
+                    .parse()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Invalid address: {}", e)
+                    ))?;
+                socket.send_to(data, target_addr)
+            } else if let Some(remote) = self.remote_addr {
+                socket.send_to(data, remote)
+            } else {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "No address specified and socket is not connected"
+                ));
+            };
+            
+            match result {
+                Ok(_) => Ok(()),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    Err(PyErr::new::<pyo3::exceptions::PyBlockingIOError, _>(
+                        "Socket buffer full"
+                    ))
+                }
+                Err(e) => Err(e.into()),
+            }
+        } else {
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Socket is closed"
+            ))
+        }
+    }
+    
+    fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.close(py)
+    }
+    
+    fn read_ready(&self, py: Python<'_>) -> PyResult<()> {
+        let socket_guard = self.socket.lock();
+        
+        if let Some(socket) = socket_guard.as_ref() {
+            let mut buf = [0u8; 65536];
+            
+            match socket.recv_from(&mut buf) {
+                Ok((n, addr)) => {
+                    drop(socket_guard);
+                    
+                    let py_data = PyBytes::new(py, &buf[..n]);
+                    let py_addr = crate::utils::ipv6::socket_addr_to_tuple(py, addr)?;
+                    
+                    self.protocol.call_method1(py, "datagram_received", (py_data, py_addr))?;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => {
+                    drop(socket_guard);
+                    let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string());
+                    self.protocol.call_method1(py, "error_received", (py_err,))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl UdpTransport {
+    #[pyo3(signature = (name, default=None))]
+    fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        // Delegate to trait implementation
+        Transport::get_extra_info(self, py, name, default)
+    }
+
+    fn is_closing(&self) -> bool {
+        // Delegate to trait implementation
+        Transport::is_closing(self)
+    }
+    
+    fn fileno(&self) -> RawFd {
+        // Delegate to trait implementation
+        Transport::get_fd(self)
     }
 
     fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
@@ -112,8 +214,8 @@ impl UdpTransport {
         
         {
             let mut self_ = slf.borrow_mut();
-            self_.closing = true;
-            self_._force_close(py)?;
+            // Delegate to trait implementation
+            DatagramTransport::close(&mut *self_, py)?;
         }
         Ok(())
     }

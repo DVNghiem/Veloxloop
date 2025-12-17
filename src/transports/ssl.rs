@@ -12,6 +12,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use crate::utils::VeloxResult;
 use crate::event_loop::VeloxLoop;
+use crate::transports::{Transport, StreamTransport};
+
 
 /// SSL/TLS Context for configuring secure connections
 #[pyclass(module = "veloxloop._veloxloop")]
@@ -282,9 +284,9 @@ impl TlsConnection {
     }
 }
 
-#[pymethods]
-impl SSLTransport {
-    #[pyo3(signature = (name, default=None))]
+
+// Implement Transport trait for SSLTransport
+impl crate::transports::Transport for SSLTransport {
     fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
         match name {
             "peername" => {
@@ -305,16 +307,13 @@ impl SSLTransport {
                 Ok(self.ssl_context.clone_ref(py).into_any())
             }
             "ssl_object" => {
-                // Return a simple marker that SSL is active
                 Ok(py.None())
             }
             "peercert" => {
-                // Get peer certificate information
                 let state = self.tls_state.lock();
                 let conn = &state.connection;
                 if let Some(certs) = conn.peer_certificates() {
                     if let Some(cert) = certs.first() {
-                        // Return the DER-encoded certificate
                         let cert_bytes = PyBytes::new(py, cert.as_ref());
                         return Ok(cert_bytes.into());
                     }
@@ -322,26 +321,83 @@ impl SSLTransport {
                 Ok(default.unwrap_or_else(|| py.None()))
             }
             "cipher" => {
-                // Could return cipher suite information here
-                // For now, return a simple tuple
                 Ok(default.unwrap_or_else(|| py.None()))
             }
             "compression" => {
-                // TLS 1.3 doesn't support compression
                 Ok(default.unwrap_or_else(|| py.None()))
             }
             _ => {
-                // Delegate to base transport info
                 Ok(default.unwrap_or_else(|| py.None()))
             }
         }
     }
+    
+    fn is_closing(&self) -> bool {
+        self.closing
+    }
+    
+    fn get_fd(&self) -> RawFd {
+        self.fd
+    }
+    
+}
 
+// Implement StreamTransport trait for SSLTransport  
+impl crate::transports::StreamTransport for SSLTransport {
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.closing {
+            return Ok(());
+        }
+        
+        self.closing = true;
+        
+        if self.write_buffer.is_empty() {
+            self.force_close(py)?;
+        }
+        Ok(())
+    }
+    
+    fn force_close(&mut self, py: Python<'_>) -> PyResult<()> {
+        self._force_close(py)
+    }
+    
+    fn write(&mut self, _py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        if self.closing {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Cannot write to closing transport"
+            ));
+        }
+        
+        self.write_buffer.extend_from_slice(data);
+        
+        let mut state = self.tls_state.lock();
+        let mut writer = state.connection.writer();
+        
+        match writer.write_all(data) {
+            Ok(_) => {
+                drop(writer);
+                // Split the mutable borrows by destructuring
+                let TlsState { connection, stream } = &mut *state;
+                match connection.write_tls(stream) {
+                    Ok(_) => Ok(()),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+    
+    fn write_eof(&mut self) -> PyResult<()> {
+        let state = self.tls_state.lock();
+        state.stream.shutdown(std::net::Shutdown::Write)?;
+        Ok(())
+    }
+    
     fn get_write_buffer_size(&self) -> usize {
         self.write_buffer.len()
     }
     
-    #[pyo3(signature = (high=None, low=None))]
     fn set_write_buffer_limits(&mut self, py: Python<'_>, high: Option<usize>, low: Option<usize>) -> PyResult<()> {
         const DEFAULT_HIGH: usize = 64 * 1024;
         
@@ -363,15 +419,128 @@ impl SSLTransport {
         
         Ok(())
     }
+    
+    fn read_ready(&mut self, py: Python<'_>) -> PyResult<()> {
+        let mut state = self.tls_state.lock();
+        
+        // Read TLS records - split the mutable borrows
+        let result = {
+            let TlsState { connection, stream } = &mut *state;
+            connection.process_tls_records(stream)
+        };
+        
+        match result {
+            Ok(_) => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+        
+        // Handle handshake
+        if state.connection.is_handshaking() {
+            if state.connection.wants_write() {
+                let TlsState { connection, stream } = &mut *state;
+                match connection.write_tls(stream) {
+                    Ok(_) => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            
+            if !state.connection.is_handshaking() && !self.handshake_complete {
+                drop(state);
+                self.handshake_complete = true;
+                self.protocol.call_method1(py, "connection_made", (py.None(),))?;
+            }
+            return Ok(());
+        }
+        
+        // Read application data
+        let mut buf = [0u8; 4096];
+        let mut reader = state.connection.reader();
+        
+        match reader.read(&mut buf) {
+            Ok(0) => {
+                drop(reader);
+                drop(state);
+                if let Ok(res) = self.protocol.call_method0(py, "eof_received") {
+                    if let Ok(keep_open) = res.extract::<bool>(py) {
+                        if !keep_open {
+                            self.close(py)?;
+                        }
+                    } else {
+                        self.close(py)?;
+                    }
+                } else {
+                    self.close(py)?;
+                }
+            }
+            Ok(n) => {
+                let data = Vec::from(&buf[..n]);
+                drop(reader);
+                drop(state);
+                let py_data = PyBytes::new(py, &data);
+                self.protocol.call_method1(py, "data_received", (py_data,))?;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(e.into()),
+        }
+        
+        Ok(())
+    }
+    
+    fn write_ready(&mut self, py: Python<'_>) -> PyResult<()> {
+        let mut state = self.tls_state.lock();
+        
+        if state.connection.wants_write() {
+            let TlsState { connection, stream } = &mut *state;
+            match connection.write_tls(stream) {
+                Ok(_) => {
+                    if !connection.wants_write() && self.write_buffer.is_empty() {
+                        drop(state);
+                        self.loop_.bind(py).borrow().remove_writer(py, self.fd)?;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl SSLTransport {
+    #[pyo3(signature = (name, default=None))]
+    fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        // Delegate to trait implementation
+        Transport::get_extra_info(self, py, name, default)
+    }
+
+    fn get_write_buffer_size(&self) -> usize {
+        // Delegate to trait implementation
+        StreamTransport::get_write_buffer_size(self)
+    }
+    
+    #[pyo3(signature = (high=None, low=None))]
+    fn set_write_buffer_limits(&mut self, py: Python<'_>, high: Option<usize>, low: Option<usize>) -> PyResult<()> {
+        // Delegate to trait implementation
+        StreamTransport::set_write_buffer_limits(self, py, high, low)
+    }
 
     fn write_eof(&mut self) -> PyResult<()> {
-        let state = self.tls_state.lock();
-        state.stream.shutdown(std::net::Shutdown::Write)?;
-        Ok(())
+        // Delegate to trait implementation
+        StreamTransport::write_eof(self)
     }
 
     fn is_closing(&self) -> bool {
-        self.closing
+        // Delegate to trait implementation
+        Transport::is_closing(self)
+    }
+    
+    fn fileno(&self) -> RawFd {
+        // Delegate to trait implementation
+        Transport::get_fd(self)
     }
 
     fn close(slf: &Bound<'_, Self>) -> PyResult<()> {

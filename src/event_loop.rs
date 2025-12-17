@@ -755,17 +755,21 @@ impl VeloxLoop {
         // Create protocol instance
         let protocol = protocol_factory.call0(py)?;
         
-        // Create transport
-        use crate::transports::udp::UdpTransport;
-        let transport = UdpTransport::new(
-            loop_obj.clone_ref(py),
+        // Create transport using factory
+        use crate::transports::{TransportFactory, DefaultTransportFactory};
+        let factory = DefaultTransportFactory;
+        let loop_py = loop_obj.clone_ref(py).into_any();
+        
+        let transport_py = factory.create_udp(
+            py,
+            loop_py,
             udp_socket,
             protocol.clone_ref(py),
             remote_sockaddr,
+            allow_broadcast,
         )?;
         
-        let fd = transport.fd();
-        let transport_py = Py::new(py, transport)?;
+        let fd = transport_py.getattr(py, "fileno")?.call0(py)?.extract::<i32>(py)?;
         
         // Call protocol.connection_made(transport)
         protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;

@@ -7,9 +7,9 @@ use std::os::fd::{AsRawFd, RawFd};
 
 use crate::poller::LoopPoller;
 use crate::event_loop::VeloxLoop;
-use crate::transports::tcp::TcpTransport;
-use crate::transports::ssl::{SSLContext, SSLTransport};
+use crate::transports::ssl::SSLContext;
 use crate::transports::future::PendingFuture;
+use crate::transports::{TransportFactory, DefaultTransportFactory};
 
 pub struct Callback {
     pub callback: Py<PyAny>,
@@ -84,18 +84,21 @@ impl AsyncConnectCallback {
                     let protocol_res = self.protocol_factory.call0(py);
                     match protocol_res {
                         Ok(protocol) => {
-                            // Create Transport (SSL or regular TCP)
+                            // Use the transport factory to create transports
+                            let factory = DefaultTransportFactory;
+                            let loop_py = self.loop_.clone_ref(py).into_any();
+                            
                             let transport_result: PyResult<(Py<PyAny>, Py<PyAny>)> = if let Some(ssl_ctx) = &self.ssl_context {
-                                // Create SSL transport
-                                let ssl_transport = SSLTransport::new_client(
-                                    self.loop_.clone_ref(py),
+                                // Create SSL transport using factory
+                                let transport_py = factory.create_ssl(
+                                    py,
+                                    loop_py,
                                     stream,
                                     protocol.clone_ref(py),
-                                    ssl_ctx.clone_ref(py),
+                                    ssl_ctx.clone_ref(py).into_any(),
                                     self.server_hostname.clone(),
-                                    py,
+                                    true, // is_client
                                 )?;
-                                let transport_py = Py::new(py, ssl_transport)?;
                                 
                                 // Add reader for SSL handshake and data
                                 let read_ready = transport_py.getattr(py, "_read_ready")?;
@@ -105,15 +108,15 @@ impl AsyncConnectCallback {
                                 let write_ready = transport_py.getattr(py, "_write_ready")?;
                                 loop_ref.borrow().add_writer(py, fd, write_ready)?;
                                 
-                                Ok((transport_py.into_any(), protocol.clone_ref(py)))
+                                Ok((transport_py, protocol.clone_ref(py)))
                             } else {
-                                // Create regular TCP transport
-                                let transport = TcpTransport::new(
-                                    self.loop_.clone_ref(py),
+                                // Create regular TCP transport using factory
+                                let transport_py = factory.create_tcp(
+                                    py,
+                                    loop_py,
                                     stream,
                                     protocol.clone_ref(py),
                                 )?;
-                                let transport_py = Py::new(py, transport)?;
                                 
                                 // connection_made
                                 protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;
@@ -122,7 +125,7 @@ impl AsyncConnectCallback {
                                 let read_ready = transport_py.getattr(py, "_read_ready")?;
                                 loop_ref.borrow().add_reader(py, fd, read_ready)?;
                                 
-                                Ok((transport_py.into_any(), protocol.clone_ref(py)))
+                                Ok((transport_py, protocol.clone_ref(py)))
                             };
                             
                             match transport_result {
