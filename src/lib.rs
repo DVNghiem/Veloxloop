@@ -10,7 +10,9 @@ mod policy;
 mod transports;
 
 use event_loop::VeloxLoop;
-use transports::tcp::{TcpTransport, TcpServer, SocketWrapper, CompletedFuture};
+use transports::tcp::{TcpTransport, TcpServer, SocketWrapper};
+use transports::future::CompletedFuture;
+use callbacks::AsyncConnectCallback;
 use policy::VeloxLoopPolicy;
 
 #[pymodule(gil_used = false)]
@@ -20,6 +22,7 @@ fn _veloxloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TcpServer>()?;
     m.add_class::<SocketWrapper>()?;
     m.add_class::<CompletedFuture>()?;
+    m.add_class::<AsyncConnectCallback>()?;
     m.add_class::<VeloxLoopPolicy>()?;
     Ok(())
 }

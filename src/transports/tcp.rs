@@ -1,104 +1,18 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyTuple};
-use std::net::{TcpListener, TcpStream, SocketAddr};
+use pyo3::types::PyBytes;
+use std::net::{TcpStream, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::Arc;
-use parking_lot::Mutex;
-use std::io::{Read, Write, self};
+use std::io::{Write, self};
 
-use crate::utils::{VeloxResult, VeloxError};
+use crate::utils::VeloxResult;
 use crate::event_loop::VeloxLoop;
-use super::Transport;
+use super::future::CompletedFuture;
 
 // Pure Rust socket wrapper to avoid importing Python's socket module
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct SocketWrapper {
     fd: RawFd,
     addr: SocketAddr,
-}
-
-#[pyclass(module = "veloxloop._veloxloop")]
-pub struct AsyncConnectCallback {
-    loop_: Py<PyAny>,
-    future: Py<PyAny>,
-    protocol_factory: Py<PyAny>,
-    stream: Option<std::net::TcpStream>,
-    fd: RawFd,
-    // We need to keep stream alive? Yes.
-}
-
-#[pymethods]
-impl AsyncConnectCallback {
-    fn __call__(&mut self, py: Python<'_>) -> PyResult<()> {
-        let loop_ = self.loop_.clone_ref(py);
-        let fd = self.fd;
-        
-        // Unregister writer (ourselves)
-        // Unregister writer (ourselves)
-        if let Ok(bound) = loop_.bind(py).downcast::<VeloxLoop>() {
-             bound.borrow().remove_writer(py, fd)?;
-        } else {
-             loop_.call_method1(py, "remove_writer", (fd,))?;
-        }
-        
-        // Take stream
-        if let Some(stream) = self.stream.take() {
-            // Check error
-            let res = stream.take_error();
-             match res {
-                 Ok(None) => {
-                     eprintln!("DEBUG: Connection success fd={}", fd);
-                     // Connected!
-                     // Create protocol
-                     let protocol_res = self.protocol_factory.call0(py);
-                     match protocol_res {
-                         Ok(protocol) => {
-                              // Create Transport
-                              let transport_res = TcpTransport::new(py, loop_.clone_ref(py), stream, protocol.clone_ref(py));
-                              match transport_res {
-                                  Ok(transport) => {
-                                      let transport_py = Py::new(py, transport)?;
-                                      // connection_made
-                                      if let Err(e) = protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),)) {
-                                          self.future.call_method1(py, "set_exception", (e,))?;
-                                          return Ok(());
-                                      }
-                                      
-                                      eprintln!("DEBUG: calling add_reader for fd={}", fd);
-                                      // Add reader
-                                      // We can use transport_py object
-                                      let read_ready = transport_py.getattr(py, "_read_ready")?;
-                                      if let Ok(bound) = loop_.bind(py).downcast::<VeloxLoop>() {
-                                           bound.borrow().add_reader(py, fd, read_ready)?;
-                                      } else {
-                                           loop_.call_method1(py, "add_reader", (fd, read_ready))?;
-                                      }
-                                      
-                                      // Set result: (transport, protocol)
-                                      let res = PyTuple::new(py, &[transport_py.into_any(), protocol])?;
-                                      self.future.call_method1(py, "set_result", (res,))?;
-                                  }
-                                  Err(e) => {
-                                      // Convert VeloxError to PyErr
-                                      let py_err: PyErr = e.into();
-                                      self.future.call_method1(py, "set_exception", (py_err,))?;
-                                  }
-                              }
-                         }
-                         Err(e) => {
-                             self.future.call_method1(py, "set_exception", (e,))?;
-                         }
-                     }
-                 }
-                 Ok(Some(e)) | Err(e) => {
-                     // Error connecting
-                     let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string());
-                     self.future.call_method1(py, "set_exception", (py_err,))?;
-                 }
-             }
-        }
-        Ok(())
-    }
 }
 
 #[pymethods]
@@ -118,48 +32,10 @@ impl SocketWrapper {
     }
 }
 
-// Pure Rust completed future to avoid importing asyncio.Future
-#[pyclass(module = "veloxloop._veloxloop")]
-pub struct CompletedFuture {
-    result: Py<PyAny>,
-}
-
-#[pymethods]
-impl CompletedFuture {
-    fn __await__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        // Return self as an iterator - already completed
-        slf
-    }
-    
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-    
-    fn __next__(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-        // Iterator is exhausted, raise StopIteration with result
-        Err(pyo3::exceptions::PyStopIteration::new_err((self.result.clone_ref(py),)))
-    }
-    
-    fn result(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok(self.result.clone_ref(py))
-    }
-    
-    fn done(&self) -> bool {
-        true
-    }
-}
-
-impl CompletedFuture {
-    pub fn new(result: Py<PyAny>) -> Self {
-        Self { result }
-    }
-}
-
-
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct TcpServer {
     listener: Option<std::net::TcpListener>,
-    loop_: Py<PyAny>,
+    loop_: Py<VeloxLoop>,
     protocol_factory: Py<PyAny>,
     active: bool,
 }
@@ -184,11 +60,7 @@ impl TcpServer {
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(listener) = self.listener.as_ref() {
             let fd = listener.as_raw_fd();
-            if let Ok(bound) = self.loop_.bind(py).downcast::<VeloxLoop>() {
-                 bound.borrow().remove_reader(py, fd)?;
-            } else {
-                 let _ = self.loop_.call_method1(py, "remove_reader", (fd,));
-            }
+            self.loop_.bind(py).borrow().remove_reader(py, fd)?;
         }
         self.active = false;
         self.listener = None;
@@ -196,7 +68,7 @@ impl TcpServer {
     }
     
     fn get_loop(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok(self.loop_.clone_ref(py))
+        Ok(self.loop_.clone_ref(py).into_any())
     }
     
     fn is_serving(&self) -> bool {
@@ -208,7 +80,7 @@ impl TcpServer {
     }
     
     // wait_closed is async. We return a completed future-like object
-    fn wait_closed(&self, py: Python<'_>) -> PyResult<PyObject> {
+    fn wait_closed(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
          // Create a simple completed future wrapper
          let fut = CompletedFuture::new(py.None());
          Ok(Py::new(py, fut)?.into())
@@ -239,7 +111,7 @@ impl TcpServer {
                     // Create protocol
                      let protocol = self.protocol_factory.call0(py)?;
                      // Create Transport
-                     let transport = TcpTransport::new(py, self.loop_.clone_ref(py), stream, protocol.clone_ref(py))?;
+                     let transport = TcpTransport::new(self.loop_.clone_ref(py), stream, protocol.clone_ref(py))?;
                      let transport_py = Py::new(py, transport)?;
                      
                      // Connection made
@@ -247,11 +119,7 @@ impl TcpServer {
                      // Start reading
                      let read_ready = transport_py.getattr(py, "_read_ready")?;
                      let fd = transport_py.borrow(py).fd;
-                     if let Ok(bound) = self.loop_.bind(py).downcast::<VeloxLoop>() {
-                          bound.borrow().add_reader(py, fd, read_ready)?;
-                     } else {
-                          self.loop_.call_method1(py, "add_reader", (fd, read_ready))?;
-                     }
+                     self.loop_.bind(py).borrow().add_reader(py, fd, read_ready)?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e.into()),
@@ -266,7 +134,7 @@ pub struct TcpTransport {
     fd: RawFd,
     stream: Option<std::net::TcpStream>,
     protocol: Py<PyAny>,
-    loop_: Py<PyAny>,
+    loop_: Py<VeloxLoop>,
     closing: bool,
     // Buffer for outgoing data? Asyncio transports buffer if socket is full.
     // For MVP we might BLOCK or fail if full? No, we must buffer.
@@ -275,7 +143,7 @@ pub struct TcpTransport {
 
 #[pymethods]
 impl TcpTransport {
-    fn get_extra_info(&self, name: &str) -> PyResult<Option<String>> {
+    fn get_extra_info(&self, _name: &str) -> PyResult<Option<String>> {
         // Implement peername, sockname etc.
         Ok(None)
     }
@@ -327,7 +195,7 @@ impl TcpTransport {
              let self_ = slf.borrow();
              let fd = self_.fd;
              let method = slf.getattr("_write_ready")?;
-             self_.loop_.call_method1(py, "add_writer", (fd, method))?;
+             self_.loop_.bind(py).borrow().add_writer(py, fd, method.unbind())?;
         }
         Ok(())
     }
@@ -335,14 +203,10 @@ impl TcpTransport {
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
         let fd = self.fd;
         
-        if let Ok(bound) = self.loop_.bind(py).downcast::<VeloxLoop>() {
-             let loop_ = bound.borrow();
-             loop_.remove_reader(py, fd)?;
-             loop_.remove_writer(py, fd)?;
-        } else {
-             let _ = self.loop_.call_method1(py, "remove_reader", (fd,));
-             let _ = self.loop_.call_method1(py, "remove_writer", (fd,));
-        }
+        let loop_ = self.loop_.bind(py).borrow();
+        loop_.remove_reader(py, fd)?;
+        loop_.remove_writer(py, fd)?;
+        drop(loop_);
         
         self.stream = None; 
         
@@ -353,7 +217,6 @@ impl TcpTransport {
 
     fn write(slf: &Bound<'_, Self>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
         let bytes = data.as_bytes();
-        let py = slf.py();
 
         let mut self_ = slf.borrow_mut();
         
@@ -395,11 +258,7 @@ impl TcpTransport {
                          self.write_buffer.drain(0..n);
                          if self.write_buffer.is_empty() {
                               let fd = self.fd;
-                              if let Ok(bound) = self.loop_.bind(py).downcast::<VeloxLoop>() {
-                                   bound.borrow().remove_writer(py, fd)?;
-                              } else {
-                                   self.loop_.call_method1(py, "remove_writer", (fd,))?;
-                              }
+                              self.loop_.bind(py).borrow().remove_writer(py, fd)?;
                          }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -464,22 +323,8 @@ impl TcpTransport {
     }
 }
 
-
-impl AsyncConnectCallback {
-    pub fn new(loop_: Py<PyAny>, future: Py<PyAny>, protocol_factory: Py<PyAny>, stream: std::net::TcpStream) -> Self {
-        let fd = stream.as_raw_fd();
-        Self {
-            loop_,
-            future,
-            protocol_factory,
-            stream: Some(stream),
-            fd,
-        }
-    }
-}
-
 impl TcpServer {
-    pub fn new(listener: std::net::TcpListener, loop_: Py<PyAny>, protocol_factory: Py<PyAny>) -> Self {
+    pub fn new(listener: std::net::TcpListener, loop_: Py<VeloxLoop>, protocol_factory: Py<PyAny>) -> Self {
         Self {
             listener: Some(listener),
             loop_,
@@ -498,7 +343,7 @@ impl TcpServer {
 }
 
 impl TcpTransport {
-    pub fn new(py: Python<'_>, loop_: Py<PyAny>, stream: std::net::TcpStream, protocol: Py<PyAny>) -> VeloxResult<Self> {
+    pub fn new(loop_: Py<VeloxLoop>, stream: std::net::TcpStream, protocol: Py<PyAny>) -> VeloxResult<Self> {
         stream.set_nonblocking(true)?;
         let fd = stream.as_raw_fd();
         
@@ -516,11 +361,7 @@ impl TcpTransport {
     fn add_writer(&self, slf: &Bound<'_, Self>) -> PyResult<()> {
         let method = slf.getattr("_write_ready")?;
         let py = slf.py();
-        if let Ok(bound) = self.loop_.bind(py).downcast::<VeloxLoop>() {
-             bound.borrow().add_writer(py, self.fd, method.unbind())?;
-        } else {
-             self.loop_.call_method1(py, "add_writer", (self.fd, method))?;
-        }
+        self.loop_.bind(py).borrow().add_writer(py, self.fd, method.unbind())?;
         Ok(())
     }
 }

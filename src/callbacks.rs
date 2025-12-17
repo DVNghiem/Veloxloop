@@ -1,8 +1,13 @@
 use pyo3::prelude::*;
+use pyo3::types::PyTuple;
 use std::collections::VecDeque;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::os::fd::{AsRawFd, RawFd};
+
 use crate::poller::LoopPoller;
+use crate::event_loop::VeloxLoop;
+use crate::transports::tcp::TcpTransport;
 
 pub struct Callback {
     pub callback: Py<PyAny>,
@@ -45,5 +50,101 @@ impl CallbackQueue {
     
     pub fn is_empty(&self) -> bool {
         self.queue.lock().is_empty()
+    }
+}
+
+/// Callback for async TCP connection establishment
+#[pyclass(module = "veloxloop._veloxloop")]
+pub struct AsyncConnectCallback {
+    loop_: Py<VeloxLoop>,
+    future: Py<PyAny>,
+    protocol_factory: Py<PyAny>,
+    stream: Option<std::net::TcpStream>,
+    fd: RawFd,
+}
+
+#[pymethods]
+impl AsyncConnectCallback {
+    fn __call__(&mut self, py: Python<'_>) -> PyResult<()> {
+        let fd = self.fd;
+        
+        // Unregister writer (ourselves) using VeloxLoop directly
+        let loop_ref = self.loop_.bind(py);
+        loop_ref.borrow().remove_writer(py, fd)?;
+        
+        // Take stream
+        if let Some(stream) = self.stream.take() {
+            // Check error
+            let res = stream.take_error();
+            match res {
+                Ok(None) => {
+                    eprintln!("DEBUG: Connection success fd={}", fd);
+                    // Connected! Create protocol
+                    let protocol_res = self.protocol_factory.call0(py);
+                    match protocol_res {
+                        Ok(protocol) => {
+                            // Create Transport
+                            let transport_res = TcpTransport::new(
+                                self.loop_.clone_ref(py),
+                                stream,
+                                protocol.clone_ref(py),
+                            );
+                            match transport_res {
+                                Ok(transport) => {
+                                    let transport_py = Py::new(py, transport)?;
+                                    
+                                    // connection_made
+                                    if let Err(e) = protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),)) {
+                                        self.future.call_method1(py, "set_exception", (e,))?;
+                                        return Ok(());
+                                    }
+                                    
+                                    eprintln!("DEBUG: calling add_reader for fd={}", fd);
+                                    // Add reader using VeloxLoop directly
+                                    let read_ready = transport_py.getattr(py, "_read_ready")?;
+                                    loop_ref.borrow().add_reader(py, fd, read_ready)?;
+                                    
+                                    // Set result: (transport, protocol)
+                                    let res = PyTuple::new(py, &[transport_py.into_any(), protocol])?;
+                                    self.future.call_method1(py, "set_result", (res,))?;
+                                }
+                                Err(e) => {
+                                    // Convert VeloxError to PyErr
+                                    let py_err: PyErr = e.into();
+                                    self.future.call_method1(py, "set_exception", (py_err,))?;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.future.call_method1(py, "set_exception", (e,))?;
+                        }
+                    }
+                }
+                Ok(Some(e)) | Err(e) => {
+                    // Error connecting
+                    let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string());
+                    self.future.call_method1(py, "set_exception", (py_err,))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AsyncConnectCallback {
+    pub fn new(
+        loop_: Py<VeloxLoop>,
+        future: Py<PyAny>,
+        protocol_factory: Py<PyAny>,
+        stream: std::net::TcpStream,
+    ) -> Self {
+        let fd = stream.as_raw_fd();
+        Self {
+            loop_,
+            future,
+            protocol_factory,
+            stream: Some(stream),
+            fd,
+        }
     }
 }

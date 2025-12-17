@@ -34,9 +34,11 @@ pub struct VeloxLoop {
 #[pymethods]
 impl VeloxLoop {
     #[new]
-    #[pyo3(signature = (debug=None))] // Updated signature for Option<bool>
-    pub fn new(debug: Option<bool>) -> VeloxResult<Self> { // Made pub and changed debug type
+    #[pyo3(signature = (debug=None))]
+    pub fn new(debug: Option<bool>) -> VeloxResult<Self> {
         let poller = Arc::new(LoopPoller::new()?);
+        let debug_val = debug.unwrap_or(false);
+        eprintln!("VeloxLoop::new called with debug={:?}, using debug_val={}", debug, debug_val);
 
         Ok(Self {
             poller: poller.clone(),
@@ -46,7 +48,7 @@ impl VeloxLoop {
             running: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             closed: AtomicBool::new(false),
-            debug: AtomicBool::new(debug.unwrap_or(false)),
+            debug: AtomicBool::new(debug_val),
             start_time: Instant::now(),
         })
     }
@@ -219,6 +221,16 @@ impl VeloxLoop {
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
+    
+    fn get_debug(&self) -> bool {
+        let val = self.debug.load(Ordering::SeqCst);
+        eprintln!("get_debug() called, returning {}", val);
+        val
+    }
+    
+    fn set_debug(&self, enabled: bool) {
+        self.debug.store(enabled, Ordering::SeqCst);
+    }
 
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
@@ -280,10 +292,10 @@ impl VeloxLoop {
         let fut = slf.call_method0("create_future")?;
         
         // Create Callback
-        use crate::transports::tcp::AsyncConnectCallback;
+        use crate::callbacks::AsyncConnectCallback;
         let loop_obj = slf.clone().unbind();
         let fut_obj = fut.clone().unbind(); 
-        let callback = AsyncConnectCallback::new(loop_obj.clone_ref(py).into_any(), fut_obj.clone_ref(py), protocol_factory, stream);
+        let callback = AsyncConnectCallback::new(loop_obj.clone_ref(py), fut_obj.clone_ref(py), protocol_factory, stream);
         let callback_py = Py::new(py, callback)?;
         
         // Register Writer (for Connect)
@@ -309,7 +321,7 @@ impl VeloxLoop {
         listener.set_nonblocking(true)?;
         
         // 2. Create Server object
-        let server = TcpServer::new(listener, loop_obj.clone_ref(py).into_any(), protocol_factory.clone_ref(py));
+        let server = TcpServer::new(listener, loop_obj.clone_ref(py), protocol_factory.clone_ref(py));
         let server = Py::new(py, server)?;
         
         // 3. Register Accept Handler
@@ -326,7 +338,7 @@ impl VeloxLoop {
         self_.add_reader(py, fd, on_accept)?;
         
         // 4. Return Server object wrapped in completed future
-        let fut = crate::transports::tcp::CompletedFuture::new(server.into());
+        let fut = crate::transports::future::CompletedFuture::new(server.into());
         
         Ok(Py::new(py, fut)?.into())
     }
