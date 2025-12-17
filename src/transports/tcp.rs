@@ -34,7 +34,12 @@ impl AsyncConnectCallback {
         let fd = self.fd;
         
         // Unregister writer (ourselves)
-        loop_.call_method1(py, "remove_writer", (fd,))?;
+        // Unregister writer (ourselves)
+        if let Ok(bound) = loop_.bind(py).downcast::<VeloxLoop>() {
+             bound.borrow().remove_writer(py, fd)?;
+        } else {
+             loop_.call_method1(py, "remove_writer", (fd,))?;
+        }
         
         // Take stream
         if let Some(stream) = self.stream.take() {
@@ -63,7 +68,11 @@ impl AsyncConnectCallback {
                                       // Add reader
                                       // We can use transport_py object
                                       let read_ready = transport_py.getattr(py, "_read_ready")?;
-                                      loop_.call_method1(py, "add_reader", (fd, read_ready))?;
+                                      if let Ok(bound) = loop_.bind(py).downcast::<VeloxLoop>() {
+                                           bound.borrow().add_reader(py, fd, read_ready)?;
+                                      } else {
+                                           loop_.call_method1(py, "add_reader", (fd, read_ready))?;
+                                      }
                                       
                                       // Set result: (transport, protocol)
                                       let res = PyTuple::new(py, &[transport_py.into_any(), protocol])?;
@@ -175,7 +184,11 @@ impl TcpServer {
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(listener) = self.listener.as_ref() {
             let fd = listener.as_raw_fd();
-            let _ = self.loop_.call_method1(py, "remove_reader", (fd,));
+            if let Ok(bound) = self.loop_.bind(py).downcast::<VeloxLoop>() {
+                 bound.borrow().remove_reader(py, fd)?;
+            } else {
+                 let _ = self.loop_.call_method1(py, "remove_reader", (fd,));
+            }
         }
         self.active = false;
         self.listener = None;
@@ -231,11 +244,14 @@ impl TcpServer {
                      
                      // Connection made
                      protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;
-                     
                      // Start reading
                      let read_ready = transport_py.getattr(py, "_read_ready")?;
                      let fd = transport_py.borrow(py).fd;
-                     self.loop_.call_method1(py, "add_reader", (fd, read_ready))?;
+                     if let Ok(bound) = self.loop_.bind(py).downcast::<VeloxLoop>() {
+                          bound.borrow().add_reader(py, fd, read_ready)?;
+                     } else {
+                          self.loop_.call_method1(py, "add_reader", (fd, read_ready))?;
+                     }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e.into()),
@@ -283,30 +299,51 @@ impl TcpTransport {
         self.closing
     }
 
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        if self.closing {
-            return Ok(());
+    fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        {
+             let self_ = slf.borrow();
+             if self_.closing {
+                 return Ok(());
+             }
         }
-        self.closing = true;
         
-        if self.write_buffer.is_empty() {
-             self._force_close(py)?;
-        } else {
+        let needs_writer;
+        let should_force_close;
+        
+        {
+             let mut self_ = slf.borrow_mut();
+             self_.closing = true;
+             should_force_close = self_.write_buffer.is_empty();
+             needs_writer = !self_.write_buffer.is_empty();
+        }
+        
+        if should_force_close {
+             let mut self_ = slf.borrow_mut();
+             self_._force_close(py)?;
+        } else if needs_writer {
              // Ensure writer is active to flush buffer
-             // We can't easily call self.add_writer without bound instance?
-             // But usually writer is already active if buffer is not empty.
-             // If not, we should adding it.
-             // BUT `TcpTransport::write` adds writer if buffering.
-             // If buffer is not empty, writer SHOULD be registered.
-             // We'll trust that for now, or we can try to ensure it.
+             // Logic similar to write()
+             let self_ = slf.borrow();
+             let fd = self_.fd;
+             let method = slf.getattr("_write_ready")?;
+             self_.loop_.call_method1(py, "add_writer", (fd, method))?;
         }
         Ok(())
     }
     
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
         let fd = self.fd;
-        let _ = self.loop_.call_method1(py, "remove_reader", (fd,));
-        let _ = self.loop_.call_method1(py, "remove_writer", (fd,));
+        
+        if let Ok(bound) = self.loop_.bind(py).downcast::<VeloxLoop>() {
+             let loop_ = bound.borrow();
+             loop_.remove_reader(py, fd)?;
+             loop_.remove_writer(py, fd)?;
+        } else {
+             let _ = self.loop_.call_method1(py, "remove_reader", (fd,));
+             let _ = self.loop_.call_method1(py, "remove_writer", (fd,));
+        }
+        
         self.stream = None; 
         
         // Notify Protocol
@@ -317,18 +354,7 @@ impl TcpTransport {
     fn write(slf: &Bound<'_, Self>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
         let bytes = data.as_bytes();
         let py = slf.py();
-        
-        // We need to access fields. Since methods are on &self or &Bound<Self>, we need to borrow.
-        // But we want to modify state (buffer, stream).
-        // TcpTransport is a pyclass, so we use internal mutability or RefCell?
-        // Wait, #[pyclass] structs in PyO3 usually require &mut self for mutable methods.
-        // But if we use `slf: &Bound<Self>`, we can't get &mut Self easily if it's shared?
-        // Actually, Python objects are interior mutable.
-        // For PyO3, `fn write(&mut self)` locks the object.
-        // BUT we need `slf` to call `add_writer` on the loop.
-        // We can't have both `&mut self` and `&Bound<Self>` referencing the same object in a way that allows calling methods easily?
-        // Actually, `slf.borrow_mut()` gives `PyRefMut<Self>`, from which we can get `&mut Self`.
-        
+
         let mut self_ = slf.borrow_mut();
         
         // Try writing directly
@@ -342,22 +368,14 @@ impl TcpTransport {
                      // Partial write
                      self_.write_buffer.extend_from_slice(&bytes[n..]);
                      // Register writer
-                     let fd = self_.fd;
-                     drop(self_); // Drop mutable borrow before calling python
-                     
-                     let method = slf.getattr("_write_ready")?;
-                     let loop_ = slf.borrow().loop_.clone_ref(py);
-                     loop_.call_method1(py, "add_writer", (fd, method))?;
+                     drop(self_); // Drop mutable borrow
+                     slf.borrow().add_writer(slf)?;
                  }
                  Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                      self_.write_buffer.extend_from_slice(bytes);
                      // Register writer
-                     let fd = self_.fd;
                      drop(self_);
-                     
-                     let method = slf.getattr("_write_ready")?;
-                     let loop_ = slf.borrow().loop_.clone_ref(py);
-                     loop_.call_method1(py, "add_writer", (fd, method))?;
+                     slf.borrow().add_writer(slf)?;
                  }
                  Err(e) => {
                      // Report error to protocol?
@@ -376,8 +394,12 @@ impl TcpTransport {
                     Ok(n) => {
                          self.write_buffer.drain(0..n);
                          if self.write_buffer.is_empty() {
-                             let fd = self.fd;
-                             self.loop_.call_method1(py, "remove_writer", (fd,))?;
+                              let fd = self.fd;
+                              if let Ok(bound) = self.loop_.bind(py).downcast::<VeloxLoop>() {
+                                   bound.borrow().remove_writer(py, fd)?;
+                              } else {
+                                   self.loop_.call_method1(py, "remove_writer", (fd,))?;
+                              }
                          }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -403,23 +425,7 @@ impl TcpTransport {
              
              if let Some(stream) = self_.stream.as_ref() {
                   let mut buf = [0u8; 4096];
-                  // Read using &TcpStream impl of Read
-                  match stream.peek(&mut buf) { // Wait, peek? No read. 
-                      // Wait, Read takes &mut self? 
-                      // &TcpStream implements Read!
-                      // let mut s = &*stream; 
-                      // s.read...
-                      
-                      // Actually simply:
-                      // (&*stream).read(...) working?
-                      
-                      // But wait, "read" moves the cursor? TcpStream has no cursor.
-                      // So it consumes data.
-                      
-                      // Wait, verify imports for Read.
-                       Ok(_) => {} // dummy
-                       Err(_) => {} // dummy
-                  }
+                  // Read using &TcpStream impl of Read (which works for shared reference)
                   
                   // Use io::Read logic
                   let mut s = stream; // s is &TcpStream
@@ -507,23 +513,14 @@ impl TcpTransport {
         Ok(transport)
     }
     
-    // We need a helper to start reading because `new` returns Self (not PyObject yet).
-    // The caller (create_connection) should call `transport.start_reading()`.
-    // Or we expose `start_reading` as pymethod?
-    // Actually asyncio transports start reading immediately.
-    // CALLER `create_connection` creates the PyObject. It should call `add_reader`.
-    
-
-     
-    // Let's add a method `maybe_start_reading` that `create_connection` calls?
-    // Or just make `_read_ready` public so `create_connection` can use it?
-    // `_read_ready` is pymethod.
-
-
     fn add_writer(&self, slf: &Bound<'_, Self>) -> PyResult<()> {
-        // Get bound method "self._write_ready"
         let method = slf.getattr("_write_ready")?;
-        self.loop_.call_method1(slf.py(), "add_writer", (self.fd, method))?;
+        let py = slf.py();
+        if let Ok(bound) = self.loop_.bind(py).downcast::<VeloxLoop>() {
+             bound.borrow().add_writer(py, self.fd, method.unbind())?;
+        } else {
+             self.loop_.call_method1(py, "add_writer", (self.fd, method))?;
+        }
         Ok(())
     }
 }

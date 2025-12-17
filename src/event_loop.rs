@@ -90,8 +90,7 @@ impl VeloxLoop {
 
     // Basic I/O methods
 
-     fn add_reader(&self, py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
-        eprintln!("DEBUG: add_reader fd={}", fd);
+    pub fn add_reader(&self, _py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
         let poller = self.poller.clone();
         
         // Lock handles once
@@ -109,16 +108,14 @@ impl VeloxLoop {
             ev.writable = true; 
         }
         if !reader_exists && !writer_exists {
-             eprintln!("DEBUG: registering fd={}", fd);
              unsafe { poller.register(fd, ev)?; }
         } else {
-             eprintln!("DEBUG: modifying fd={}", fd);
              unsafe { poller.modify(fd, ev)?; }
         }
         Ok(())
     }
 
-    fn remove_reader(&self, _py: Python<'_>, fd: RawFd) -> PyResult<bool> {
+    pub fn remove_reader(&self, _py: Python<'_>, fd: RawFd) -> PyResult<bool> {
         let mut handles = self.handles.lock();
         if handles.remove_reader(fd) {
             let writer_exists = handles.get_writer(fd).is_some();
@@ -138,7 +135,7 @@ impl VeloxLoop {
         }
     }
     
-    fn add_writer(&self, py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
+    pub fn add_writer(&self, py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
         let poller = self.poller.clone();
         
         let mut handles = self.handles.lock();
@@ -161,7 +158,7 @@ impl VeloxLoop {
         Ok(())
     }
 
-    fn remove_writer(&self, _py: Python<'_>, fd: RawFd) -> PyResult<bool> {
+    pub fn remove_writer(&self, _py: Python<'_>, fd: RawFd) -> PyResult<bool> {
         let mut handles = self.handles.lock();
         if handles.remove_writer(fd) {
             let reader_exists = handles.get_reader(fd).is_some();
@@ -179,7 +176,6 @@ impl VeloxLoop {
         }
     }
     
-    // Callbacks
     // Callbacks
     #[pyo3(signature = (callback, *args, context=None))]
     fn call_soon(&self, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) {
