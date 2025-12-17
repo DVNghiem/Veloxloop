@@ -74,6 +74,4 @@ The following asyncio features are **not yet implemented** and are planned for f
 
 ### Compatibility & Standards
 - [ ] **PEP 567 context variables** - Full context support in all callbacks
-- [x] **asyncio.Server.serve_forever()** - Server lifecycle management
 - [ ] **ProactorEventLoop equivalence** - Windows proactor-style operations
-- [x] **Full asyncio.streams API** - StreamReader/StreamWriter compatibility (Pure Rust implementation)
