@@ -1,7 +1,6 @@
 import asyncio
-import sys
 from ._veloxloop import VeloxLoop as _VeloxLoopImpl
-from ._veloxloop import VeloxLoopPolicy as _VeloxLoopPolicyImpl # Use Rust implementation
+from ._veloxloop import VeloxLoopPolicy as _VeloxLoopPolicyImpl
 import threading
 
 class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
@@ -11,18 +10,13 @@ class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
     def set_debug(self, enabled):
         self._debug = enabled
 
-        
     def create_task(self, coro, *, name=None, context=None):
-        print(f"DEBUG: create_task {coro}", file=sys.stderr)
         return asyncio.Task(coro, loop=self, name=name, context=context)
 
     def run_until_complete(self, future):
-        print(f"DEBUG: run_until_complete {future}", file=sys.stderr)
         future = asyncio.ensure_future(future, loop=self)
         future.add_done_callback(lambda f: self.stop())
-        print("DEBUG: entering run_forever", file=sys.stderr)
         self.run_forever()
-        print("DEBUG: exited run_forever", file=sys.stderr)
         if not future.done():
             raise RuntimeError("Event loop stopped before Future completed.")
         return future.result()
@@ -37,7 +31,6 @@ class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
              events._set_running_loop(None)
 
     def call_soon(self, callback, *args, context=None):
-        print(f"DEBUG: call_soon {callback} args={args}", file=sys.stderr)
         return super().call_soon(callback, *args, context=context)
 
     def create_future(self):
@@ -52,38 +45,16 @@ class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
         timer_id = super().call_at(when, callback, *args, context=context)
         return VeloxTimerHandle(timer_id, when, self, callback, args, context)
 
-    def call_exception_handler(self, context):
-        # Allow default handling or custom policy
-        # For now, print to stderr if no handler set?
-        # AbstractEventLoop default implementation usually calls handler if set, else logs.
-        # Since we inherit from AbstractEventLoop, maybe `super().call_exception_handler(context)` works?
-        # AbstractEventLoop.call_exception_handler is usually concrete?
-        # No, it's often not implemented in ABC? Actually it IS implemented in BaseEventLoop.
-        # AbstractEventLoop documentation says: "Subclasses must implement..." ?
-        # Actually standard asyncio loop inherits from BaseEventLoop which implements it.
-        # We inherit from AbstractEventLoop directly.
-        # Minimal impl:
-        message = context.get('message')
-        if not message:
-            message = 'Unhandled exception in event loop'
-        
-        # Check for exception
-        exception = context.get('exception')
-        if exception:
-            print(f"{message}: {exception}", file=sys.stderr)
-        else:
-            print(f"{message}", file=sys.stderr)
-
     async def shutdown_asyncgens(self):
-        """Shutdown async generators"""
-        # For now, just return without doing anything
-        # In a complete implementation, this would track and close async generators
-        pass
+        """Shutdown async generators - delegates to Rust implementation"""
+        # Call the Rust implementation which returns a coroutine/task
+        return await super().shutdown_asyncgens()
 
     async def shutdown_default_executor(self, timeout=None):
-        """Shutdown the default executor"""
-        # For now, just return without doing anything
-        # In a complete implementation, this would shutdown the thread pool executor
+        """Shutdown the default executor - for compatibility with asyncio.run"""
+        # asyncio.run calls this with a timeout parameter
+        # For now, we ignore the timeout and just return immediately
+        # In a full implementation, this would shutdown the thread pool executor
         pass
 
     def _timer_handle_cancelled(self, handle):
@@ -104,11 +75,6 @@ class VeloxTimerHandle(asyncio.TimerHandle):
 
     def close(self):
         pass
-        
-    def shutdown_asyncgens(self):
-        # Asyncio.run calls this. Return a dummy future or coroutine.
-        async def _shutdown(): pass
-        return _shutdown()
         
     def _check_running(self):
         if self.is_running():

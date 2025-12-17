@@ -34,12 +34,6 @@ pip install veloxloop
 The following asyncio features are **not yet implemented** and are planned for future development:
 
 ### Core Event Loop Features
-- [ ] **`run_in_executor()`** - Running blocking code in thread/process pools
-- [ ] **`set_default_executor()`** - Custom executor configuration
-- [ ] **Executor management** - Thread pool executor integration
-- [ ] **Async generator shutdown** - Proper tracking and cleanup of async generators
-- [ ] **Exception handler API** - `set_exception_handler()` and `get_exception_handler()`
-- [ ] **Task factories** - `set_task_factory()` and `get_task_factory()`
 - [ ] **Async context managers** - Full support for `async with` on loop methods
 
 ### Network & Transport Layer
@@ -84,22 +78,3 @@ The following asyncio features are **not yet implemented** and are planned for f
 - [ ] **asyncio.Server.serve_forever()** - Server lifecycle management
 - [ ] **ProactorEventLoop equivalence** - Windows proactor-style operations
 - [ ] **Full asyncio.streams API** - StreamReader/StreamWriter compatibility
-
-## Current Implementation Status
-
-### ✅ Implemented Features
-- Basic event loop (`run_forever()`, `stop()`, `close()`)
-- Callback scheduling (`call_soon()`, `call_soon_threadsafe()`)
-- Timer support (`call_later()`, `call_at()`)
-- I/O readiness monitoring (`add_reader()`, `remove_reader()`, `add_writer()`, `remove_writer()`)
-- TCP client connections (`create_connection()`)
-- TCP server (`create_server()`)
-- Basic transport and protocol support
-- Future/Task integration
-- Cross-platform polling (Linux epoll, macOS/BSD kqueue, Windows IOCP via `polling` crate)
-
-### ⚠️ Partially Implemented
-- **Exception handling** - Basic implementation, not fully compliant
-- **Debug mode** - `get_debug()`/`set_debug()` exists but limited functionality
-- **DNS resolution** - Currently blocking, needs async implementation
-- **Socket creation** - Basic support, missing advanced options

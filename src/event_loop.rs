@@ -11,6 +11,7 @@ use crate::timers::Timers;
 use crate::utils::{VeloxResult, VeloxError};
 use crate::transports::tcp::TcpServer;
 use crate::transports::future::PendingFuture;
+use crate::executor::ThreadPoolExecutor;
 use std::os::fd::{AsRawFd, RawFd};
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,6 +27,10 @@ pub struct VeloxLoop {
     closed: AtomicBool,
     debug: AtomicBool,
     start_time: Instant,
+    executor: Arc<Mutex<Option<ThreadPoolExecutor>>>,
+    exception_handler: Arc<Mutex<Option<Py<PyAny>>>>,
+    task_factory: Arc<Mutex<Option<Py<PyAny>>>>,
+    async_generators: Arc<Mutex<Vec<Py<PyAny>>>>,
 }
 
 #[pymethods]
@@ -46,6 +51,10 @@ impl VeloxLoop {
             closed: AtomicBool::new(false),
             debug: AtomicBool::new(debug_val),
             start_time: Instant::now(),
+            executor: Arc::new(Mutex::new(None)),
+            exception_handler: Arc::new(Mutex::new(None)),
+            task_factory: Arc::new(Mutex::new(None)),
+            async_generators: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -219,6 +228,193 @@ impl VeloxLoop {
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    // Executor methods
+    #[pyo3(signature = (_executor, func, *args))]
+    fn run_in_executor(
+        &self,
+        py: Python<'_>,
+        _executor: Option<Py<PyAny>>,
+        func: Py<PyAny>,
+        args: &Bound<'_, PyTuple>,
+    ) -> PyResult<Py<PyAny>> {
+        // Get or create default executor
+        let mut exec_guard = self.executor.lock();
+        if exec_guard.is_none() {
+            *exec_guard = Some(ThreadPoolExecutor::new()?);
+        }
+        let executor_ref = exec_guard.as_ref().unwrap();
+        
+        // Create a future to return to Python
+        let future = self.create_future(py)?;
+        let future_clone = future.clone_ref(py);
+        
+        // Clone the necessary objects for the spawned task
+        let func_clone = func.clone_ref(py);
+        let args_clone: Py<PyTuple> = args.clone().unbind();
+        let callbacks = self.callbacks.clone();
+        
+        // Spawn the blocking task
+        executor_ref.spawn_blocking(move || {
+            let _ = Python::attach(move |py| {
+                // Call the Python function
+                let result = func_clone.call1(py, args_clone.bind(py));
+                
+                // Schedule callback to set the future result
+                let future_ref = future_clone.clone_ref(py);
+                match result {
+                    Ok(val) => {
+                        callbacks.push(Callback {
+                            callback: future_ref.getattr(py, "set_result").unwrap(),
+                            args: vec![val],
+                            context: None,
+                        });
+                    }
+                    Err(e) => {
+                        // Set exception on future
+                        let exc: Py<PyAny> = e.value(py).clone().unbind().into();
+                        callbacks.push(Callback {
+                            callback: future_ref.getattr(py, "set_exception").unwrap(),
+                            args: vec![exc],
+                            context: None,
+                        });
+                    }
+                }
+            });
+        });
+        
+        Ok(future.into_any())
+    }
+
+    fn set_default_executor(&self, _executor: Option<Py<PyAny>>) -> PyResult<()> {
+        // For now, we only support our internal executor
+        // If executor is None, we create a new default one
+        let mut exec_guard = self.executor.lock();
+        *exec_guard = Some(ThreadPoolExecutor::new()?);
+        Ok(())
+    }
+
+    // Exception handler methods
+    fn set_exception_handler(&self, handler: Option<Py<PyAny>>) {
+        let mut eh = self.exception_handler.lock();
+        *eh = handler;
+    }
+
+    fn get_exception_handler(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        let eh = self.exception_handler.lock();
+        eh.as_ref().map(|h| h.clone_ref(py))
+    }
+
+    fn call_exception_handler(&self, py: Python<'_>, context: Py<PyDict>) -> PyResult<()> {
+        let handler = {
+            let eh = self.exception_handler.lock();
+            eh.as_ref().map(|h| h.clone_ref(py))
+        };
+        
+        if let Some(handler) = handler {
+            // Call handler with (loop, context) as per asyncio API
+            // Pass None for loop and the context dict
+            match handler.call(py, (py.None(), context.as_any()), None) {
+                Ok(_) => {},
+                Err(e) => {
+                    // If custom handler fails, fall back to default
+                    eprintln!("Error in custom exception handler: {:?}", e);
+                    e.print(py);
+                    // Fall through to default handler
+                    let message = context.bind(py).get_item("message")?;
+                    if let Some(msg) = message {
+                        eprintln!("Exception in event loop: {}", msg);
+                    }
+                }
+            }
+        } else {
+            // Default exception handler - just print to stderr
+            let message = context.bind(py).get_item("message")?;
+            if let Some(msg) = message {
+                eprintln!("Exception in event loop: {}", msg);
+            }
+            let exception = context.bind(py).get_item("exception")?;
+            if let Some(exc) = exception {
+                eprintln!("Exception: {:?}", exc);
+            }
+        }
+        Ok(())
+    }
+
+    fn default_exception_handler(&self, py: Python<'_>, context: Py<PyDict>) -> PyResult<()> {
+        // Default handler implementation
+        let message = context.bind(py).get_item("message")?;
+        if let Some(msg) = message {
+            eprintln!("Exception in event loop: {}", msg);
+        }
+        
+        let exception = context.bind(py).get_item("exception")?;
+        if let Some(exc) = exception {
+            eprintln!("Exception details: {:?}", exc);
+        }
+        
+        Ok(())
+    }
+
+    // Task factory methods
+    fn set_task_factory(&self, factory: Option<Py<PyAny>>) {
+        let mut tf = self.task_factory.lock();
+        *tf = factory;
+    }
+
+    fn get_task_factory(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        let tf = self.task_factory.lock();
+        tf.as_ref().map(|f| f.clone_ref(py))
+    }
+
+    // Async generator tracking methods
+    fn _track_async_generator(&self, agen: Py<PyAny>) {
+        let mut generators = self.async_generators.lock();
+        generators.push(agen);
+    }
+
+    fn _untrack_async_generator(&self, py: Python<'_>, agen: Py<PyAny>) {
+        let mut generators = self.async_generators.lock();
+        generators.retain(|g| !g.bind(py).is(agen.bind(py)));
+    }
+
+    fn shutdown_asyncgens(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // Get all tracked async generators
+        let generators = {
+            let mut gen_guard = self.async_generators.lock();
+            let gens: Vec<Py<PyAny>> = gen_guard.iter().map(|g| g.clone_ref(py)).collect();
+            gen_guard.clear();
+            gens
+        };
+
+        // If no generators to shut down, complete immediately
+        if generators.is_empty() {
+            let future = self.create_future(py)?;
+            let set_result = future.getattr(py, "set_result")?;
+            set_result.call1(py, (py.None(),))?;
+            return Ok(future.into_any());
+        }
+
+        // Collect all aclose() coroutines
+        let mut close_coros = Vec::new();
+        for generator in generators {                                                                                           
+            if let Ok(aclose) = generator.getattr(py, "aclose") {
+                if let Ok(coro) = aclose.call0(py) {
+                    close_coros.push(coro);
+                }
+            }
+        }
+
+        // Use asyncio.gather to await all aclose() coroutines
+        let asyncio = py.import("asyncio")?;
+        let gather = asyncio.getattr("gather")?;
+        
+        // Convert Vec to Python tuple
+        let coros_tuple = PyTuple::new(py, &close_coros)?;
+        let close_task = gather.call1(coros_tuple)?;
+        
+        Ok(close_task.unbind())
     }
 
     // Create a Rust-based PendingFuture

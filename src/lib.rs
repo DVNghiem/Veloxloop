@@ -8,6 +8,7 @@ mod timers;
 mod event_loop;
 mod policy;
 mod transports;
+mod executor;
 
 use event_loop::VeloxLoop;
 use transports::tcp::{TcpTransport, TcpServer, SocketWrapper};
