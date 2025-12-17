@@ -43,7 +43,6 @@ The following asyncio features are **not yet implemented** and are planned for f
 - [ ] **SSL/TLS support** - Secure socket connections via `ssl` module integration
 - [ ] **Socket options** - Advanced socket configuration (SO_KEEPALIVE, TCP_NODELAY, etc.)
 - [ ] **IPv6 improvements** - Better IPv6 address handling
-- [ ] **DNS resolution** - Async DNS resolution (`getaddrinfo()`, `getnameinfo()`)
 - [ ] **sendfile() support** - Zero-copy file transmission
 
 ### Subprocess Management

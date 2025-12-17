@@ -295,6 +295,113 @@ impl VeloxLoop {
         Ok(())
     }
 
+    #[pyo3(signature = (host, port, family=0, type_=0, proto=0, flags=0))]
+    fn getaddrinfo(
+        &self,
+        py: Python<'_>,
+        host: Option<String>,
+        port: Option<String>,
+        family: i32,
+        type_: i32,
+        proto: i32,
+        flags: i32,
+    ) -> PyResult<Py<PyAny>> {
+        // Get or create default executor
+        let mut exec_guard = self.executor.lock();
+        if exec_guard.is_none() {
+            *exec_guard = Some(ThreadPoolExecutor::new()?);
+        }
+        let executor_ref = exec_guard.as_ref().unwrap();
+        
+        // Create a future to return to Python
+        let future = self.create_future(py)?;
+        let future_clone = future.clone_ref(py);
+        let callbacks = self.callbacks.clone();
+        
+        // Spawn the blocking DNS resolution task
+        executor_ref.spawn_blocking(move || {
+            let _ = Python::attach(move |py| {
+                // Perform DNS resolution using libc getaddrinfo
+                let result = perform_getaddrinfo(py, host, port, family, type_, proto, flags);
+                
+                // Schedule callback to set the future result
+                let future_ref = future_clone.clone_ref(py);
+                match result {
+                    Ok(val) => {
+                        callbacks.push(Callback {
+                            callback: future_ref.getattr(py, "set_result").unwrap(),
+                            args: vec![val],
+                            context: None,
+                        });
+                    }
+                    Err(e) => {
+                        let exc: Py<PyAny> = e.value(py).clone().unbind().into();
+                        callbacks.push(Callback {
+                            callback: future_ref.getattr(py, "set_exception").unwrap(),
+                            args: vec![exc],
+                            context: None,
+                        });
+                    }
+                }
+            });
+        });
+        
+        Ok(future.into_any())
+    }
+
+    #[pyo3(signature = (sockaddr, flags=0))]
+    fn getnameinfo(
+        &self,
+        py: Python<'_>,
+        sockaddr: Bound<'_, PyTuple>,
+        flags: i32,
+    ) -> PyResult<Py<PyAny>> {
+        // Get or create default executor
+        let mut exec_guard = self.executor.lock();
+        if exec_guard.is_none() {
+            *exec_guard = Some(ThreadPoolExecutor::new()?);
+        }
+        let executor_ref = exec_guard.as_ref().unwrap();
+        
+        // Extract address and port from sockaddr tuple
+        let addr_str: String = sockaddr.get_item(0)?.extract()?;
+        let port: u16 = sockaddr.get_item(1)?.extract()?;
+        
+        // Create a future to return to Python
+        let future = self.create_future(py)?;
+        let future_clone = future.clone_ref(py);
+        let callbacks = self.callbacks.clone();
+        
+        // Spawn the blocking reverse DNS resolution task
+        executor_ref.spawn_blocking(move || {
+            let _ = Python::attach(move |py| {
+                let result = perform_getnameinfo(py, &addr_str, port, flags);
+                
+                // Schedule callback to set the future result
+                let future_ref = future_clone.clone_ref(py);
+                match result {
+                    Ok(val) => {
+                        callbacks.push(Callback {
+                            callback: future_ref.getattr(py, "set_result").unwrap(),
+                            args: vec![val],
+                            context: None,
+                        });
+                    }
+                    Err(e) => {
+                        let exc: Py<PyAny> = e.value(py).clone().unbind().into();
+                        callbacks.push(Callback {
+                            callback: future_ref.getattr(py, "set_exception").unwrap(),
+                            args: vec![exc],
+                            context: None,
+                        });
+                    }
+                }
+            });
+        });
+        
+        Ok(future.into_any())
+    }
+
     // Exception handler methods
     fn set_exception_handler(&self, handler: Option<Py<PyAny>>) {
         let mut eh = self.exception_handler.lock();
@@ -634,5 +741,232 @@ impl VeloxLoop {
          }
          
          Ok(())
+    }
+}
+
+// DNS resolution helper functions
+fn perform_getaddrinfo(
+    py: Python<'_>,
+    host: Option<String>,
+    port: Option<String>,
+    family: i32,
+    socktype: i32,
+    protocol: i32,
+    flags: i32,
+) -> PyResult<Py<PyAny>> {
+    use std::ffi::{CString, CStr};
+    use std::ptr;
+    use std::mem;
+    use pyo3::types::{PyList, PyString, PyInt};
+    
+    unsafe {
+        let mut hints: libc::addrinfo = mem::zeroed();
+        hints.ai_family = family;
+        hints.ai_socktype = socktype;
+        hints.ai_protocol = protocol;
+        hints.ai_flags = flags;
+        
+        let c_host = host.as_ref().map(|h| CString::new(h.as_str()).ok()).flatten();
+        let c_port = port.as_ref().map(|p| CString::new(p.as_str()).ok()).flatten();
+        
+        let host_ptr = c_host.as_ref().map_or(ptr::null(), |s| s.as_ptr());
+        let port_ptr = c_port.as_ref().map_or(ptr::null(), |s| s.as_ptr());
+        
+        let mut res: *mut libc::addrinfo = ptr::null_mut();
+        let ret = libc::getaddrinfo(host_ptr, port_ptr, &hints, &mut res);
+        
+        if ret != 0 {
+            let error_msg = if ret == libc::EAI_SYSTEM {
+                format!("getaddrinfo failed: {}", std::io::Error::last_os_error())
+            } else {
+                let err_str = libc::gai_strerror(ret);
+                let c_str = CStr::from_ptr(err_str);
+                format!("getaddrinfo failed: {}", c_str.to_string_lossy())
+            };
+            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(error_msg));
+        }
+        
+        // Convert the linked list of addrinfo to Python list
+        let py_list = PyList::empty(py);
+        let mut current = res;
+        
+        while !current.is_null() {
+            let info = &*current;
+            
+            // Extract family, socktype, protocol
+            let fam = info.ai_family;
+            let stype = info.ai_socktype;
+            let proto = info.ai_protocol;
+            
+            // Extract canonname
+            let canonname = if info.ai_canonname.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(info.ai_canonname).to_string_lossy().to_string()
+            };
+            
+            // Extract sockaddr
+            if info.ai_family == libc::AF_INET {
+                let addr = &*(info.ai_addr as *const libc::sockaddr_in);
+                let ip_bytes = addr.sin_addr.s_addr.to_ne_bytes();
+                let ip = format!("{}.{}.{}.{}", ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+                let port = u16::from_be(addr.sin_port);
+                
+                let fam_py = PyInt::new(py, fam);
+                let stype_py = PyInt::new(py, stype);
+                let proto_py = PyInt::new(py, proto);
+                let canon_py = PyString::new(py, &canonname);
+                let ip_py = PyString::new(py, &ip);
+                let port_py = PyInt::new(py, port);
+                let addr_tuple = PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?;
+                
+                let tuple = PyTuple::new(py, vec![
+                    fam_py.as_any(),
+                    stype_py.as_any(),
+                    proto_py.as_any(),
+                    canon_py.as_any(),
+                    addr_tuple.as_any(),
+                ])?;
+                py_list.append(tuple)?;
+            } else if info.ai_family == libc::AF_INET6 {
+                let addr = &*(info.ai_addr as *const libc::sockaddr_in6);
+                let ip_bytes = addr.sin6_addr.s6_addr;
+                let ip = format!(
+                    "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+                    u16::from_be_bytes([ip_bytes[0], ip_bytes[1]]),
+                    u16::from_be_bytes([ip_bytes[2], ip_bytes[3]]),
+                    u16::from_be_bytes([ip_bytes[4], ip_bytes[5]]),
+                    u16::from_be_bytes([ip_bytes[6], ip_bytes[7]]),
+                    u16::from_be_bytes([ip_bytes[8], ip_bytes[9]]),
+                    u16::from_be_bytes([ip_bytes[10], ip_bytes[11]]),
+                    u16::from_be_bytes([ip_bytes[12], ip_bytes[13]]),
+                    u16::from_be_bytes([ip_bytes[14], ip_bytes[15]]),
+                );
+                let port = u16::from_be(addr.sin6_port);
+                let flowinfo = addr.sin6_flowinfo;
+                let scope_id = addr.sin6_scope_id;
+                
+                let fam_py = PyInt::new(py, fam);
+                let stype_py = PyInt::new(py, stype);
+                let proto_py = PyInt::new(py, proto);
+                let canon_py = PyString::new(py, &canonname);
+                let ip_py = PyString::new(py, &ip);
+                let port_py = PyInt::new(py, port);
+                let flowinfo_py = PyInt::new(py, flowinfo);
+                let scope_py = PyInt::new(py, scope_id);
+                let addr_tuple = PyTuple::new(py, vec![
+                    ip_py.as_any(),
+                    port_py.as_any(),
+                    flowinfo_py.as_any(),
+                    scope_py.as_any(),
+                ])?;
+                
+                let tuple = PyTuple::new(py, vec![
+                    fam_py.as_any(),
+                    stype_py.as_any(),
+                    proto_py.as_any(),
+                    canon_py.as_any(),
+                    addr_tuple.as_any(),
+                ])?;
+                py_list.append(tuple)?;
+            }
+            
+            current = info.ai_next;
+        }
+        
+        libc::freeaddrinfo(res);
+        
+        Ok(py_list.into())
+    }
+}
+
+fn perform_getnameinfo(
+    py: Python<'_>,
+    addr: &str,
+    port: u16,
+    flags: i32,
+) -> PyResult<Py<PyAny>> {
+    use std::ffi::CStr;
+    use std::mem;
+    use std::net::{IpAddr, SocketAddr};
+    use pyo3::types::PyString;
+    
+    // Parse the address
+    let ip_addr: IpAddr = addr.parse()
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid IP address: {}", e)))?;
+    
+    let sock_addr = SocketAddr::new(ip_addr, port);
+    
+    // Use constants directly since libc may not export them on all platforms
+    const NI_MAXHOST: usize = 1025;
+    const NI_MAXSERV: usize = 32;
+    
+    unsafe {
+        let mut host = vec![0u8; NI_MAXHOST];
+        let mut serv = vec![0u8; NI_MAXSERV];
+        
+        // Create the sockaddr structure that will live for the duration of getnameinfo call
+        let ret = match sock_addr {
+            SocketAddr::V4(v4_addr) => {
+                let mut sa: libc::sockaddr_in = mem::zeroed();
+                sa.sin_family = libc::AF_INET as _;
+                sa.sin_port = v4_addr.port().to_be();
+                sa.sin_addr.s_addr = u32::from_ne_bytes(v4_addr.ip().octets());
+                
+                libc::getnameinfo(
+                    &sa as *const libc::sockaddr_in as *const libc::sockaddr,
+                    mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    host.as_mut_ptr() as *mut libc::c_char,
+                    host.len() as libc::socklen_t,
+                    serv.as_mut_ptr() as *mut libc::c_char,
+                    serv.len() as libc::socklen_t,
+                    flags,
+                )
+            }
+            SocketAddr::V6(v6_addr) => {
+                let mut sa: libc::sockaddr_in6 = mem::zeroed();
+                sa.sin6_family = libc::AF_INET6 as _;
+                sa.sin6_port = v6_addr.port().to_be();
+                sa.sin6_addr.s6_addr = v6_addr.ip().octets();
+                sa.sin6_flowinfo = v6_addr.flowinfo();
+                sa.sin6_scope_id = v6_addr.scope_id();
+                
+                libc::getnameinfo(
+                    &sa as *const libc::sockaddr_in6 as *const libc::sockaddr,
+                    mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    host.as_mut_ptr() as *mut libc::c_char,
+                    host.len() as libc::socklen_t,
+                    serv.as_mut_ptr() as *mut libc::c_char,
+                    serv.len() as libc::socklen_t,
+                    flags,
+                )
+            }
+        };
+        
+        if ret != 0 {
+            let error_msg = if ret == libc::EAI_SYSTEM {
+                format!("getnameinfo failed: {}", std::io::Error::last_os_error())
+            } else {
+                let err_str = libc::gai_strerror(ret);
+                let c_str = CStr::from_ptr(err_str);
+                format!("getnameinfo failed: {}", c_str.to_string_lossy())
+            };
+            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(error_msg));
+        }
+        
+        // Convert C strings to Rust strings
+        let hostname = CStr::from_ptr(host.as_ptr() as *const libc::c_char)
+            .to_string_lossy()
+            .to_string();
+        let servname = CStr::from_ptr(serv.as_ptr() as *const libc::c_char)
+            .to_string_lossy()
+            .to_string();
+        
+        // Return tuple (hostname, servname)
+        let host_py = PyString::new(py, &hostname);
+        let serv_py = PyString::new(py, &servname);
+        let result_tuple = PyTuple::new(py, vec![host_py.as_any(), serv_py.as_any()])?;
+        
+        Ok(result_tuple.into())
     }
 }
