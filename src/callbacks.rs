@@ -13,6 +13,8 @@ use crate::transports::future::PendingFuture;
 pub struct Callback {
     pub callback: Py<PyAny>,
     pub args: Vec<Py<PyAny>>, // Minimal args, usually Context + Args
+
+    #[allow(dead_code)] // For future use
     pub context: Option<Py<PyAny>>,
 }
 
@@ -44,11 +46,7 @@ impl CallbackQueue {
         let mut q = self.queue.lock();
         std::mem::take(&mut *q)
     }
-    
-    pub fn len(&self) -> usize {
-        self.queue.lock().len()
-    }
-    
+        
     pub fn is_empty(&self) -> bool {
         self.queue.lock().is_empty()
     }

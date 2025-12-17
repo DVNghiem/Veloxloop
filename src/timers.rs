@@ -6,6 +6,8 @@ use std::collections::HashMap;
 pub struct TimerEntry {
     pub callback: Py<PyAny>,
     pub args: Vec<Py<PyAny>>,
+
+    #[allow(dead_code)] // For future use
     pub context: Option<Py<PyAny>>,
 }
 
@@ -69,13 +71,5 @@ impl Timers {
     
     pub fn next_expiry(&self) -> Option<u64> {
         self.pq.peek().map(|(_, Reverse(when))| *when)
-    }
-
-    pub fn len(&self) -> usize {
-        self.pq.len()
-    }
-    
-    pub fn is_empty(&self) -> bool {
-        self.pq.is_empty()
     }
 }

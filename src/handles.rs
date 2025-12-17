@@ -2,16 +2,8 @@ use slab::Slab;
 use std::os::fd::RawFd;
 use pyo3::prelude::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandleType {
-    Reader,
-    Writer,
-}
-
 pub struct Handle {
-    pub fd: RawFd,
     pub callback: Py<PyAny>,
-    pub args: Option<Vec<Py<PyAny>>>, // Optional args for the callback
     pub cancelled: bool,
 }
 
@@ -49,9 +41,7 @@ impl IoHandles {
         } else {
             // Insert new
             let key = self.readers.insert(Handle {
-                fd,
                 callback,
-                args: None,
                 cancelled: false,
             });
             entry.0 = Some(key);
@@ -85,9 +75,7 @@ impl IoHandles {
         } else {
             // Insert new
             let key = self.writers.insert(Handle {
-                fd,
                 callback,
-                args: None,
                 cancelled: false,
             });
             entry.1 = Some(key);

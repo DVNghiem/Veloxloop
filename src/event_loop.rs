@@ -25,8 +25,6 @@ pub struct VeloxLoop {
     stopped: AtomicBool,
     closed: AtomicBool,
     debug: AtomicBool,
-    // We need to track time, asyncio uses loop.time() which is monotonic float seconds.
-    // Rust Instant is opaque. We'll verify against a baseline.
     start_time: Instant,
 }
 
@@ -37,7 +35,6 @@ impl VeloxLoop {
     pub fn new(debug: Option<bool>) -> VeloxResult<Self> {
         let poller = Arc::new(LoopPoller::new()?);
         let debug_val = debug.unwrap_or(false);
-        eprintln!("VeloxLoop::new called with debug={:?}, using debug_val={}", debug, debug_val);
 
         Ok(Self {
             poller: poller.clone(),
@@ -56,12 +53,6 @@ impl VeloxLoop {
         self.start_time.elapsed().as_secs_f64()
     }
     
-    fn _check_closed(&self) -> VeloxResult<()> {
-        // Simple check
-        Ok(())
-    }
-
-    // Lifecycle
     fn run_forever(&self, py: Python<'_>) -> VeloxResult<()> {
         self.running.store(true, Ordering::SeqCst);
         self.stopped.store(false, Ordering::SeqCst);
@@ -70,8 +61,6 @@ impl VeloxLoop {
         let mut events = polling::Events::new();
         
         while self.running.load(Ordering::SeqCst) && !self.stopped.load(Ordering::SeqCst) {
-            // 1. Run scheduled callbacks
-            // We call the internal run_once which is NOT a pymethod
             self._run_once(py, &mut events)?;
             
             // Check if stopped after processing callbacks (future might be done)
@@ -88,8 +77,6 @@ impl VeloxLoop {
         self.running.store(false, Ordering::SeqCst);
         Ok(())
     }
-
-    // Basic I/O methods
 
     pub fn add_reader(&self, _py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
         let poller = self.poller.clone();
@@ -109,9 +96,9 @@ impl VeloxLoop {
             ev.writable = true; 
         }
         if !reader_exists && !writer_exists {
-             unsafe { poller.register(fd, ev)?; }
+             poller.register(fd, ev)?;
         } else {
-             unsafe { poller.modify(fd, ev)?; }
+             poller.modify(fd, ev)?;
         }
         Ok(())
     }
@@ -123,12 +110,12 @@ impl VeloxLoop {
             drop(handles);
             
             if writer_exists {
-                 // Downgrade to W only
-                 let ev = polling::Event::writable(fd as usize);
-                 unsafe { self.poller.modify(fd, ev)?; }
+                // Downgrade to W only
+                let ev = polling::Event::writable(fd as usize);
+                self.poller.modify(fd, ev)?;
             } else {
-                 // Remove
-                 unsafe { self.poller.delete(fd)?; }
+                // Remove
+                self.poller.delete(fd)?;
             }
             Ok(true)
         } else {
@@ -152,9 +139,9 @@ impl VeloxLoop {
         }
         
         if !writer_exists && !reader_exists {
-             unsafe { poller.register(fd, ev)?; }
+            poller.register(fd, ev)?;
         } else {
-             unsafe { poller.modify(fd, ev)?; }
+            poller.modify(fd, ev)?;
         }
         Ok(())
     }
@@ -167,9 +154,9 @@ impl VeloxLoop {
             
             if reader_exists {
                  let ev = polling::Event::readable(fd as usize);
-                 unsafe { self.poller.modify(fd, ev)?; }
+                 self.poller.modify(fd, ev)?;
             } else {
-                 unsafe { self.poller.delete(fd)?; }
+                 self.poller.delete(fd)?;
             }
             Ok(true)
         } else {
@@ -185,8 +172,8 @@ impl VeloxLoop {
     
     #[pyo3(signature = (callback, *args, context=None))]
     fn call_soon_threadsafe(&self, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) {
-         self.callbacks.push(Callback { callback, args, context });
-         // Push naturally notifies.
+        // Push naturally notifies.
+        self.callbacks.push(Callback { callback, args, context });
     }
     
     #[pyo3(signature = (delay, callback, *args, context=None))]
@@ -207,7 +194,6 @@ impl VeloxLoop {
         self.timers.lock().remove(timer_id);
     }
 
-    // Lifecycle methods
     fn stop(&self) {
         self.stopped.store(true, Ordering::SeqCst);
         self.running.store(false, Ordering::SeqCst);
@@ -241,15 +227,6 @@ impl VeloxLoop {
         Py::new(py, PendingFuture::new())
     }
 
-    // --- Networking ---
-    
-    // internal _accept_connection
-    // callback called when listener is ready
-    fn _accept_connection(&self) -> PyResult<()> {
-         // Placeholder or remove
-        Ok(())
-    }
-
     #[pyo3(signature = (protocol_factory, host=None, port=None, **_kwargs))]
     fn create_connection(slf: &Bound<'_, Self>, protocol_factory: Py<PyAny>, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
@@ -275,17 +252,25 @@ impl VeloxLoop {
         socket.set_nonblocking(true)
              .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
              
-        // Connect
+        // Connect (non-blocking)
         match socket.connect(&addr.into()) {
             Ok(_) => {
-                // Immediate success?
-                // Should still go through callback path to be consistent or handle here?
-                // Let's assume generic path handle it via EINPROGRESS usually.
+                // Immediate success (rare, typically for localhost connections)
+                // Continue to callback path for consistent handling
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(115) => {
-                // Expected (115 is EINPROGRESS on Linux)
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Expected: EWOULDBLOCK - connection in progress
             }
-            Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string())),
+            #[cfg(unix)]
+            Err(e) if e.raw_os_error() == Some(36) || e.raw_os_error() == Some(115) => {
+                // Expected: EINPROGRESS - connection in progress
+                // 36 on macOS/BSD, 115 on Linux
+            }
+            Err(e) => {
+                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                    format!("Connection failed: {}", e)
+                ));
+            }
         }
         
         let stream: std::net::TcpStream = socket.into();
@@ -300,7 +285,7 @@ impl VeloxLoop {
         let callback = AsyncConnectCallback::new(loop_obj.clone_ref(py), fut.clone_ref(py), protocol_factory, stream);
         let callback_py = Py::new(py, callback)?.into_any();
         
-        // Register Writer (for Connect) - call add_writer directly instead of via Python
+        // Register Writer (for Connect)
         self_.add_writer(py, fd, callback_py)?;
         
         Ok(fut.into_any())
@@ -316,15 +301,14 @@ impl VeloxLoop {
         let port = port.unwrap_or(0);
         let addr = format!("{}:{}", host, port);
         
-        // 1. Bind
         let listener = std::net::TcpListener::bind(&addr)?;
         listener.set_nonblocking(true)?;
         
-        // 2. Create Server object
+        // Create Server object
         let server = TcpServer::new(listener, loop_obj.clone_ref(py), protocol_factory.clone_ref(py));
         let server_py = Py::new(py, server)?;
         
-        // 3. Register Accept Handler
+        // Register Accept Handler
         // The server needs to be polled for reading (accept).
         // TcpServer defines `_on_accept`.
         let on_accept = server_py.getattr(py, "_on_accept")?;
@@ -333,10 +317,9 @@ impl VeloxLoop {
         let fd = server_py.borrow(py).fd()
             .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Server has no listener"))?;
         
-        // Call add_reader directly instead of via Python
         self_.add_reader(py, fd, on_accept)?;
         
-        // 4. Return Server object wrapped in completed future
+        // Return Server object wrapped in completed future
         let fut = crate::transports::future::CompletedFuture::new(server_py.into_any());
         
         Ok(Py::new(py, fut)?.into_any())
@@ -345,7 +328,7 @@ impl VeloxLoop {
 
 impl VeloxLoop {
     fn _run_once(&self, py: Python<'_>, events: &mut polling::Events) -> VeloxResult<()> {
-         // 1. Calculate Timeout
+         // Calculate Timeout
          let has_callbacks = !self.callbacks.is_empty();
          let timeout = if has_callbacks {
              Some(Duration::from_secs(0))
@@ -366,7 +349,7 @@ impl VeloxLoop {
              }
          };
          
-         // 2. Poll
+         // Poll
          match self.poller.poll(events, timeout) {
              Ok(_) => {},
              Err(e) => {
@@ -375,7 +358,7 @@ impl VeloxLoop {
              }
          }
          
-         // 3. Process I/O Events
+         // Process I/O Events
          for event in events.iter() {
 
              let fd = event.key as std::os::fd::RawFd;
@@ -385,7 +368,6 @@ impl VeloxLoop {
                       let handles = self.handles.lock();
                       if let Some(handle) = handles.get_reader(fd) {
                           if !handle.cancelled {
-                               // eprintln!("DEBUG: Found readable callback for fd={}", fd);
                                Some(handle.callback.clone_ref(py))
                           } else {
                                None
@@ -399,7 +381,6 @@ impl VeloxLoop {
                       if let Err(e) = cb.call0(py) {
                           e.print(py);
                       } else {
-                          // eprintln!("DEBUG: callback executed successfully");
                       }
                  }
              }
@@ -416,7 +397,7 @@ impl VeloxLoop {
                          None
                      }
                  };
-                                  if let Some(cb) = callback {
+                if let Some(cb) = callback {
                        if let Err(e) = cb.call0(py) {
                            e.print(py);
                        }
@@ -441,17 +422,17 @@ impl VeloxLoop {
                  };
                  
                  // Ignore errors (e.g. if concurrently closed)
-                 unsafe { let _ = self.poller.modify(fd, ev); }
+                let _ = self.poller.modify(fd, ev);
              }
          }
-                  // 4. Process Timers
+            // Process Timers
           let now_ns = (self.time() * 1_000_000_000.0) as u64;
           let expired = self.timers.lock().pop_expired(now_ns);
          for entry in expired {
              let _ = entry.callback.bind(py).call(PyTuple::new(py, entry.args)?, None);
          }
          
-         // 5. Process Callbacks (call_soon)
+         // Process Callbacks (call_soon)
          let callbacks = self.callbacks.pop_all();
          for cb in callbacks {
              let _ = cb.callback.bind(py).call(PyTuple::new(py, cb.args)?, None);
