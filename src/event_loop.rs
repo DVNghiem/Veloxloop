@@ -547,7 +547,9 @@ impl VeloxLoop {
         
         // Use socket2 for non-blocking connect
         use socket2::{Socket, Domain, Type};
-        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        // Use IPv6 detection from utils for better handling
+        let is_ipv6 = addr.is_ipv6();
+        let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
         let socket = Socket::new(domain, Type::STREAM, None)
              .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
              
@@ -655,10 +657,11 @@ impl VeloxLoop {
         use std::net::SocketAddr;
         
         // Determine address family from local_addr or remote_addr
+        // Using helper function for better IPv6 detection
         let is_ipv6 = if let Some((ref host, _)) = local_addr {
-            host.contains(':')
+            crate::utils::ipv6::is_ipv6_string(host)
         } else if let Some((ref host, _)) = remote_addr {
-            host.contains(':')
+            crate::utils::ipv6::is_ipv6_string(host)
         } else {
             false
         };

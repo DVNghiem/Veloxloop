@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyTuple, PyString, PyInt};
+use pyo3::types::PyBytes;
 use std::net::{TcpStream, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::io::{Write, self};
@@ -24,6 +24,23 @@ impl SocketWrapper {
     
     fn fileno(&self) -> RawFd {
         self.fd
+    }
+
+    /// Get IPv6-specific information (flowinfo and scope_id for IPv6 addresses)
+    fn get_ipv6_info(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        match self.addr {
+            SocketAddr::V6(addr) => {
+                let flowinfo = addr.flowinfo();
+                let scope_id = addr.scope_id();
+                
+                let info = pyo3::types::PyDict::new(py);
+                info.set_item("flowinfo", flowinfo)?;
+                info.set_item("scope_id", scope_id)?;
+                
+                Ok(Some(info.into()))
+            }
+            SocketAddr::V4(_) => Ok(None),
+        }
     }
 }
 
@@ -191,10 +208,7 @@ impl TcpTransport {
             "peername" => {
                 if let Some(stream) = self.stream.as_ref() {
                     if let Ok(addr) = stream.peer_addr() {
-                        let ip_str = PyString::new(py, &addr.ip().to_string());
-                        let port_num = PyInt::new(py, addr.port());
-                        let tuple = PyTuple::new(py, vec![ip_str.as_any(), port_num.as_any()])?;
-                        return Ok(tuple.into());
+                        return Ok(crate::utils::ipv6::socket_addr_to_tuple(py, addr)?);
                     }
                 }
                 Ok(default.unwrap_or_else(|| py.None()))
@@ -202,10 +216,7 @@ impl TcpTransport {
             "sockname" => {
                 if let Some(stream) = self.stream.as_ref() {
                     if let Ok(addr) = stream.local_addr() {
-                        let ip_str = PyString::new(py, &addr.ip().to_string());
-                        let port_num = PyInt::new(py, addr.port());
-                        let tuple = PyTuple::new(py, vec![ip_str.as_any(), port_num.as_any()])?;
-                        return Ok(tuple.into());
+                        return Ok(crate::utils::ipv6::socket_addr_to_tuple(py, addr)?);
                     }
                 }
                 Ok(default.unwrap_or_else(|| py.None()))
