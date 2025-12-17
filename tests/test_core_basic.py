@@ -29,8 +29,19 @@ class TestCorePollingBasic:
 
     def test_loop_time_basic(self):
         """Test loop.time() returns a value"""
-        # Skip this test if it causes blocking - the issue is likely in loop.time() implementation
-        pytest.skip("Loop time test may block - requires timer implementation")
+        async def main():
+            loop = asyncio.get_running_loop()
+            # Get initial time
+            time1 = loop.time()
+            assert isinstance(time1, float)
+            assert time1 >= 0.0
+            
+            # Time should be monotonic - getting it again should be >= previous
+            time2 = loop.time()
+            assert isinstance(time2, float)
+            assert time2 >= time1
+
+        asyncio.run(main())
 
     def test_call_soon(self):
         """Test call_soon executes callback"""

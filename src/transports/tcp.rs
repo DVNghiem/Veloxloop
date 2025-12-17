@@ -3,10 +3,11 @@ use pyo3::types::{PyBytes, PyTuple, PyString, PyInt};
 use std::net::{TcpStream, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::io::{Write, self};
+use parking_lot::Mutex;
 
 use crate::utils::VeloxResult;
 use crate::event_loop::VeloxLoop;
-use super::future::CompletedFuture;
+use super::future::{CompletedFuture, PendingFuture};
 
 // Pure Rust socket wrapper to avoid importing Python's socket module
 #[pyclass(module = "veloxloop._veloxloop")]
@@ -38,6 +39,7 @@ pub struct TcpServer {
     loop_: Py<VeloxLoop>,
     protocol_factory: Py<PyAny>,
     active: bool,
+    serve_forever_future: Mutex<Option<Py<PendingFuture>>>,
 }
 
 #[pymethods]
@@ -64,6 +66,12 @@ impl TcpServer {
         }
         self.active = false;
         self.listener = None;
+        
+        // Resolve serve_forever future if it exists
+        if let Some(future) = self.serve_forever_future.lock().as_ref() {
+            future.bind(py).borrow().set_result(py.None())?;
+        }
+        
         Ok(())
     }
     
@@ -123,6 +131,35 @@ impl TcpServer {
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+    
+    /// Serve forever - runs the server until explicitly closed
+    /// This method implements asyncio.Server.serve_forever() behavior
+    fn serve_forever(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // Create a PendingFuture that will be resolved when close() is called
+        let future = Py::new(py, PendingFuture::new())?;
+        *self.serve_forever_future.lock() = Some(future.clone_ref(py));
+        
+        Ok(future.into_any())
+    }
+    
+    /// Start serving - begin accepting connections
+    fn start_serving(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        let mut self_ = slf.borrow_mut();
+        
+        if !self_.active {
+            self_.active = true;
+            if let Some(listener) = self_.listener.as_ref() {
+                let fd = listener.as_raw_fd();
+                // Register the accept callback
+                drop(self_); // Drop the mutable borrow before calling getattr
+                let on_accept = slf.getattr("_on_accept")?;
+                let loop_ = slf.borrow().loop_.clone_ref(py);
+                loop_.bind(py).borrow().add_reader(py, fd, on_accept.unbind())?;
             }
         }
         Ok(())
@@ -407,6 +444,7 @@ impl TcpServer {
             loop_,
             protocol_factory,
             active: true,
+            serve_forever_future: Mutex::new(None),
         }
     }
     
