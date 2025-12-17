@@ -77,7 +77,6 @@ impl AsyncConnectCallback {
             let res = stream.take_error();
             match res {
                 Ok(None) => {
-                    eprintln!("DEBUG: Connection success fd={}", fd);
                     // Connected! Create protocol
                     let protocol_res = self.protocol_factory.call0(py);
                     match protocol_res {
@@ -98,7 +97,6 @@ impl AsyncConnectCallback {
                                         return Ok(());
                                     }
                                     
-                                    eprintln!("DEBUG: calling add_reader for fd={}", fd);
                                     // Add reader using VeloxLoop directly
                                     let read_ready = transport_py.getattr(py, "_read_ready")?;
                                     loop_ref.borrow().add_reader(py, fd, read_ready)?;

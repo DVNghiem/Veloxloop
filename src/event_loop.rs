@@ -209,7 +209,6 @@ impl VeloxLoop {
     
     fn get_debug(&self) -> bool {
         let val = self.debug.load(Ordering::SeqCst);
-        eprintln!("get_debug() called, returning {}", val);
         val
     }
     
