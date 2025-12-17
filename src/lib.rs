@@ -16,6 +16,7 @@ use event_loop::VeloxLoop;
 use transports::tcp::{TcpTransport, TcpServer, SocketWrapper};
 use transports::udp::{UdpTransport, UdpSocketWrapper};
 use transports::ssl::{SSLContext, SSLTransport};
+use transports::stream_server::{StreamServer, StreamTransport};
 use transports::future::CompletedFuture;
 use callbacks::AsyncConnectCallback;
 use policy::VeloxLoopPolicy;
@@ -37,6 +38,8 @@ fn _veloxloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VeloxLoopPolicy>()?;
     m.add_class::<StreamReader>()?;
     m.add_class::<StreamWriter>()?;
+    m.add_class::<StreamServer>()?;
+    m.add_class::<StreamTransport>()?;
     m.add_class::<SocketOptions>()?;
     Ok(())
 }

@@ -961,6 +961,96 @@ impl VeloxLoop {
         Ok(Py::new(py, fut)?.into_any())
     }
 
+    /// High-performance native start_server using StreamReader/StreamWriter
+    /// This provides better performance than Protocol-based servers for stream applications
+    #[pyo3(signature = (client_connected_cb, host=None, port=None, limit=None, **_kwargs))]
+    fn start_server(
+        slf: &Bound<'_, Self>,
+        client_connected_cb: Py<PyAny>,
+        host: Option<&str>,
+        port: Option<u16>,
+        limit: Option<usize>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let self_ = slf.borrow();
+        let loop_obj = slf.clone().unbind();
+        
+        let host = host.unwrap_or("127.0.0.1");
+        let port = port.unwrap_or(0);
+        let addr = format!("{}:{}", host, port);
+        let limit = limit.unwrap_or(65536); // 64KB default buffer
+        
+        let listener = std::net::TcpListener::bind(&addr)?;
+        listener.set_nonblocking(true)?;
+        
+        // Create StreamServer object
+        let server = crate::transports::stream_server::StreamServer::new(
+            listener,
+            loop_obj.clone_ref(py),
+            client_connected_cb,
+            limit,
+        );
+        let server_py = Py::new(py, server)?;
+        
+        // Register Accept Handler
+        let on_accept = server_py.getattr(py, "_on_accept")?;
+        
+        // Get fd from server
+        let fd = server_py.borrow(py).get_fd()
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Server has no listener"))?;
+        
+        self_.add_reader(py, fd, on_accept)?;
+        
+        // Return Server object wrapped in completed future
+        let fut = crate::transports::future::CompletedFuture::new(server_py.into_any());
+        
+        Ok(Py::new(py, fut)?.into_any())
+    }
+
+    /// High-performance native open_connection using StreamReader/StreamWriter
+    #[pyo3(signature = (host, port, limit=None, **_kwargs))]
+    fn open_connection(
+        slf: &Bound<'_, Self>,
+        host: &str,
+        port: u16,
+        limit: Option<usize>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let loop_obj = slf.clone().unbind();
+        let limit = limit.unwrap_or(65536); // 64KB default buffer
+        
+        let addr = format!("{}:{}", host, port);
+        let stream = std::net::TcpStream::connect(&addr)?;
+        stream.set_nonblocking(true)?;
+        
+        // Create StreamReader and StreamWriter
+        let reader = Py::new(py, crate::streams::StreamReader::new(Some(limit)))?;
+        let writer = Py::new(py, crate::streams::StreamWriter::new(Some(65536), Some(16384)))?;
+        
+        // Create StreamTransport (now returns Py<StreamTransport>)
+        let transport_py = crate::transports::stream_server::StreamTransport::new(
+            py,
+            loop_obj,
+            stream,
+            reader.clone_ref(py),
+            writer.clone_ref(py),
+        )?;
+        
+        // Register read callback
+        let read_ready = transport_py.getattr(py, "_read_ready")?;
+        let fd = transport_py.borrow(py).get_fd();
+        slf.borrow().add_reader(py, fd, read_ready)?;
+        
+        // Return (reader, writer) tuple wrapped in completed future
+        let result = (reader.into_any(), writer.into_any());
+        let result_tuple = pyo3::types::PyTuple::new(py, &[result.0, result.1])?;
+        let fut = crate::transports::future::CompletedFuture::new(result_tuple.into());
+        
+        Ok(Py::new(py, fut)?.into_any())
+    }
+
     #[pyo3(signature = (protocol_factory, local_addr=None, remote_addr=None, **kwargs))]
     fn create_datagram_endpoint(
         slf: &Bound<'_, Self>,

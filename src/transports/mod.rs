@@ -2,6 +2,7 @@ pub mod future;
 pub mod tcp;
 pub mod udp;
 pub mod ssl;
+pub mod stream_server;
 
 use pyo3::prelude::*;
 use std::os::fd::RawFd;

@@ -118,11 +118,11 @@ impl SocketWrapper {
 }
 
 impl SocketWrapper {
-    fn new(fd: RawFd, addr: SocketAddr) -> Self {
+    pub(crate) fn new(fd: RawFd, addr: SocketAddr) -> Self {
         Self { fd, addr, peer_addr: None }
     }
     
-    fn new_with_peer(fd: RawFd, addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+    pub(crate) fn new_with_peer(fd: RawFd, addr: SocketAddr, peer_addr: SocketAddr) -> Self {
         Self { fd, addr, peer_addr: Some(peer_addr) }
     }
 }
@@ -468,7 +468,7 @@ impl crate::transports::StreamTransport for TcpTransport {
     
     fn read_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(stream) = self.stream.as_ref() {
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 65536]; // Increased from 4KB to 64KB for better large message performance
             let mut s = stream;
             match std::io::Read::read(&mut s, &mut buf) {
                 Ok(0) => {
@@ -499,17 +499,31 @@ impl crate::transports::StreamTransport for TcpTransport {
     fn write_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(mut stream) = self.stream.as_ref() {
             if !self.write_buffer.is_empty() {
-                match stream.write(&self.write_buffer) {
-                    Ok(n) => {
-                        self.write_buffer.drain(0..n);
-                        if self.write_buffer.is_empty() {
-                            let fd = self.fd;
-                            self.loop_.bind(py).borrow().remove_writer(py, fd)?;
+                // Try to write as much as possible in one go
+                loop {
+                    match stream.write(&self.write_buffer) {
+                        Ok(0) => {
+                            // Connection closed
+                            return Err(PyErr::new::<pyo3::exceptions::PyConnectionError, _>(
+                                "Connection closed during write"
+                            ));
                         }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => {
-                        return Err(e.into());
+                        Ok(n) => {
+                            self.write_buffer.drain(0..n);
+                            if self.write_buffer.is_empty() {
+                                let fd = self.fd;
+                                self.loop_.bind(py).borrow().remove_writer(py, fd)?;
+                                break;
+                            }
+                            // Continue writing remaining data
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            // Can't write more now, will retry on next write_ready
+                            break;
+                        }
+                        Err(e) => {
+                            return Err(e.into());
+                        }
                     }
                 }
             }

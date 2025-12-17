@@ -50,9 +50,9 @@ def generate_simple_readme():
             content.append("TCP echo server with raw sockets comparison.\n")
         
         # Overview table
-        content.append("\n### Overview (1 concurrent connection)\n")
+        content.append("\n### Overview (1 concurrent connection)")
         content.append("| Loop | 1KB rps | 10KB rps | 100KB rps |")
-        content.append("\n| --- | --- | --- | --- |")
+        content.append("| --- | --- | --- | --- |")
         
         for loop in ['veloxloop', 'asyncio', 'uvloop']:
             if loop not in bench_data or '1' not in bench_data[loop]:
@@ -70,7 +70,7 @@ def generate_simple_readme():
         for msg_size, msg_label in [('1024', '1KB'), ('10240', '10KB'), ('102400', '100KB')]:
             content.append(f"\n### {msg_label} Details\n")
             content.append("| Loop | RPS | Mean Latency | 99p Latency | Min | Max |")
-            content.append("\n| --- | --- | --- | --- | --- | --- |")
+            content.append("| --- | --- | --- | --- | --- | --- |")
             
             for loop in ['veloxloop', 'asyncio', 'uvloop']:
                 if loop not in bench_data or '1' not in bench_data[loop]:
@@ -106,7 +106,7 @@ def generate_simple_readme():
         content.append("\n### Overview\n")
         header = ["| Loop"] + [f"{c} conn" for c in concurrency_levels] + ["|"]
         content.append(" | ".join(header))
-        content.append("\n| --- " + "| --- " * len(concurrency_levels) + "|")
+        content.append("| --- " + "| --- " * len(concurrency_levels) + "|")
         
         for loop in ['veloxloop', 'asyncio', 'uvloop']:
             if loop not in concurrency_data:
@@ -124,7 +124,7 @@ def generate_simple_readme():
         for c_level in concurrency_levels:
             content.append(f"\n### {c_level} Concurrent Connections\n")
             content.append("| Loop | RPS | Mean Latency | 99p Latency | Min | Max |")
-            content.append("\n| --- | --- | --- | --- | --- | --- |")
+            content.append("| --- | --- | --- | --- | --- | --- |")
             
             for loop in ['veloxloop', 'asyncio', 'uvloop']:
                 if loop not in concurrency_data:

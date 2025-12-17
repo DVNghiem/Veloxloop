@@ -1,6 +1,7 @@
 import asyncio
 from ._veloxloop import VeloxLoop as _VeloxLoopImpl
 from ._veloxloop import VeloxLoopPolicy as _VeloxLoopPolicyImpl
+from ._veloxloop import StreamReader, StreamWriter
 import threading
 
 __version__ = "0.1.0"
@@ -123,5 +124,5 @@ def new_event_loop():
     """Create a new VeloxLoop event loop instance."""
     return VeloxLoop(debug=False)
 
-__all__ = ['VeloxLoop', 'VeloxLoopPolicy', 'VeloxTimerHandle', 'install', 'new_event_loop', '__version__']
-__all__ = ('VeloxLoop', 'VeloxLoopPolicy', 'install')
+__all__ = ['VeloxLoop', 'VeloxLoopPolicy', 'VeloxTimerHandle', 'install', 'new_event_loop', 
+           'StreamReader', 'StreamWriter', '__version__']
