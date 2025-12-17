@@ -1,5 +1,5 @@
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyTuple, PyString, PyInt};
 use std::net::{TcpStream, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::io::{Write, self};
@@ -75,7 +75,7 @@ impl TcpServer {
          self.active
     }
     
-    fn fd(&self) -> Option<RawFd> {
+    pub fn fd(&self) -> Option<RawFd> {
         self.listener.as_ref().map(|l| l.as_raw_fd())
     }
     
@@ -139,20 +139,97 @@ pub struct TcpTransport {
     // Buffer for outgoing data? Asyncio transports buffer if socket is full.
     // For MVP we might BLOCK or fail if full? No, we must buffer.
     write_buffer: Vec<u8>,
+    // Write buffer limits (high water mark, low water mark)
+    write_buffer_high: usize,
+    write_buffer_low: usize,
 }
 
 #[pymethods]
 impl TcpTransport {
-    fn get_extra_info(&self, _name: &str) -> PyResult<Option<String>> {
-        // Implement peername, sockname etc.
-        Ok(None)
+    #[pyo3(signature = (name, default=None))]
+    fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        // Implement peername, sockname, socket, etc.
+        // Based on asyncio transport protocol
+        match name {
+            "peername" => {
+                if let Some(stream) = self.stream.as_ref() {
+                    if let Ok(addr) = stream.peer_addr() {
+                        let ip_str = PyString::new(py, &addr.ip().to_string());
+                        let port_num = PyInt::new(py, addr.port());
+                        let tuple = PyTuple::new(py, vec![ip_str.as_any(), port_num.as_any()])?;
+                        return Ok(tuple.into());
+                    }
+                }
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            "sockname" => {
+                if let Some(stream) = self.stream.as_ref() {
+                    if let Ok(addr) = stream.local_addr() {
+                        let ip_str = PyString::new(py, &addr.ip().to_string());
+                        let port_num = PyInt::new(py, addr.port());
+                        let tuple = PyTuple::new(py, vec![ip_str.as_any(), port_num.as_any()])?;
+                        return Ok(tuple.into());
+                    }
+                }
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            "socket" => {
+                if let Some(stream) = self.stream.as_ref() {
+                    let fd = stream.as_raw_fd();
+                    if let Ok(addr) = stream.local_addr() {
+                        let socket_wrapper = SocketWrapper::new(fd, addr);
+                        return Ok(Py::new(py, socket_wrapper)?.into_any());
+                    }
+                }
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            "compression" => {
+                // No compression support
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            "cipher" => {
+                // No SSL support yet
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            "peercert" => {
+                // No SSL support yet
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            "sslcontext" => {
+                // No SSL support yet
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            _ => Ok(default.unwrap_or_else(|| py.None()))
+        }
     }
 
     fn get_write_buffer_size(&self) -> usize {
         self.write_buffer.len()
     }
     
-    fn set_write_buffer_limits(&self, _high: Option<usize>, _low: Option<usize>) -> PyResult<()> {
+    #[pyo3(signature = (high=None, low=None))]
+    fn set_write_buffer_limits(&mut self, py: Python<'_>, high: Option<usize>, low: Option<usize>) -> PyResult<()> {
+        // Set the high and low watermarks for the write buffer
+        // Default values are defined in asyncio: high=64KB, low=high//2 if not specified
+        const DEFAULT_HIGH: usize = 64 * 1024;
+        
+        let high_limit = high.unwrap_or(DEFAULT_HIGH);
+        let low_limit = low.unwrap_or(high_limit / 4);
+        
+        if low_limit >= high_limit {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "low must be less than high"
+            ));
+        }
+        
+        self.write_buffer_high = high_limit;
+        self.write_buffer_low = low_limit;
+        
+        // Call _maybe_pause_protocol() if buffer size exceeds high water mark
+        if self.write_buffer.len() > self.write_buffer_high {
+            let _ = self.protocol.call_method0(py, "pause_writing");
+        }
+        
         Ok(())
     }
     
@@ -308,13 +385,13 @@ impl TcpTransport {
                   if let Ok(res) = protocol.call_method0(py, "eof_received") {
                        if let Ok(keep_open) = res.extract::<bool>(py) {
                            if !keep_open {
-                               slf.call_method0("close")?;
+                               Self::close(&slf)?;
                            }
                        } else {
-                           slf.call_method0("close")?;
+                           Self::close(&slf)?;
                        }
                   } else {
-                       slf.call_method0("close")?;
+                       Self::close(&slf)?;
                   }
              }
              Err(e) => return Err(e.into()),
@@ -347,6 +424,10 @@ impl TcpTransport {
         stream.set_nonblocking(true)?;
         let fd = stream.as_raw_fd();
         
+        // Default buffer limits from asyncio
+        const DEFAULT_HIGH: usize = 64 * 1024;  // 64 KB
+        const DEFAULT_LOW: usize = 16 * 1024;   // 16 KB (64KB / 4)
+        
         let transport = Self {
             fd,
             stream: Some(stream),
@@ -354,6 +435,8 @@ impl TcpTransport {
             loop_,
             closing: false,
             write_buffer: Vec::new(),
+            write_buffer_high: DEFAULT_HIGH,
+            write_buffer_low: DEFAULT_LOW,
         };
         Ok(transport)
     }

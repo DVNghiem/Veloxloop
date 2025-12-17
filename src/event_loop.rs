@@ -3,16 +3,15 @@ use pyo3::types::{PyDict, PyTuple};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use std::time::{Instant, Duration};
-use polling::Event;
 
 use crate::poller::LoopPoller;
-use crate::handles::{IoHandles, HandleType};
+use crate::handles::IoHandles;
 use crate::callbacks::{CallbackQueue, Callback};
 use crate::timers::Timers;
 use crate::utils::{VeloxResult, VeloxError};
-use crate::transports::tcp::{TcpTransport, TcpServer};
-use std::net::{TcpListener, SocketAddr};
-use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
+use crate::transports::tcp::TcpServer;
+use crate::transports::future::PendingFuture;
+use std::os::fd::{AsRawFd, RawFd};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -137,7 +136,7 @@ impl VeloxLoop {
         }
     }
     
-    pub fn add_writer(&self, py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
+    pub fn add_writer(&self, _py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
         let poller = self.poller.clone();
         
         let mut handles = self.handles.lock();
@@ -237,6 +236,11 @@ impl VeloxLoop {
         self.running.store(false, Ordering::SeqCst);
     }
 
+    // Create a Rust-based PendingFuture
+    fn create_future(&self, py: Python<'_>) -> PyResult<Py<PendingFuture>> {
+        Py::new(py, PendingFuture::new())
+    }
+
     // --- Networking ---
     
     // internal _accept_connection
@@ -247,9 +251,9 @@ impl VeloxLoop {
     }
 
     #[pyo3(signature = (protocol_factory, host=None, port=None, **_kwargs))]
-    fn create_connection(slf: &Bound<'_, Self>, protocol_factory: Py<PyAny>, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<PyObject> {
+    fn create_connection(slf: &Bound<'_, Self>, protocol_factory: Py<PyAny>, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
-        // let self_ = slf.borrow(); // We don't need borrow of self anymore for this logic (mostly)
+        let self_ = slf.borrow();
         
         let host = host.unwrap_or("127.0.0.1");
         let port = port.unwrap_or(0);
@@ -287,29 +291,25 @@ impl VeloxLoop {
         let stream: std::net::TcpStream = socket.into();
         let fd = stream.as_raw_fd();
         
-        // Create Future
-        // Use self.create_future() via Python wrapper to avoid importing asyncio here
-        let fut = slf.call_method0("create_future")?;
+        // Create Future using Rust implementation
+        let fut = self_.create_future(py)?;
         
         // Create Callback
         use crate::callbacks::AsyncConnectCallback;
         let loop_obj = slf.clone().unbind();
-        let fut_obj = fut.clone().unbind(); 
-        let callback = AsyncConnectCallback::new(loop_obj.clone_ref(py), fut_obj.clone_ref(py), protocol_factory, stream);
-        let callback_py = Py::new(py, callback)?;
+        let callback = AsyncConnectCallback::new(loop_obj.clone_ref(py), fut.clone_ref(py), protocol_factory, stream);
+        let callback_py = Py::new(py, callback)?.into_any();
         
-        // Register Writer (for Connect)
-        // We need to call add_writer on the loop.
-        // slf is &Bound<Self>. We can call Python method "add_writer" on it (exposed via base implementation inheritance if it worked completely via python, but here slf IS the VeloxLoop instance).
-        // Since VeloxLoop has add_writer pymethod, we can call it.
-        slf.call_method1("add_writer", (fd, callback_py))?;
+        // Register Writer (for Connect) - call add_writer directly instead of via Python
+        self_.add_writer(py, fd, callback_py)?;
         
-        Ok(fut.into())
+        Ok(fut.into_any())
     }    
 
     #[pyo3(signature = (protocol_factory, host=None, port=None, **_kwargs))]
-    fn create_server(slf: &Bound<'_, Self>, protocol_factory: Py<PyAny>, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<PyObject> {
+    fn create_server(slf: &Bound<'_, Self>, protocol_factory: Py<PyAny>, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
         let py = slf.py();
+        let self_ = slf.borrow();
         let loop_obj = slf.clone().unbind();
         
         let host = host.unwrap_or("127.0.0.1");
@@ -322,35 +322,28 @@ impl VeloxLoop {
         
         // 2. Create Server object
         let server = TcpServer::new(listener, loop_obj.clone_ref(py), protocol_factory.clone_ref(py));
-        let server = Py::new(py, server)?;
+        let server_py = Py::new(py, server)?;
         
         // 3. Register Accept Handler
         // The server needs to be polled for reading (accept).
         // TcpServer defines `_on_accept`.
-        let on_accept = server.getattr(py, "_on_accept")?;
+        let on_accept = server_py.getattr(py, "_on_accept")?;
         
-        // Use self.add_reader directly?
-        // We need fd from listener. We can get it from server.
-        let fd = server.call_method0(py, "fd")?.extract::<i32>(py)?;
+        // Get fd directly from TcpServer instead of calling Python method
+        let fd = server_py.borrow(py).fd()
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Server has no listener"))?;
         
-        // self.add_reader(fd, on_accept)
-        let self_ = slf.borrow();
+        // Call add_reader directly instead of via Python
         self_.add_reader(py, fd, on_accept)?;
         
         // 4. Return Server object wrapped in completed future
-        let fut = crate::transports::future::CompletedFuture::new(server.into());
+        let fut = crate::transports::future::CompletedFuture::new(server_py.into_any());
         
-        Ok(Py::new(py, fut)?.into())
+        Ok(Py::new(py, fut)?.into_any())
     }
 }
 
 impl VeloxLoop {
-    fn get_loop_obj(&self, _py: Python<'_>) -> PyResult<Py<PyAny>> {
-        // This is hard without `slf`.
-        // We will assume the user passes the loop or we fix signature.
-        Err(VeloxError::RuntimeError("Creating connection requires bound loop".into()).into())
-    }
-
     fn _run_once(&self, py: Python<'_>, events: &mut polling::Events) -> VeloxResult<()> {
          // 1. Calculate Timeout
          let has_callbacks = !self.callbacks.is_empty();

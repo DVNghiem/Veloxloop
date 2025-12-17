@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use crate::poller::LoopPoller;
 use crate::event_loop::VeloxLoop;
 use crate::transports::tcp::TcpTransport;
+use crate::transports::future::PendingFuture;
 
 pub struct Callback {
     pub callback: Py<PyAny>,
@@ -57,7 +58,7 @@ impl CallbackQueue {
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct AsyncConnectCallback {
     loop_: Py<VeloxLoop>,
-    future: Py<PyAny>,
+    future: Py<PendingFuture>,
     protocol_factory: Py<PyAny>,
     stream: Option<std::net::TcpStream>,
     fd: RawFd,
@@ -95,7 +96,7 @@ impl AsyncConnectCallback {
                                     
                                     // connection_made
                                     if let Err(e) = protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),)) {
-                                        self.future.call_method1(py, "set_exception", (e,))?;
+                                        self.future.bind(py).borrow().set_exception(py, e.value(py).as_any().clone().unbind())?;
                                         return Ok(());
                                     }
                                     
@@ -105,25 +106,28 @@ impl AsyncConnectCallback {
                                     loop_ref.borrow().add_reader(py, fd, read_ready)?;
                                     
                                     // Set result: (transport, protocol)
-                                    let res = PyTuple::new(py, &[transport_py.into_any(), protocol])?;
-                                    self.future.call_method1(py, "set_result", (res,))?;
+                                    let res = PyTuple::new(py, &[transport_py.into_any(), protocol])?.into_any();
+                                    self.future.bind(py).borrow().set_result(res.unbind())?;
                                 }
                                 Err(e) => {
                                     // Convert VeloxError to PyErr
                                     let py_err: PyErr = e.into();
-                                    self.future.call_method1(py, "set_exception", (py_err,))?;
+                                    let exc_val = py_err.value(py).as_any().clone().unbind();
+                                    self.future.bind(py).borrow().set_exception(py, exc_val)?;
                                 }
                             }
                         }
                         Err(e) => {
-                            self.future.call_method1(py, "set_exception", (e,))?;
+                            let exc_val = e.value(py).as_any().clone().unbind();
+                            self.future.bind(py).borrow().set_exception(py, exc_val)?;
                         }
                     }
                 }
                 Ok(Some(e)) | Err(e) => {
                     // Error connecting
                     let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string());
-                    self.future.call_method1(py, "set_exception", (py_err,))?;
+                    let exc_val = py_err.value(py).as_any().clone().unbind();
+                    self.future.bind(py).borrow().set_exception(py, exc_val)?;
                 }
             }
         }
@@ -134,7 +138,7 @@ impl AsyncConnectCallback {
 impl AsyncConnectCallback {
     pub fn new(
         loop_: Py<VeloxLoop>,
-        future: Py<PyAny>,
+        future: Py<PendingFuture>,
         protocol_factory: Py<PyAny>,
         stream: std::net::TcpStream,
     ) -> Self {
