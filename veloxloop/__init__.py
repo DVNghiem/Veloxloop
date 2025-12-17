@@ -57,6 +57,18 @@ class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
         # In a full implementation, this would shutdown the thread pool executor
         pass
 
+    async def create_datagram_endpoint(self, protocol_factory, 
+                                      local_addr=None, remote_addr=None,
+                                      **kwargs):
+        """Create datagram endpoint - delegates to Rust implementation"""
+        # Call the Rust implementation
+        return await super().create_datagram_endpoint(
+            protocol_factory, 
+            local_addr=local_addr, 
+            remote_addr=remote_addr,
+            **kwargs
+        )
+
     def _timer_handle_cancelled(self, handle):
         """Notification that a TimerHandle has been cancelled"""
         # This is called when a timer handle is cancelled

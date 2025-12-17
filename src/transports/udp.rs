@@ -1,0 +1,266 @@
+use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyTuple, PyString, PyInt};
+use std::net::{UdpSocket, SocketAddr};
+use std::os::fd::{AsRawFd, RawFd};
+use std::io;
+use parking_lot::Mutex;
+
+use crate::utils::VeloxResult;
+use crate::event_loop::VeloxLoop;
+
+/// Pure Rust UDP socket wrapper to avoid importing Python's socket module
+#[pyclass(module = "veloxloop._veloxloop")]
+pub struct UdpSocketWrapper {
+    fd: RawFd,
+    addr: SocketAddr,
+}
+
+#[pymethods]
+impl UdpSocketWrapper {
+    fn getsockname(&self) -> PyResult<(String, u16)> {
+        Ok((self.addr.ip().to_string(), self.addr.port()))
+    }
+    
+    fn fileno(&self) -> RawFd {
+        self.fd
+    }
+}
+
+impl UdpSocketWrapper {
+    fn new(fd: RawFd, addr: SocketAddr) -> Self {
+        Self { fd, addr }
+    }
+}
+
+/// UDP/Datagram Transport implementation
+/// Implements asyncio's DatagramTransport protocol
+#[pyclass(module = "veloxloop._veloxloop")]
+pub struct UdpTransport {
+    fd: RawFd,
+    socket: Mutex<Option<UdpSocket>>,
+    protocol: Py<PyAny>,
+    loop_: Py<VeloxLoop>,
+    closing: bool,
+    local_addr: Option<SocketAddr>,
+    remote_addr: Option<SocketAddr>,
+    // For sendto() when not connected
+    allow_broadcast: bool,
+}
+
+#[pymethods]
+impl UdpTransport {
+    #[pyo3(signature = (name, default=None))]
+    fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+        match name {
+            "socket" => {
+                if let Some(ref addr) = self.local_addr {
+                    let socket_wrapper = UdpSocketWrapper::new(self.fd, *addr);
+                    return Ok(Py::new(py, socket_wrapper)?.into_any());
+                }
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            "sockname" => {
+                if let Some(addr) = self.local_addr {
+                    let ip_str = PyString::new(py, &addr.ip().to_string());
+                    let port_num = PyInt::new(py, addr.port());
+                    let tuple = PyTuple::new(py, vec![ip_str.as_any(), port_num.as_any()])?;
+                    return Ok(tuple.into());
+                }
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            "peername" => {
+                if let Some(addr) = self.remote_addr {
+                    let ip_str = PyString::new(py, &addr.ip().to_string());
+                    let port_num = PyInt::new(py, addr.port());
+                    let tuple = PyTuple::new(py, vec![ip_str.as_any(), port_num.as_any()])?;
+                    return Ok(tuple.into());
+                }
+                Ok(default.unwrap_or_else(|| py.None()))
+            }
+            _ => Ok(default.unwrap_or_else(|| py.None()))
+        }
+    }
+
+    fn is_closing(&self) -> bool {
+        self.closing
+    }
+
+    fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        {
+            let self_ = slf.borrow();
+            if self_.closing {
+                return Ok(());
+            }
+        }
+        
+        {
+            let mut self_ = slf.borrow_mut();
+            self_.closing = true;
+            self_._force_close(py)?;
+        }
+        Ok(())
+    }
+    
+    fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
+        let fd = self.fd;
+        
+        let loop_ = self.loop_.bind(py).borrow();
+        loop_.remove_reader(py, fd)?;
+        drop(loop_);
+        
+        *self.socket.lock() = None;
+        
+        // Notify Protocol
+        let _ = self.protocol.call_method1(py, "connection_lost", (py.None(),));
+        Ok(())
+    }
+
+    /// Send data to the remote peer (for connected sockets)
+    /// Implements DatagramTransport.sendto() when addr is None
+    #[pyo3(signature = (data, addr=None))]
+    fn sendto(slf: &Bound<'_, Self>, data: &Bound<'_, PyBytes>, addr: Option<(String, u16)>) -> PyResult<()> {
+        let bytes = data.as_bytes();
+        let self_ = slf.borrow();
+        
+        if self_.closing {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Cannot send on closing transport"
+            ));
+        }
+        
+        let socket_guard = self_.socket.lock();
+        if let Some(socket) = socket_guard.as_ref() {
+            let result = if let Some((ip, port)) = addr {
+                // sendto() with explicit address
+                let target_addr: SocketAddr = format!("{}:{}", ip, port)
+                    .parse()
+                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        format!("Invalid address: {}", e)
+                    ))?;
+                socket.send_to(bytes, target_addr)
+            } else if let Some(remote) = self_.remote_addr {
+                // Connected socket - send to remote_addr
+                socket.send_to(bytes, remote)
+            } else {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "No address specified and socket is not connected"
+                ));
+            };
+            
+            match result {
+                Ok(_) => Ok(()),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // For UDP, we could buffer or just drop
+                    // asyncio UDP doesn't buffer writes, it may raise BlockingIOError
+                    Err(PyErr::new::<pyo3::exceptions::PyBlockingIOError, _>(
+                        "Socket buffer full"
+                    ))
+                }
+                Err(e) => Err(e.into()),
+            }
+        } else {
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Socket is closed"
+            ))
+        }
+    }
+
+    /// Abort the transport immediately
+    fn abort(slf: &Bound<'_, Self>) -> PyResult<()> {
+        Self::close(slf)
+    }
+
+    /// Internal callback called by loop when readable
+    fn _read_ready(&self, py: Python<'_>) -> PyResult<()> {
+        let socket_guard = self.socket.lock();
+        
+        if let Some(socket) = socket_guard.as_ref() {
+            let mut buf = [0u8; 65536]; // Max UDP packet size
+            
+            match socket.recv_from(&mut buf) {
+                Ok((n, addr)) => {
+                    drop(socket_guard); // Release lock before calling Python
+                    
+                    let data = PyBytes::new(py, &buf[..n]);
+                    let addr_tuple = PyTuple::new(py, vec![
+                        PyString::new(py, &addr.ip().to_string()).as_any(),
+                        PyInt::new(py, addr.port()).as_any(),
+                    ])?;
+                    
+                    // Call protocol.datagram_received(data, addr)
+                    let _ = self.protocol.call_method1(
+                        py,
+                        "datagram_received",
+                        (data, addr_tuple),
+                    );
+                    Ok(())
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // No data available
+                    Ok(())
+                }
+                Err(e) => {
+                    drop(socket_guard); // Release lock before calling Python
+                    
+                    // Call protocol.error_received(exc)
+                    let exc = pyo3::exceptions::PyOSError::new_err(e.to_string());
+                    let exc_obj = exc.value(py);
+                    let _ = self.protocol.call_method1(py, "error_received", (exc_obj,));
+                    Ok(())
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set broadcast option on the socket
+    fn set_broadcast(&mut self, enable: bool) -> PyResult<()> {
+        let socket_guard = self.socket.lock();
+        if let Some(socket) = socket_guard.as_ref() {
+            socket.set_broadcast(enable)?;
+            drop(socket_guard);
+            self.allow_broadcast = enable;
+            Ok(())
+        } else {
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Socket is closed"
+            ))
+        }
+    }
+
+    /// Get the loop associated with this transport
+    fn get_loop(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        Ok(self.loop_.clone_ref(py).into_any())
+    }
+}
+
+impl UdpTransport {
+    /// Create a new UDP transport
+    pub fn new(
+        loop_: Py<VeloxLoop>,
+        socket: UdpSocket,
+        protocol: Py<PyAny>,
+        remote_addr: Option<SocketAddr>,
+    ) -> VeloxResult<Self> {
+        socket.set_nonblocking(true)?;
+        let fd = socket.as_raw_fd();
+        let local_addr = socket.local_addr().ok();
+        
+        Ok(Self {
+            fd,
+            socket: Mutex::new(Some(socket)),
+            protocol,
+            loop_,
+            closing: false,
+            local_addr,
+            remote_addr,
+            allow_broadcast: false,
+        })
+    }
+    
+    pub fn fd(&self) -> RawFd {
+        self.fd
+    }
+}

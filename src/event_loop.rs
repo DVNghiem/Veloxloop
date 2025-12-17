@@ -626,6 +626,143 @@ impl VeloxLoop {
         
         Ok(Py::new(py, fut)?.into_any())
     }
+
+    #[pyo3(signature = (protocol_factory, local_addr=None, remote_addr=None, **kwargs))]
+    fn create_datagram_endpoint(
+        slf: &Bound<'_, Self>,
+        protocol_factory: Py<PyAny>,
+        local_addr: Option<(String, u16)>,
+        remote_addr: Option<(String, u16)>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let self_ = slf.borrow();
+        let loop_obj = slf.clone().unbind();
+        
+        // Extract optional parameters from kwargs
+        let allow_broadcast = kwargs
+            .and_then(|k| k.get_item("allow_broadcast").ok())
+            .and_then(|v| v.and_then(|val| val.extract::<bool>().ok()))
+            .unwrap_or(false);
+            
+        let reuse_port = kwargs
+            .and_then(|k| k.get_item("reuse_port").ok())
+            .and_then(|v| v.and_then(|val| val.extract::<bool>().ok()))
+            .unwrap_or(false);
+        
+        // Create UDP socket
+        use socket2::{Socket, Domain, Type, Protocol};
+        use std::net::SocketAddr;
+        
+        // Determine address family from local_addr or remote_addr
+        let is_ipv6 = if let Some((ref host, _)) = local_addr {
+            host.contains(':')
+        } else if let Some((ref host, _)) = remote_addr {
+            host.contains(':')
+        } else {
+            false
+        };
+        
+        let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+        
+        socket.set_nonblocking(true)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+        
+        // Set socket options
+        if allow_broadcast {
+            socket.set_broadcast(true)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+        }
+        
+        #[cfg(all(unix, not(target_os = "solaris")))]
+        if reuse_port {
+            use std::os::fd::AsRawFd;
+            let fd = socket.as_raw_fd();
+            unsafe {
+                let optval: libc::c_int = 1;
+                let ret = libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_REUSEPORT,
+                    &optval as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&optval) as libc::socklen_t,
+                );
+                if ret != 0 {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        format!("Failed to set SO_REUSEPORT: {}", std::io::Error::last_os_error())
+                    ));
+                }
+            }
+        }
+        
+        // Bind to local address if provided
+        if let Some((host, port)) = local_addr {
+            let addr_str = format!("{}:{}", host, port);
+            let bind_addr: SocketAddr = addr_str
+                .parse()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid local address: {}", e)
+                ))?;
+            socket.bind(&bind_addr.into())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                    format!("Failed to bind: {}", e)
+                ))?;
+        }
+        
+        // Parse remote address if provided
+        let remote_sockaddr = if let Some((host, port)) = remote_addr {
+            let addr_str = format!("{}:{}", host, port);
+            let addr: SocketAddr = addr_str
+                .parse()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    format!("Invalid remote address: {}", e)
+                ))?;
+            
+            // Connect to remote address (this filters incoming packets)
+            socket.connect(&addr.into())
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                    format!("Failed to connect: {}", e)
+                ))?;
+            Some(addr)
+        } else {
+            None
+        };
+        
+        let udp_socket: std::net::UdpSocket = socket.into();
+        
+        // Create protocol instance
+        let protocol = protocol_factory.call0(py)?;
+        
+        // Create transport
+        use crate::transports::udp::UdpTransport;
+        let transport = UdpTransport::new(
+            loop_obj.clone_ref(py),
+            udp_socket,
+            protocol.clone_ref(py),
+            remote_sockaddr,
+        )?;
+        
+        let fd = transport.fd();
+        let transport_py = Py::new(py, transport)?;
+        
+        // Call protocol.connection_made(transport)
+        protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;
+        
+        // Register read handler
+        let read_ready = transport_py.getattr(py, "_read_ready")?;
+        self_.add_reader(py, fd, read_ready)?;
+        
+        // Return (transport, protocol) tuple wrapped in completed future
+        let result_tuple = PyTuple::new(py, vec![
+            transport_py.into_any(),
+            protocol.into_any(),
+        ])?;
+        
+        let fut = crate::transports::future::CompletedFuture::new(result_tuple.into());
+        Ok(Py::new(py, fut)?.into_any())
+    }
 }
 
 impl VeloxLoop {

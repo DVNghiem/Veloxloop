@@ -13,6 +13,7 @@ mod streams;
 
 use event_loop::VeloxLoop;
 use transports::tcp::{TcpTransport, TcpServer, SocketWrapper};
+use transports::udp::{UdpTransport, UdpSocketWrapper};
 use transports::future::CompletedFuture;
 use callbacks::AsyncConnectCallback;
 use policy::VeloxLoopPolicy;
@@ -24,6 +25,8 @@ fn _veloxloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TcpTransport>()?;
     m.add_class::<TcpServer>()?;
     m.add_class::<SocketWrapper>()?;
+    m.add_class::<UdpTransport>()?;
+    m.add_class::<UdpSocketWrapper>()?;
     m.add_class::<CompletedFuture>()?;
     m.add_class::<AsyncConnectCallback>()?;
     m.add_class::<VeloxLoopPolicy>()?;

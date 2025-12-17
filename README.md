@@ -37,7 +37,6 @@ The following asyncio features are **not yet implemented** and are planned for f
 - [ ] **Async context managers** - Full support for `async with` on loop methods
 
 ### Network & Transport Layer
-- [ ] **UDP/Datagram support** - `create_datagram_endpoint()`
 - [ ] **Unix domain sockets** - Support for `AF_UNIX` sockets
 - [ ] **Unix pipes** - `connect_read_pipe()` and `connect_write_pipe()`
 - [ ] **SSL/TLS support** - Secure socket connections via `ssl` module integration
