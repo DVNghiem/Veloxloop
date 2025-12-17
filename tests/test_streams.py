@@ -97,11 +97,12 @@ class TestStreamReader:
         assert reader.buffer_size() == 8
     
     def test_readexactly_not_enough_data(self):
-        """Test readexactly with not enough data"""
+        """Test readexactly with not enough data returns PendingFuture"""
         reader = _veloxloop.StreamReader()
         reader.feed_data(b"Hi")
-        data = reader.readexactly(10)
-        assert data == b""  # Not enough data, returns empty
+        result = reader.readexactly(10)
+        # When not enough data, returns PendingFuture for async waiting
+        assert hasattr(result, '__await__') or 'PendingFuture' in str(type(result))
     
     def test_readexactly_eof_error(self):
         """Test readexactly raises error at EOF with insufficient data"""
@@ -136,11 +137,12 @@ class TestStreamReader:
         assert line3 == b"Line 3"
     
     def test_readline_no_newline(self):
-        """Test readline with no newline in buffer"""
+        """Test readline with no newline in buffer returns PendingFuture"""
         reader = _veloxloop.StreamReader()
         reader.feed_data(b"incomplete line")
-        line = reader.readline()
-        assert line == b""  # No newline found, returns empty
+        result = reader.readline()
+        # When no newline found, returns PendingFuture for async waiting
+        assert hasattr(result, '__await__') or 'PendingFuture' in str(type(result))
     
     def test_readuntil_found(self):
         """Test readuntil when separator is found"""
@@ -154,11 +156,12 @@ class TestStreamReader:
         assert item2 == b"banana,"
     
     def test_readuntil_not_found(self):
-        """Test readuntil when separator not found"""
+        """Test readuntil when separator not found returns PendingFuture"""
         reader = _veloxloop.StreamReader()
         reader.feed_data(b"no separator here")
-        data = reader.readuntil(b",")
-        assert data == b""  # Not found, returns empty
+        result = reader.readuntil(b",")
+        # When separator not found, returns PendingFuture for async waiting
+        assert hasattr(result, '__await__') or 'PendingFuture' in str(type(result))
     
     def test_readuntil_eof(self):
         """Test readuntil at EOF without separator"""

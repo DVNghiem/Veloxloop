@@ -3,6 +3,7 @@ use pyo3::types::PyBytes;
 use std::net::{TcpStream, SocketAddr};
 use std::os::fd::{AsRawFd, RawFd};
 use std::io::{Write, self};
+use std::collections::VecDeque;
 use parking_lot::Mutex;
 
 use crate::utils::VeloxResult;
@@ -326,9 +327,8 @@ pub struct TcpTransport {
     loop_: Py<VeloxLoop>,
     closing: bool,
     reading_paused: bool,
-    // Buffer for outgoing data? Asyncio transports buffer if socket is full.
-    // For MVP we might BLOCK or fail if full? No, we must buffer.
-    write_buffer: Vec<u8>,
+    // Buffer for outgoing data - VecDeque for O(1) front removal
+    write_buffer: VecDeque<u8>,
     // Write buffer limits (high water mark, low water mark)
     write_buffer_high: usize,
     write_buffer_low: usize,
@@ -411,11 +411,11 @@ impl crate::transports::StreamTransport for TcpTransport {
                     // All written
                 }
                 Ok(n) => {
-                    // Partial write
-                    self.write_buffer.extend_from_slice(&data[n..]);
+                    // Partial write - use extend for VecDeque
+                    self.write_buffer.extend(&data[n..]);
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.write_buffer.extend_from_slice(data);
+                    self.write_buffer.extend(data);
                 }
                 Err(e) => {
                     return Err(e.into());
@@ -498,32 +498,32 @@ impl crate::transports::StreamTransport for TcpTransport {
     
     fn write_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(mut stream) = self.stream.as_ref() {
-            if !self.write_buffer.is_empty() {
-                // Try to write as much as possible in one go
-                loop {
-                    match stream.write(&self.write_buffer) {
-                        Ok(0) => {
-                            // Connection closed
-                            return Err(PyErr::new::<pyo3::exceptions::PyConnectionError, _>(
-                                "Connection closed during write"
-                            ));
+            // Try to write as much as possible in one go
+            while !self.write_buffer.is_empty() {
+                // Make buffer contiguous at the start of each iteration
+                let data = self.write_buffer.make_contiguous();
+                
+                match stream.write(data) {
+                    Ok(0) => {
+                        // Connection closed
+                        return Err(PyErr::new::<pyo3::exceptions::PyConnectionError, _>(
+                            "Connection closed during write"
+                        ));
+                    }
+                    Ok(n) => {
+                        self.write_buffer.drain(..n);
+                        if self.write_buffer.is_empty() {
+                            let fd = self.fd;
+                            self.loop_.bind(py).borrow().remove_writer(py, fd)?;
                         }
-                        Ok(n) => {
-                            self.write_buffer.drain(0..n);
-                            if self.write_buffer.is_empty() {
-                                let fd = self.fd;
-                                self.loop_.bind(py).borrow().remove_writer(py, fd)?;
-                                break;
-                            }
-                            // Continue writing remaining data
-                        }
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                            // Can't write more now, will retry on next write_ready
-                            break;
-                        }
-                        Err(e) => {
-                            return Err(e.into());
-                        }
+                        // Continue loop to write remaining data
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Can't write more now, will retry on next write_ready
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(e.into());
                     }
                 }
             }
@@ -684,44 +684,50 @@ impl TcpTransport {
             Error(io::Error),
         }
         
-        let action = {
-            let self_ = slf.borrow();
-            if let Some(stream) = self_.stream.as_ref() {
-                let mut buf = [0u8; 4096];
-                let mut s = stream;
-                match std::io::Read::read(&mut s, &mut buf) {
-                    Ok(0) => Action::Eof,
-                    Ok(n) => Action::Data(buf[..n].to_vec()),
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Action::WouldBlock,
-                    Err(e) => Action::Error(e),
+        // Read loop: continue reading until WouldBlock to maximize throughput
+        loop {
+            let action = {
+                let self_ = slf.borrow();
+                if let Some(stream) = self_.stream.as_ref() {
+                    // Use 64KB buffer matching the trait implementation
+                    let mut buf = [0u8; 65536];
+                    let mut s = stream;
+                    match std::io::Read::read(&mut s, &mut buf) {
+                        Ok(0) => Action::Eof,
+                        Ok(n) => Action::Data(buf[..n].to_vec()),
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Action::WouldBlock,
+                        Err(e) => Action::Error(e),
+                    }
+                } else {
+                    Action::WouldBlock
                 }
-            } else {
-                Action::WouldBlock
-            }
-        }; // Drop borrow before calling Python callbacks
-        
-        match action {
-            Action::Data(data) => {
-                let py_data = PyBytes::new(py, &data);
-                let protocol = slf.borrow().protocol.clone_ref(py);
-                protocol.call_method1(py, "data_received", (py_data,))?;
-            }
-            Action::Eof => {
-                let protocol = slf.borrow().protocol.clone_ref(py);
-                if let Ok(res) = protocol.call_method0(py, "eof_received") {
-                    if let Ok(keep_open) = res.extract::<bool>(py) {
-                        if !keep_open {
+            }; // Drop borrow before calling Python callbacks
+            
+            match action {
+                Action::Data(data) => {
+                    let py_data = PyBytes::new(py, &data);
+                    let protocol = slf.borrow().protocol.clone_ref(py);
+                    protocol.call_method1(py, "data_received", (py_data,))?;
+                    // Continue loop to read more data if available
+                }
+                Action::Eof => {
+                    let protocol = slf.borrow().protocol.clone_ref(py);
+                    if let Ok(res) = protocol.call_method0(py, "eof_received") {
+                        if let Ok(keep_open) = res.extract::<bool>(py) {
+                            if !keep_open {
+                                Self::close(slf)?;
+                            }
+                        } else {
                             Self::close(slf)?;
                         }
                     } else {
                         Self::close(slf)?;
                     }
-                } else {
-                    Self::close(slf)?;
+                    break; // EOF, exit loop
                 }
+                Action::WouldBlock => break, // No more data, exit loop
+                Action::Error(e) => return Err(e.into()),
             }
-            Action::WouldBlock => {}
-            Action::Error(e) => return Err(e.into()),
         }
         
         Ok(())
@@ -923,7 +929,7 @@ impl TcpTransport {
             loop_,
             closing: false,
             reading_paused: false,
-            write_buffer: Vec::new(),
+            write_buffer: VecDeque::new(),
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,
         };

@@ -823,6 +823,7 @@ name = "veloxloop"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "memchr",
  "mimalloc",
  "once_cell",
  "parking_lot",

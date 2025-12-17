@@ -76,20 +76,28 @@ impl StreamTransport {
             let mut buf = [0u8; 65536];
             let mut s = stream;
             
-            match Read::read(&mut s, &mut buf) {
-                Ok(0) => {
-                    // EOF
-                    self.reader.bind(py).borrow().feed_eof(py)?;
-                    self.close(py)?;
-                }
-                Ok(n) => {
-                    // Feed data directly to StreamReader with Python context
-                    self.reader.bind(py).borrow().feed_data(py, &buf[..n])?;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    self.reader.bind(py).borrow().set_exception(e.to_string())?;
-                    self.close(py)?;
+            // Read loop: continue reading until WouldBlock to maximize throughput
+            loop {
+                match Read::read(&mut s, &mut buf) {
+                    Ok(0) => {
+                        // EOF
+                        self.reader.bind(py).borrow().feed_eof(py)?;
+                        self.close(py)?;
+                        break;
+                    }
+                    Ok(n) => {
+                        // Feed data directly to StreamReader with Python context
+                        self.reader.bind(py).borrow().feed_data(py, &buf[..n])?;
+                        // Continue loop to read more data if available
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        break; // No more data, exit loop
+                    }
+                    Err(e) => {
+                        self.reader.bind(py).borrow().set_exception(e.to_string())?;
+                        self.close(py)?;
+                        break;
+                    }
                 }
             }
         }

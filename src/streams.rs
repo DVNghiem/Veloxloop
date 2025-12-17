@@ -1,7 +1,9 @@
+#[allow(unused)]
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::sync::Arc;
 use parking_lot::Mutex;
+use memchr::memchr;
 use crate::transports::future::PendingFuture;
 
 #[pyclass(module = "veloxloop._veloxloop")]
@@ -107,6 +109,7 @@ impl StreamReader {
     }
     
     /// Try to read until separator without blocking
+    /// Optimized with SIMD-accelerated search for single-byte separators
     fn _try_readuntil(&self, py: Python<'_>, separator: &[u8]) -> PyResult<Option<Py<PyAny>>> {
         // Check for exception first
         if let Some(exc_msg) = self.exception.lock().as_ref() {
@@ -115,24 +118,32 @@ impl StreamReader {
         
         let mut buffer = self.buffer.lock();
         
-        // Find the separator
-        if let Some(pos) = buffer.windows(separator.len())
-            .position(|window| window == separator)
-        {
+        // Find the separator - use SIMD-accelerated memchr for single-byte (common case: newline)
+        let pos = if separator.len() == 1 {
+            memchr(separator[0], &buffer)
+        } else {
+            // Multi-byte separator: use windows iterator
+            buffer.windows(separator.len())
+                .position(|window| window == separator)
+        };
+        
+        if let Some(pos) = pos {
             let end = pos + separator.len();
-            let data = buffer.drain(..end).collect::<Vec<u8>>();
-            let bytes = PyBytes::new(py, &data);
+            // Create PyBytes directly from slice to avoid intermediate Vec allocation
+            let bytes = PyBytes::new(py, &buffer[..end]);
+            buffer.drain(..end);
             return Ok(Some(bytes.into()));
         }
         
-        // Separator not found
-        if *self.eof.lock() {
+        // Separator not found - check EOF while still holding buffer lock
+        let is_eof = *self.eof.lock();
+        if is_eof {
             // Return all data if at EOF
             if buffer.is_empty() {
                 return Ok(Some(PyBytes::new(py, &[]).into()));
             }
-            let data = buffer.drain(..).collect::<Vec<u8>>();
-            let bytes = PyBytes::new(py, &data);
+            let bytes = PyBytes::new(py, &buffer);
+            buffer.clear();
             return Ok(Some(bytes.into()));
         }
         
@@ -150,12 +161,15 @@ impl StreamReader {
         let mut buffer = self.buffer.lock();
         
         if buffer.len() >= n {
-            let data = buffer.drain(..n).collect::<Vec<u8>>();
-            let bytes = PyBytes::new(py, &data);
+            // Create PyBytes directly from slice to avoid intermediate allocation
+            let bytes = PyBytes::new(py, &buffer[..n]);
+            buffer.drain(..n);
             return Ok(Some(bytes.into()));
         }
         
-        if *self.eof.lock() {
+        // Check EOF while still holding buffer lock
+        let is_eof = *self.eof.lock();
+        if is_eof {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 format!("Not enough data: expected {}, got {}", n, buffer.len())
             ));
