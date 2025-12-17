@@ -104,8 +104,8 @@ def generate_simple_readme():
         
         # Overview table
         content.append("\n### Overview\n")
-        header = ["| Loop"] + [f"{c} conn" for c in concurrency_levels] + ["|"]
-        content.append(" | ".join(header))
+        header = ["| Loop"] + [f"| {c} conn " for c in concurrency_levels] + ["|"]  
+        content.append("".join(header))
         content.append("| --- " + "| --- " * len(concurrency_levels) + "|")
         
         for loop in ['veloxloop', 'asyncio', 'uvloop']:

@@ -916,6 +916,7 @@ impl TcpServer {
 impl TcpTransport {
     pub fn new(loop_: Py<VeloxLoop>, stream: std::net::TcpStream, protocol: Py<PyAny>) -> VeloxResult<Self> {
         stream.set_nonblocking(true)?;
+        stream.set_nodelay(true).ok(); // lower latency (disable Nagle algorithm)
         let fd = stream.as_raw_fd();
         
         // Default buffer limits from asyncio

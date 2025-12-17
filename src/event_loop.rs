@@ -1226,71 +1226,80 @@ impl VeloxLoop {
              }
          }
          
-         // Process I/O Events
-         for event in events.iter() {
-
-             let fd = event.key as std::os::fd::RawFd;
-             
-             if event.readable {
-                  let callback = {
-                      let handles = self.handles.lock();
-                      if let Some(handle) = handles.get_reader(fd) {
-                          if !handle.cancelled {
-                               Some(handle.callback.clone_ref(py))
-                          } else {
-                               None
-                          }
-                      } else {
-                          None
-                      }
-                  };
+         // Process I/O Events - OPTIMIZED: Batch lock acquisition and defer epoll re-arming
+         // First pass: Collect all callbacks with single lock acquisition
+         let mut pending_callbacks: Vec<(std::os::fd::RawFd, Option<Py<PyAny>>, Option<Py<PyAny>>, bool, bool)> = Vec::with_capacity(events.len());
+         
+         {
+             let handles = self.handles.lock();
+             for event in events.iter() {
+                 let fd = event.key as std::os::fd::RawFd;
                  
-                 if let Some(cb) = callback {
-                      if let Err(e) = cb.call0(py) {
-                          e.print(py);
-                      } else {
-                      }
-                 }
-             }
-             if event.writable {
-                 let callback = {
-                     let handles = self.handles.lock();
-                     if let Some(handle) = handles.get_writer(fd) {
+                 let reader_cb = if event.readable {
+                     if let Some(handle) = handles.get_reader(fd) {
                          if !handle.cancelled {
-                              Some(handle.callback.clone_ref(py))
+                             Some(handle.callback.clone_ref(py))
                          } else {
-                              None
+                             None
                          }
                      } else {
                          None
                      }
-                 };
-                if let Some(cb) = callback {
-                       if let Err(e) = cb.call0(py) {
-                           e.print(py);
-                       }
-                  }
-             }
-             
-             // Re-arm (Oneshot support for polling v3)
-             let handles = self.handles.lock();
-             let r = handles.get_reader(fd).is_some();
-             let w = handles.get_writer(fd).is_some();
-             drop(handles);
-             
-             if r || w {
-                 let ev = if r && w {
-                      let mut e = polling::Event::readable(fd as usize);
-                      e.writable = true;
-                      e
-                 } else if r {
-                      polling::Event::readable(fd as usize)
                  } else {
-                      polling::Event::writable(fd as usize)
+                     None
+                 };
+                 
+                 let writer_cb = if event.writable {
+                     if let Some(handle) = handles.get_writer(fd) {
+                         if !handle.cancelled {
+                             Some(handle.callback.clone_ref(py))
+                         } else {
+                             None
+                         }
+                     } else {
+                         None
+                     }
+                 } else {
+                     None
+                 };
+                 
+                 // Track if we need to re-arm this FD
+                 let has_reader = handles.get_reader(fd).is_some();
+                 let has_writer = handles.get_writer(fd).is_some();
+                 
+                 pending_callbacks.push((fd, reader_cb, writer_cb, has_reader, has_writer));
+             }
+         } // Lock released before dispatching callbacks
+         
+         // Second pass: Dispatch callbacks (without holding lock)
+         for (_, reader_cb, writer_cb, _, _) in &pending_callbacks {
+             if let Some(cb) = reader_cb {
+                 if let Err(e) = cb.call0(py) {
+                     e.print(py);
+                 }
+             }
+             if let Some(cb) = writer_cb {
+                 if let Err(e) = cb.call0(py) {
+                     e.print(py);
+                 }
+             }
+         }
+         
+         // Third pass: Batch re-arm all FDs (oneshot support for polling v3)
+         for (fd, _, _, has_reader, has_writer) in pending_callbacks {
+             if has_reader || has_writer {
+                 let ev = if has_reader && has_writer {
+                     let mut e = polling::Event::readable(fd as usize);
+                     e.writable = true;
+                     e
+                 } else if has_reader {
+                     polling::Event::readable(fd as usize)
+                 } else {
+                     polling::Event::writable(fd as usize)
                  };
                  
                  // Ignore errors (e.g. if concurrently closed)
-                let _ = self.poller.modify(fd, ev);
+                 let _ = self.poller.modify(fd, ev);
              }
          }
             // Process Timers

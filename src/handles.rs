@@ -1,6 +1,7 @@
 use slab::Slab;
 use std::os::fd::RawFd;
 use pyo3::prelude::*;
+use rustc_hash::FxHashMap;
 
 pub struct Handle {
     pub callback: Py<PyAny>,
@@ -11,13 +12,7 @@ pub struct IoHandles {
     readers: Slab<Handle>,
     writers: Slab<Handle>,
     // Mapping from FD to Slab Key for fast lookup
-    // Since FDs can be arbitrary, we might need a HashMap or similar if FDs are sparse.
-    // However, usually we can just use the FD directly if we are careful, OR
-    // we use a HashMap<RawFd, usize> to map FD -> Slab Key.
-    // For O(1) strictly, if max FDs is known, a Vec could work, but HashMap is safer.
-    // Let's us a simple strategy:
-    // We actually need to map FD -> (ReaderKey, WriterKey).
-    fd_map: std::collections::HashMap<RawFd, (Option<usize>, Option<usize>)>,
+    fd_map: FxHashMap<RawFd, (Option<usize>, Option<usize>)>,
 }
 
 impl IoHandles {
@@ -25,7 +20,7 @@ impl IoHandles {
         Self {
             readers: Slab::new(),
             writers: Slab::new(),
-            fd_map: std::collections::HashMap::new(),
+            fd_map: FxHashMap::default(),
         }
     }
 

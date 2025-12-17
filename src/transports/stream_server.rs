@@ -238,6 +238,7 @@ impl StreamTransport {
         writer: Py<StreamWriter>,
     ) -> VeloxResult<Py<StreamTransport>> {
         stream.set_nonblocking(true)?;
+        stream.set_nodelay(true).ok(); // lower latency (disable Nagle algorithm)
         let fd = stream.as_raw_fd();
         
         // Use the writer's buffer directly (shared)
