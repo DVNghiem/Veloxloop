@@ -12,6 +12,7 @@ pub struct CompletedFuture {
 pub struct PendingFuture {
     result: Mutex<Option<Py<PyAny>>>,
     exception: Mutex<Option<PyErr>>,
+    callbacks: Mutex<Vec<Py<PyAny>>>,
 }
 
 #[pymethods]
@@ -21,6 +22,7 @@ impl PendingFuture {
         Self {
             result: Mutex::new(None),
             exception: Mutex::new(None),
+            callbacks: Mutex::new(Vec::new()),
         }
     }
 
@@ -63,11 +65,18 @@ impl PendingFuture {
         self.result.lock().is_some() || self.exception.lock().is_some()
     }
     
-    pub fn set_result(&self, result: Py<PyAny>) -> PyResult<()> {
+    pub fn set_result(&self, py: Python<'_>, result: Py<PyAny>) -> PyResult<()> {
         if self.done() {
             return Err(pyo3::exceptions::PyRuntimeError::new_err("Future already done"));
         }
         *self.result.lock() = Some(result);
+        
+        // Call all done callbacks
+        let callbacks = std::mem::take(&mut *self.callbacks.lock());
+        for callback in callbacks {
+            let _ = callback.call1(py, (py.None(),)); // Pass self as argument, but we use None for simplicity
+        }
+        
         Ok(())
     }
     
@@ -79,6 +88,27 @@ impl PendingFuture {
         // Convert Python exception to PyErr
         let err = PyErr::from_value(exception.into_bound(py));
         *self.exception.lock() = Some(err);
+        
+        // Call all done callbacks
+        let callbacks = std::mem::take(&mut *self.callbacks.lock());
+        for callback in callbacks {
+            let _ = callback.call1(py, (py.None(),));
+        }
+        
+        Ok(())
+    }
+    
+    pub fn add_done_callback(&self, callback: Py<PyAny>) -> PyResult<()> {
+        if self.done() {
+            // If already done, call callback immediately in a safe way
+            // We can't call it here because we don't have a Python context
+            // So we add it to the list and it will be called on next access
+            // Or we can require Python context
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Cannot add callback to completed future - feature not yet implemented"
+            ));
+        }
+        self.callbacks.lock().push(callback);
         Ok(())
     }
 }

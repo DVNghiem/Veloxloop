@@ -132,7 +132,7 @@ impl AsyncConnectCallback {
                                 Ok((transport_py, protocol)) => {
                                     // Set result: (transport, protocol)
                                     let res = PyTuple::new(py, &[transport_py, protocol])?.into_any();
-                                    self.future.bind(py).borrow().set_result(res.unbind())?;
+                                    self.future.bind(py).borrow().set_result(py, res.unbind())?;
                                 }
                                 Err(e) => {
                                     let exc_val = e.value(py).as_any().clone().unbind();

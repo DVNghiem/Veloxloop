@@ -204,6 +204,7 @@ pub struct SSLTransport {
     protocol: Py<PyAny>,
     loop_: Py<VeloxLoop>,
     closing: bool,
+    reading_paused: bool,
     write_buffer: Vec<u8>,
     write_buffer_high: usize,
     write_buffer_low: usize,
@@ -402,9 +403,17 @@ impl crate::transports::StreamTransport for SSLTransport {
         const DEFAULT_HIGH: usize = 64 * 1024;
         
         let high_limit = high.unwrap_or(DEFAULT_HIGH);
-        let low_limit = low.unwrap_or(high_limit / 4);
+        let low_limit = low.unwrap_or_else(|| {
+            if high_limit == 0 {
+                0
+            } else {
+                high_limit / 4
+            }
+        });
         
-        if low_limit >= high_limit {
+        // Special case: high=0 means disable flow control (both should be 0)
+        // Otherwise, validate that low < high
+        if high_limit > 0 && low_limit >= high_limit {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "low must be less than high"
             ));
@@ -413,7 +422,7 @@ impl crate::transports::StreamTransport for SSLTransport {
         self.write_buffer_high = high_limit;
         self.write_buffer_low = low_limit;
         
-        if self.write_buffer.len() > self.write_buffer_high {
+        if high_limit > 0 && self.write_buffer.len() > self.write_buffer_high {
             let _ = self.protocol.call_method0(py, "pause_writing");
         }
         
@@ -543,6 +552,35 @@ impl SSLTransport {
         Transport::get_fd(self)
     }
 
+    fn pause_reading(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        let mut self_ = slf.borrow_mut();
+        
+        if !self_.reading_paused {
+            self_.reading_paused = true;
+            let fd = self_.fd;
+            let loop_ = self_.loop_.bind(py).borrow();
+            loop_.remove_reader(py, fd)?;
+        }
+        Ok(())
+    }
+
+    fn resume_reading(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        let mut self_ = slf.borrow_mut();
+        
+        if self_.reading_paused {
+            self_.reading_paused = false;
+            let fd = self_.fd;
+            drop(self_); // Drop borrow before calling getattr
+            let method = slf.getattr("_read_ready")?;
+            let self_ = slf.borrow();
+            let loop_ = self_.loop_.bind(py).borrow();
+            loop_.add_reader(py, fd, method.unbind())?;
+        }
+        Ok(())
+    }
+
     fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         {
@@ -572,6 +610,11 @@ impl SSLTransport {
             self_.loop_.bind(py).borrow().add_writer(py, fd, method.unbind())?;
         }
         Ok(())
+    }
+    
+    fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
+        // Immediate close without flushing
+        self._force_close(py)
     }
     
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -922,6 +965,7 @@ impl SSLTransport {
             protocol,
             loop_,
             closing: false,
+            reading_paused: false,
             write_buffer: Vec::new(),
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,
@@ -969,6 +1013,7 @@ impl SSLTransport {
             protocol,
             loop_,
             closing: false,
+            reading_paused: false,
             write_buffer: Vec::new(),
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,

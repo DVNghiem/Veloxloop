@@ -15,12 +15,31 @@ use crate::transports::{TransportFactory, DefaultTransportFactory, StreamTranspo
 pub struct SocketWrapper {
     fd: RawFd,
     addr: SocketAddr,
+    peer_addr: Option<SocketAddr>,
 }
 
 #[pymethods]
 impl SocketWrapper {
     fn getsockname(&self) -> PyResult<(String, u16)> {
         Ok((self.addr.ip().to_string(), self.addr.port()))
+    }
+    
+    fn getpeername(&self) -> PyResult<(String, u16)> {
+        if let Some(peer) = self.peer_addr {
+            Ok((peer.ip().to_string(), peer.port()))
+        } else {
+            Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                "Transport endpoint is not connected"
+            ))
+        }
+    }
+    
+    #[getter]
+    fn family(&self) -> i32 {
+        match self.addr {
+            SocketAddr::V4(_) => libc::AF_INET,
+            SocketAddr::V6(_) => libc::AF_INET6,
+        }
     }
     
     fn fileno(&self) -> RawFd {
@@ -47,7 +66,11 @@ impl SocketWrapper {
 
 impl SocketWrapper {
     fn new(fd: RawFd, addr: SocketAddr) -> Self {
-        Self { fd, addr }
+        Self { fd, addr, peer_addr: None }
+    }
+    
+    fn new_with_peer(fd: RawFd, addr: SocketAddr, peer_addr: SocketAddr) -> Self {
+        Self { fd, addr, peer_addr: Some(peer_addr) }
     }
 }
 
@@ -87,7 +110,7 @@ impl TcpServer {
         
         // Resolve serve_forever future if it exists
         if let Some(future) = self.serve_forever_future.lock().as_ref() {
-            future.bind(py).borrow().set_result(py.None())?;
+            future.bind(py).borrow().set_result(py, py.None())?;
         }
         
         Ok(())
@@ -249,6 +272,7 @@ pub struct TcpTransport {
     protocol: Py<PyAny>,
     loop_: Py<VeloxLoop>,
     closing: bool,
+    reading_paused: bool,
     // Buffer for outgoing data? Asyncio transports buffer if socket is full.
     // For MVP we might BLOCK or fail if full? No, we must buffer.
     write_buffer: Vec<u8>,
@@ -282,7 +306,10 @@ impl crate::transports::Transport for TcpTransport {
             "socket" => {
                 if let Some(stream) = self.stream.as_ref() {
                     let fd = stream.as_raw_fd();
-                    if let Ok(addr) = stream.local_addr() {
+                    if let (Ok(addr), Ok(peer_addr)) = (stream.local_addr(), stream.peer_addr()) {
+                        let socket_wrapper = SocketWrapper::new_with_peer(fd, addr, peer_addr);
+                        return Ok(Py::new(py, socket_wrapper)?.into_any());
+                    } else if let Ok(addr) = stream.local_addr() {
                         let socket_wrapper = SocketWrapper::new(fd, addr);
                         return Ok(Py::new(py, socket_wrapper)?.into_any());
                     }
@@ -360,9 +387,17 @@ impl crate::transports::StreamTransport for TcpTransport {
         const DEFAULT_HIGH: usize = 64 * 1024;
         
         let high_limit = high.unwrap_or(DEFAULT_HIGH);
-        let low_limit = low.unwrap_or(high_limit / 4);
+        let low_limit = low.unwrap_or_else(|| {
+            if high_limit == 0 {
+                0
+            } else {
+                high_limit / 4
+            }
+        });
         
-        if low_limit >= high_limit {
+        // Special case: high=0 means disable flow control (both should be 0)
+        // Otherwise, validate that low < high
+        if high_limit > 0 && low_limit >= high_limit {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 "low must be less than high"
             ));
@@ -371,7 +406,7 @@ impl crate::transports::StreamTransport for TcpTransport {
         self.write_buffer_high = high_limit;
         self.write_buffer_low = low_limit;
         
-        if self.write_buffer.len() > self.write_buffer_high {
+        if high_limit > 0 && self.write_buffer.len() > self.write_buffer_high {
             let _ = self.protocol.call_method0(py, "pause_writing");
         }
         
@@ -464,6 +499,44 @@ impl TcpTransport {
         Transport::get_fd(self)
     }
 
+    fn pause_reading(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        let (should_remove, fd, loop_obj) = {
+            let mut self_ = slf.borrow_mut();
+            
+            if !self_.reading_paused {
+                self_.reading_paused = true;
+                let fd = self_.fd;
+                let loop_obj = self_.loop_.clone_ref(py);
+                (true, fd, loop_obj)
+            } else {
+                return Ok(());
+            }
+        }; // Drop mutable borrow before calling into loop
+        
+        if should_remove {
+            let loop_ = loop_obj.bind(py).borrow();
+            loop_.remove_reader(py, fd)?;
+        }
+        Ok(())
+    }
+
+    fn resume_reading(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        let mut self_ = slf.borrow_mut();
+        
+        if self_.reading_paused {
+            self_.reading_paused = false;
+            let fd = self_.fd;
+            drop(self_); // Drop borrow before calling getattr
+            let method = slf.getattr("_read_ready")?;
+            let self_ = slf.borrow();
+            let loop_ = self_.loop_.bind(py).borrow();
+            loop_.add_reader(py, fd, method.unbind())?;
+        }
+        Ok(())
+    }
+
     fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         {
@@ -490,6 +563,11 @@ impl TcpTransport {
              self_.loop_.bind(py).borrow().add_writer(py, fd, method.unbind())?;
         }
         Ok(())
+    }
+    
+    fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
+        // Immediate close without flushing
+        self._force_close(py)
     }
     
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
@@ -530,10 +608,56 @@ impl TcpTransport {
 
     fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        let mut self_ = slf.borrow_mut();
         
-        // Delegate to trait implementation
-        StreamTransport::read_ready(&mut *self_, py)
+        // Read data and prepare callbacks without holding the mutable borrow
+        enum Action {
+            Data(Vec<u8>),
+            Eof,
+            WouldBlock,
+            Error(io::Error),
+        }
+        
+        let action = {
+            let self_ = slf.borrow();
+            if let Some(stream) = self_.stream.as_ref() {
+                let mut buf = [0u8; 4096];
+                let mut s = stream;
+                match std::io::Read::read(&mut s, &mut buf) {
+                    Ok(0) => Action::Eof,
+                    Ok(n) => Action::Data(buf[..n].to_vec()),
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Action::WouldBlock,
+                    Err(e) => Action::Error(e),
+                }
+            } else {
+                Action::WouldBlock
+            }
+        }; // Drop borrow before calling Python callbacks
+        
+        match action {
+            Action::Data(data) => {
+                let py_data = PyBytes::new(py, &data);
+                let protocol = slf.borrow().protocol.clone_ref(py);
+                protocol.call_method1(py, "data_received", (py_data,))?;
+            }
+            Action::Eof => {
+                let protocol = slf.borrow().protocol.clone_ref(py);
+                if let Ok(res) = protocol.call_method0(py, "eof_received") {
+                    if let Ok(keep_open) = res.extract::<bool>(py) {
+                        if !keep_open {
+                            Self::close(slf)?;
+                        }
+                    } else {
+                        Self::close(slf)?;
+                    }
+                } else {
+                    Self::close(slf)?;
+                }
+            }
+            Action::WouldBlock => {}
+            Action::Error(e) => return Err(e.into()),
+        }
+        
+        Ok(())
     }
 
     /// Set TCP_NODELAY option on the socket
@@ -731,6 +855,7 @@ impl TcpTransport {
             protocol,
             loop_,
             closing: false,
+            reading_paused: false,
             write_buffer: Vec::new(),
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,

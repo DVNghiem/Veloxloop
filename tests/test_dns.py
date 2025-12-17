@@ -73,7 +73,7 @@ class TestDNSResolution:
                 "localhost", 
                 "80",
                 family=socket.AF_INET,
-                type_=socket.SOCK_STREAM,
+                type=socket.SOCK_STREAM,
                 proto=socket.IPPROTO_TCP
             )
             assert len(results) > 0

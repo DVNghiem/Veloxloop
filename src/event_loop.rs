@@ -253,7 +253,6 @@ impl VeloxLoop {
         // Clone the necessary objects for the spawned task
         let func_clone = func.clone_ref(py);
         let args_clone: Py<PyTuple> = args.clone().unbind();
-        let callbacks = self.callbacks.clone();
         
         // Spawn the blocking task
         executor_ref.spawn_blocking(move || {
@@ -262,23 +261,14 @@ impl VeloxLoop {
                 let result = func_clone.call1(py, args_clone.bind(py));
                 
                 // Schedule callback to set the future result
-                let future_ref = future_clone.clone_ref(py);
                 match result {
                     Ok(val) => {
-                        callbacks.push(Callback {
-                            callback: future_ref.getattr(py, "set_result").unwrap(),
-                            args: vec![val],
-                            context: None,
-                        });
+                        let _ = future_clone.bind(py).borrow().set_result(py, val);
                     }
                     Err(e) => {
                         // Set exception on future
                         let exc: Py<PyAny> = e.value(py).clone().unbind().into();
-                        callbacks.push(Callback {
-                            callback: future_ref.getattr(py, "set_exception").unwrap(),
-                            args: vec![exc],
-                            context: None,
-                        });
+                        let _ = future_clone.bind(py).borrow().set_exception(py, exc);
                     }
                 }
             });
@@ -295,17 +285,53 @@ impl VeloxLoop {
         Ok(())
     }
 
-    #[pyo3(signature = (host, port, family=0, type_=0, proto=0, flags=0))]
+    #[pyo3(signature = (host, port, *, family=0, r#type=0, proto=0, flags=0))]
     fn getaddrinfo(
         &self,
         py: Python<'_>,
-        host: Option<String>,
-        port: Option<String>,
+        host: Option<Bound<'_, PyAny>>,
+        port: Option<Bound<'_, PyAny>>,
         family: i32,
-        type_: i32,
+        r#type: i32,
         proto: i32,
         flags: i32,
     ) -> PyResult<Py<PyAny>> {
+        use pyo3::types::{PyString, PyBytes};
+        
+        // Convert host to Option<String>, handling both str and bytes
+        let host_str = match host {
+            Some(h) => {
+                if let Ok(s) = h.cast::<PyString>() {
+                    Some(s.to_string())
+                } else if let Ok(b) = h.cast::<PyBytes>() {
+                    Some(String::from_utf8_lossy(b.as_bytes()).to_string())
+                } else {
+                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                        "host must be str, bytes, or None"
+                    ));
+                }
+            }
+            None => None,
+        };
+        
+        // Convert port to Option<String>, handling both str and bytes
+        let port_str = match port {
+            Some(p) => {
+                if let Ok(s) = p.cast::<PyString>() {
+                    Some(s.to_string())
+                } else if let Ok(b) = p.cast::<PyBytes>() {
+                    Some(String::from_utf8_lossy(b.as_bytes()).to_string())
+                } else if let Ok(i) = p.extract::<i32>() {
+                    Some(i.to_string())
+                } else {
+                    return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                        "port must be str, bytes, int, or None"
+                    ));
+                }
+            }
+            None => None,
+        };
+        
         // Get or create default executor
         let mut exec_guard = self.executor.lock();
         if exec_guard.is_none() {
@@ -316,31 +342,21 @@ impl VeloxLoop {
         // Create a future to return to Python
         let future = self.create_future(py)?;
         let future_clone = future.clone_ref(py);
-        let callbacks = self.callbacks.clone();
         
         // Spawn the blocking DNS resolution task
         executor_ref.spawn_blocking(move || {
             let _ = Python::attach(move |py| {
                 // Perform DNS resolution using libc getaddrinfo
-                let result = perform_getaddrinfo(py, host, port, family, type_, proto, flags);
+                let result = perform_getaddrinfo(py, host_str, port_str, family, r#type, proto, flags);
                 
                 // Schedule callback to set the future result
-                let future_ref = future_clone.clone_ref(py);
                 match result {
                     Ok(val) => {
-                        callbacks.push(Callback {
-                            callback: future_ref.getattr(py, "set_result").unwrap(),
-                            args: vec![val],
-                            context: None,
-                        });
+                        let _ = future_clone.bind(py).borrow().set_result(py, val);
                     }
                     Err(e) => {
                         let exc: Py<PyAny> = e.value(py).clone().unbind().into();
-                        callbacks.push(Callback {
-                            callback: future_ref.getattr(py, "set_exception").unwrap(),
-                            args: vec![exc],
-                            context: None,
-                        });
+                        let _ = future_clone.bind(py).borrow().set_exception(py, exc);
                     }
                 }
             });
@@ -370,7 +386,6 @@ impl VeloxLoop {
         // Create a future to return to Python
         let future = self.create_future(py)?;
         let future_clone = future.clone_ref(py);
-        let callbacks = self.callbacks.clone();
         
         // Spawn the blocking reverse DNS resolution task
         executor_ref.spawn_blocking(move || {
@@ -378,22 +393,13 @@ impl VeloxLoop {
                 let result = perform_getnameinfo(py, &addr_str, port, flags);
                 
                 // Schedule callback to set the future result
-                let future_ref = future_clone.clone_ref(py);
                 match result {
                     Ok(val) => {
-                        callbacks.push(Callback {
-                            callback: future_ref.getattr(py, "set_result").unwrap(),
-                            args: vec![val],
-                            context: None,
-                        });
+                        let _ = future_clone.bind(py).borrow().set_result(py, val);
                     }
                     Err(e) => {
                         let exc: Py<PyAny> = e.value(py).clone().unbind().into();
-                        callbacks.push(Callback {
-                            callback: future_ref.getattr(py, "set_exception").unwrap(),
-                            args: vec![exc],
-                            context: None,
-                        });
+                        let _ = future_clone.bind(py).borrow().set_exception(py, exc);
                     }
                 }
             });
@@ -498,8 +504,7 @@ impl VeloxLoop {
         // If no generators to shut down, complete immediately
         if generators.is_empty() {
             let future = self.create_future(py)?;
-            let set_result = future.getattr(py, "set_result")?;
-            set_result.call1(py, (py.None(),))?;
+            future.bind(py).borrow().set_result(py, py.None())?;
             return Ok(future.into_any());
         }
 
@@ -527,6 +532,125 @@ impl VeloxLoop {
     // Create a Rust-based PendingFuture
     fn create_future(&self, py: Python<'_>) -> PyResult<Py<PendingFuture>> {
         Py::new(py, PendingFuture::new())
+    }
+
+    fn sock_connect(slf: &Bound<'_, Self>, sock: Py<PyAny>, address: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        use std::net::SocketAddr;
+        use pyo3::types::PyTuple;
+        
+        let py = slf.py();
+        let self_ = slf.borrow();
+        
+        // Get the socket's file descriptor
+        let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
+        
+        // Parse the address - it should be a tuple (host, port) for TCP
+        let tuple: Bound<'_, PyTuple> = address.extract()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                "address must be a tuple (host, port)"
+            ))?;
+        
+        let host: String = tuple.get_item(0)?.extract()?;
+        let port: u16 = tuple.get_item(1)?.extract()?;
+        
+        // Parse the host as an IP address
+        let ip_addr: std::net::IpAddr = host.parse()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                format!("Invalid IP address: {}", host)
+            ))?;
+        
+        let addr = SocketAddr::new(ip_addr, port);
+        
+        // Perform non-blocking connect using the raw fd
+        use socket2::SockAddr;
+        let sock_addr: SockAddr = addr.into();
+        
+        unsafe {
+            let ret = libc::connect(
+                fd,
+                sock_addr.as_ptr() as *const libc::sockaddr,
+                sock_addr.len()
+            );
+            
+            if ret == 0 {
+                // Immediate success (rare)
+                let fut = PendingFuture::new();
+                fut.set_result(py, py.None())?;
+                return Ok(Py::new(py, fut)?.into_any());
+            }
+            
+            let err = std::io::Error::last_os_error();
+            match err.kind() {
+                std::io::ErrorKind::WouldBlock => {
+                    // Expected: connection in progress
+                }
+                _ if err.raw_os_error() == Some(libc::EINPROGRESS) => {
+                    // Expected: connection in progress
+                }
+                _ => {
+                    // For other errors (including ENETUNREACH), propagate them
+                    // The caller (aiohappyeyeballs) will handle fallback to other addresses
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        err.to_string()
+                    ));
+                }
+            }
+        }
+        
+        // Connection in progress - wait for the socket to become writable
+        let future = self_.create_future(py)?;
+        let future_clone = future.clone_ref(py);
+        
+        // Create a callback that will be called when the socket is writable
+        // We'll wrap it in a simple Callable struct
+        #[pyclass]
+        struct SockConnectCallback {
+            future: Py<PendingFuture>,
+        }
+        
+        #[pymethods]
+        impl SockConnectCallback {
+            fn __call__(&self, py: Python<'_>) -> PyResult<()> {
+                self.future.bind(py).call_method1("set_result", (py.None(),))?;
+                Ok(())
+            }
+        }
+        
+        let callback_obj = SockConnectCallback {
+            future: future_clone,
+        };
+        let callback = Py::new(py, callback_obj)?;
+        
+        // Add writer to wait for socket to be writable
+        self_.add_writer(py, fd, callback.into_any())?;
+        
+        // Create a done callback to remove the writer when future completes
+        let fd_copy = fd;
+        let loop_ref = slf.clone().unbind();
+        
+        #[pyclass]
+        struct RemoveWriterCallback {
+            fd: RawFd,
+            loop_: Py<VeloxLoop>,
+        }
+        
+        #[pymethods]
+        impl RemoveWriterCallback {
+            fn __call__(&self, py: Python<'_>, _fut: Py<PyAny>) -> PyResult<()> {
+                // Remove writer through the event loop's remove_writer method
+                self.loop_.bind(py).borrow().remove_writer(py, self.fd)?;
+                Ok(())
+            }
+        }
+        
+        let done_callback_obj = RemoveWriterCallback {
+            fd: fd_copy,
+            loop_: loop_ref,
+        };
+        let done_callback = Py::new(py, done_callback_obj)?;
+        future.bind(py).borrow().add_done_callback(done_callback.into_any())?;
+        
+        Ok(future.into_any())
     }
 
     #[pyo3(signature = (protocol_factory, host=None, port=None, **_kwargs))]
