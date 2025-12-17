@@ -25,6 +25,10 @@ parking_lot = "0.12"
 socket2 = "0.6.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 libc = "0.2"
+rustls = "0.23"
+rustls-pemfile = "2.0"
+webpki-roots = "1.0.4"
+rustls-native-certs = "0.8"
 
 [target.'cfg(not(any(target_env = "musl", target_os = "freebsd", target_os = "openbsd", target_os = "windows")))'.dependencies]
 tikv-jemallocator = { version = "0.6.1", default-features = false, features = ["disable_initial_exec_tls"] }

@@ -39,7 +39,6 @@ The following asyncio features are **not yet implemented** and are planned for f
 ### Network & Transport Layer
 - [ ] **Unix domain sockets** - Support for `AF_UNIX` sockets
 - [ ] **Unix pipes** - `connect_read_pipe()` and `connect_write_pipe()`
-- [ ] **SSL/TLS support** - Secure socket connections via `ssl` module integration
 - [ ] **Socket options** - Advanced socket configuration (SO_KEEPALIVE, TCP_NODELAY, etc.)
 - [ ] **sendfile() support** - Zero-copy file transmission
 

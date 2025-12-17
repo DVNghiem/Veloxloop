@@ -8,6 +8,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use crate::poller::LoopPoller;
 use crate::event_loop::VeloxLoop;
 use crate::transports::tcp::TcpTransport;
+use crate::transports::ssl::{SSLContext, SSLTransport};
 use crate::transports::future::PendingFuture;
 
 pub struct Callback {
@@ -60,6 +61,8 @@ pub struct AsyncConnectCallback {
     protocol_factory: Py<PyAny>,
     stream: Option<std::net::TcpStream>,
     fd: RawFd,
+    ssl_context: Option<Py<SSLContext>>,
+    server_hostname: Option<String>,
 }
 
 #[pymethods]
@@ -81,34 +84,55 @@ impl AsyncConnectCallback {
                     let protocol_res = self.protocol_factory.call0(py);
                     match protocol_res {
                         Ok(protocol) => {
-                            // Create Transport
-                            let transport_res = TcpTransport::new(
-                                self.loop_.clone_ref(py),
-                                stream,
-                                protocol.clone_ref(py),
-                            );
-                            match transport_res {
-                                Ok(transport) => {
-                                    let transport_py = Py::new(py, transport)?;
-                                    
-                                    // connection_made
-                                    if let Err(e) = protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),)) {
-                                        self.future.bind(py).borrow().set_exception(py, e.value(py).as_any().clone().unbind())?;
-                                        return Ok(());
-                                    }
-                                    
-                                    // Add reader using VeloxLoop directly
-                                    let read_ready = transport_py.getattr(py, "_read_ready")?;
-                                    loop_ref.borrow().add_reader(py, fd, read_ready)?;
-                                    
+                            // Create Transport (SSL or regular TCP)
+                            let transport_result: PyResult<(Py<PyAny>, Py<PyAny>)> = if let Some(ssl_ctx) = &self.ssl_context {
+                                // Create SSL transport
+                                let ssl_transport = SSLTransport::new_client(
+                                    self.loop_.clone_ref(py),
+                                    stream,
+                                    protocol.clone_ref(py),
+                                    ssl_ctx.clone_ref(py),
+                                    self.server_hostname.clone(),
+                                    py,
+                                )?;
+                                let transport_py = Py::new(py, ssl_transport)?;
+                                
+                                // Add reader for SSL handshake and data
+                                let read_ready = transport_py.getattr(py, "_read_ready")?;
+                                loop_ref.borrow().add_reader(py, fd, read_ready)?;
+                                
+                                // Add writer for SSL handshake
+                                let write_ready = transport_py.getattr(py, "_write_ready")?;
+                                loop_ref.borrow().add_writer(py, fd, write_ready)?;
+                                
+                                Ok((transport_py.into_any(), protocol.clone_ref(py)))
+                            } else {
+                                // Create regular TCP transport
+                                let transport = TcpTransport::new(
+                                    self.loop_.clone_ref(py),
+                                    stream,
+                                    protocol.clone_ref(py),
+                                )?;
+                                let transport_py = Py::new(py, transport)?;
+                                
+                                // connection_made
+                                protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;
+                                
+                                // Add reader
+                                let read_ready = transport_py.getattr(py, "_read_ready")?;
+                                loop_ref.borrow().add_reader(py, fd, read_ready)?;
+                                
+                                Ok((transport_py.into_any(), protocol.clone_ref(py)))
+                            };
+                            
+                            match transport_result {
+                                Ok((transport_py, protocol)) => {
                                     // Set result: (transport, protocol)
-                                    let res = PyTuple::new(py, &[transport_py.into_any(), protocol])?.into_any();
+                                    let res = PyTuple::new(py, &[transport_py, protocol])?.into_any();
                                     self.future.bind(py).borrow().set_result(res.unbind())?;
                                 }
                                 Err(e) => {
-                                    // Convert VeloxError to PyErr
-                                    let py_err: PyErr = e.into();
-                                    let exc_val = py_err.value(py).as_any().clone().unbind();
+                                    let exc_val = e.value(py).as_any().clone().unbind();
                                     self.future.bind(py).borrow().set_exception(py, exc_val)?;
                                 }
                             }
@@ -145,6 +169,28 @@ impl AsyncConnectCallback {
             protocol_factory,
             stream: Some(stream),
             fd,
+            ssl_context: None,
+            server_hostname: None,
+        }
+    }
+    
+    pub fn new_with_ssl(
+        loop_: Py<VeloxLoop>,
+        future: Py<PendingFuture>,
+        protocol_factory: Py<PyAny>,
+        stream: std::net::TcpStream,
+        ssl_context: Option<Py<SSLContext>>,
+        server_hostname: Option<String>,
+    ) -> Self {
+        let fd = stream.as_raw_fd();
+        Self {
+            loop_,
+            future,
+            protocol_factory,
+            stream: Some(stream),
+            fd,
+            ssl_context,
+            server_hostname,
         }
     }
 }

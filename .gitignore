@@ -180,3 +180,4 @@ test_app_2.py
 /target
 .codspeed
 .idea
+tests/ssl_certs/*

@@ -538,6 +538,16 @@ impl VeloxLoop {
         let port = port.unwrap_or(0);
         let addr_str = format!("{}:{}", host, port);
         
+        // Extract SSL context and server_hostname from kwargs
+        let ssl_context = _kwargs.as_ref()
+            .and_then(|kw| kw.get_item("ssl").ok().flatten())
+            .and_then(|v| v.extract::<Py<crate::transports::ssl::SSLContext>>().ok());
+        
+        let server_hostname = _kwargs.as_ref()
+            .and_then(|kw| kw.get_item("server_hostname").ok().flatten())
+            .and_then(|v| v.extract::<String>().ok())
+            .or_else(|| if ssl_context.is_some() { Some(host.to_string()) } else { None });
+        
         // Resolve address (blocking for now - DNS resolution is blocking in this MVP)
         // using std::net::ToSocketAddrs.
         let mut addrs = std::net::ToSocketAddrs::to_socket_addrs(&addr_str)
@@ -583,10 +593,17 @@ impl VeloxLoop {
         // Create Future using Rust implementation
         let fut = self_.create_future(py)?;
         
-        // Create Callback
+        // Create Callback - with SSL support
         use crate::callbacks::AsyncConnectCallback;
         let loop_obj = slf.clone().unbind();
-        let callback = AsyncConnectCallback::new(loop_obj.clone_ref(py), fut.clone_ref(py), protocol_factory, stream);
+        let callback = AsyncConnectCallback::new_with_ssl(
+            loop_obj.clone_ref(py),
+            fut.clone_ref(py),
+            protocol_factory,
+            stream,
+            ssl_context,
+            server_hostname,
+        );
         let callback_py = Py::new(py, callback)?.into_any();
         
         // Register Writer (for Connect)
