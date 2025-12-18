@@ -8,9 +8,9 @@ use std::net::TcpStream;
 pub struct InnerSocketOptions {
     pub tcp_nodelay: Option<bool>,
     pub keepalive: Option<bool>,
-    pub keepalive_time: Option<u32>,    // TCP_KEEP_IDLE on Unix, TCP_KEEPIDLE
+    pub keepalive_time: Option<u32>, // TCP_KEEP_IDLE on Unix, TCP_KEEPIDLE
     pub keepalive_interval: Option<u32>, // TCP_KEEP_INTVL on Unix, TCP_KEEPINTVL
-    pub keepalive_count: Option<u32>,    // TCP_KEEP_CNT on Unix, TCP_KEEPCNT
+    pub keepalive_count: Option<u32>, // TCP_KEEP_CNT on Unix, TCP_KEEPCNT
     pub so_reuseaddr: Option<bool>,
     pub so_reuseport: Option<bool>,
     pub so_rcvbuf: Option<usize>,
@@ -58,8 +58,8 @@ impl InnerSocketOptions {
     /// Apply SO_KEEPALIVE and related TCP keep-alive options
     #[cfg(unix)]
     fn apply_keepalive(&self, socket: &Socket) -> PyResult<()> {
+        use libc::{IPPROTO_TCP, SO_KEEPALIVE, SOL_SOCKET, setsockopt};
         use std::os::unix::io::AsRawFd;
-        use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP};
 
         let fd = socket.as_raw_fd();
 
@@ -74,12 +74,10 @@ impl InnerSocketOptions {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!(
-                            "Failed to set SO_KEEPALIVE: {}",
-                            std::io::Error::last_os_error()
-                        ),
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set SO_KEEPALIVE: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
@@ -97,12 +95,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set TCP_KEEPIDLE: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set TCP_KEEPIDLE: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -118,12 +114,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set TCP_KEEPINTVL: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set TCP_KEEPINTVL: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -139,12 +133,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set TCP_KEEPCNT: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set TCP_KEEPCNT: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -163,12 +155,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set TCP_KEEPALIVE: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set TCP_KEEPALIVE: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -184,12 +174,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set TCP_KEEPINTVL: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set TCP_KEEPINTVL: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -205,12 +193,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set TCP_KEEPCNT: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set TCP_KEEPCNT: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -242,12 +228,10 @@ impl InnerSocketOptions {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!(
-                            "Failed to set SO_REUSEPORT: {}",
-                            std::io::Error::last_os_error()
-                        ),
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set SO_REUSEPORT: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
@@ -264,8 +248,8 @@ impl InnerSocketOptions {
     pub fn apply_to_stream(&self, stream: &TcpStream) -> PyResult<()> {
         #[cfg(unix)]
         {
+            use libc::{IPPROTO_TCP, SO_KEEPALIVE, SOL_SOCKET, setsockopt};
             use std::os::unix::io::AsRawFd;
-            use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE, IPPROTO_TCP};
 
             let fd = stream.as_raw_fd();
 
@@ -280,12 +264,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set TCP_NODELAY: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set TCP_NODELAY: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -301,12 +283,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set SO_KEEPALIVE: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set SO_KEEPALIVE: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -324,12 +304,10 @@ impl InnerSocketOptions {
                             std::mem::size_of_val(&optval) as libc::socklen_t,
                         );
                         if ret != 0 {
-                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                                format!(
-                                    "Failed to set TCP_KEEPIDLE: {}",
-                                    std::io::Error::last_os_error()
-                                ),
-                            ));
+                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                                "Failed to set TCP_KEEPIDLE: {}",
+                                std::io::Error::last_os_error()
+                            )));
                         }
                     }
                 }
@@ -345,12 +323,10 @@ impl InnerSocketOptions {
                             std::mem::size_of_val(&optval) as libc::socklen_t,
                         );
                         if ret != 0 {
-                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                                format!(
-                                    "Failed to set TCP_KEEPINTVL: {}",
-                                    std::io::Error::last_os_error()
-                                ),
-                            ));
+                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                                "Failed to set TCP_KEEPINTVL: {}",
+                                std::io::Error::last_os_error()
+                            )));
                         }
                     }
                 }
@@ -366,12 +342,10 @@ impl InnerSocketOptions {
                             std::mem::size_of_val(&optval) as libc::socklen_t,
                         );
                         if ret != 0 {
-                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                                format!(
-                                    "Failed to set TCP_KEEPCNT: {}",
-                                    std::io::Error::last_os_error()
-                                ),
-                            ));
+                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                                "Failed to set TCP_KEEPCNT: {}",
+                                std::io::Error::last_os_error()
+                            )));
                         }
                     }
                 }
@@ -390,12 +364,10 @@ impl InnerSocketOptions {
                             std::mem::size_of_val(&optval) as libc::socklen_t,
                         );
                         if ret != 0 {
-                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                                format!(
-                                    "Failed to set TCP_KEEPALIVE: {}",
-                                    std::io::Error::last_os_error()
-                                ),
-                            ));
+                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                                "Failed to set TCP_KEEPALIVE: {}",
+                                std::io::Error::last_os_error()
+                            )));
                         }
                     }
                 }
@@ -411,12 +383,10 @@ impl InnerSocketOptions {
                             std::mem::size_of_val(&optval) as libc::socklen_t,
                         );
                         if ret != 0 {
-                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                                format!(
-                                    "Failed to set TCP_KEEPINTVL: {}",
-                                    std::io::Error::last_os_error()
-                                ),
-                            ));
+                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                                "Failed to set TCP_KEEPINTVL: {}",
+                                std::io::Error::last_os_error()
+                            )));
                         }
                     }
                 }
@@ -432,12 +402,10 @@ impl InnerSocketOptions {
                             std::mem::size_of_val(&optval) as libc::socklen_t,
                         );
                         if ret != 0 {
-                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                                format!(
-                                    "Failed to set TCP_KEEPCNT: {}",
-                                    std::io::Error::last_os_error()
-                                ),
-                            ));
+                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                                "Failed to set TCP_KEEPCNT: {}",
+                                std::io::Error::last_os_error()
+                            )));
                         }
                     }
                 }
@@ -454,12 +422,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 && cfg!(not(target_os = "solaris")) {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set SO_REUSEPORT: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set SO_REUSEPORT: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -475,12 +441,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set SO_REUSEADDR: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set SO_REUSEADDR: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -496,12 +460,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set SO_RCVBUF: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set SO_RCVBUF: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }
@@ -517,12 +479,10 @@ impl InnerSocketOptions {
                         std::mem::size_of_val(&optval) as libc::socklen_t,
                     );
                     if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            format!(
-                                "Failed to set SO_SNDBUF: {}",
-                                std::io::Error::last_os_error()
-                            ),
-                        ));
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                            "Failed to set SO_SNDBUF: {}",
+                            std::io::Error::last_os_error()
+                        )));
                     }
                 }
             }

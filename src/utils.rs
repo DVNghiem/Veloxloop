@@ -1,5 +1,5 @@
+use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyOSError, PyValueError, PyRuntimeError};
 use std::io;
 use std::net::IpAddr;
 
@@ -32,13 +32,14 @@ impl From<VeloxError> for PyErr {
 #[allow(dead_code)]
 pub mod ipv6 {
     use super::*;
+    use pyo3::types::{PyInt, PyString, PyTuple};
     use std::net::{Ipv6Addr, SocketAddr};
-    use pyo3::types::{PyTuple, PyString, PyInt};
 
     /// Normalize an IPv6 address string to standard representation
     /// Removes leading zeros and expands :: notation properly
     pub fn normalize_ipv6_address(addr: &str) -> VeloxResult<String> {
-        let ipv6: Ipv6Addr = addr.parse()
+        let ipv6: Ipv6Addr = addr
+            .parse()
             .map_err(|_| VeloxError::ValueError(format!("Invalid IPv6 address: {}", addr)))?;
         Ok(ipv6.to_string())
     }
@@ -76,7 +77,8 @@ pub mod ipv6 {
 
     /// Validate an IPv6 address string and return parsed address
     pub fn validate_ipv6(addr_str: &str) -> VeloxResult<Ipv6Addr> {
-        addr_str.parse::<Ipv6Addr>()
+        addr_str
+            .parse::<Ipv6Addr>()
             .map_err(|_| VeloxError::ValueError(format!("Invalid IPv6 address: {}", addr_str)))
     }
 
@@ -93,9 +95,10 @@ pub mod ipv6 {
     /// Detect address family from string representation
     /// Returns true if IPv6, false if IPv4
     pub fn detect_is_ipv6(addr: &str) -> VeloxResult<bool> {
-        let parsed: IpAddr = addr.parse()
+        let parsed: IpAddr = addr
+            .parse()
             .map_err(|_| VeloxError::ValueError(format!("Invalid IP address: {}", addr)))?;
-        
+
         Ok(matches!(parsed, IpAddr::V6(_)))
     }
 
@@ -116,12 +119,15 @@ pub mod ipv6 {
                 let port_num = PyInt::new(py, v6_addr.port());
                 let flowinfo_num = PyInt::new(py, v6_addr.flowinfo());
                 let scope_id_num = PyInt::new(py, v6_addr.scope_id());
-                let tuple = PyTuple::new(py, vec![
-                    ip_str.as_any(),
-                    port_num.as_any(),
-                    flowinfo_num.as_any(),
-                    scope_id_num.as_any(),
-                ])?;
+                let tuple = PyTuple::new(
+                    py,
+                    vec![
+                        ip_str.as_any(),
+                        port_num.as_any(),
+                        flowinfo_num.as_any(),
+                        scope_id_num.as_any(),
+                    ],
+                )?;
                 Ok(tuple.into())
             }
         }

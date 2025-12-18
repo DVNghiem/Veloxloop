@@ -1,7 +1,7 @@
-use slab::Slab;
-use std::os::fd::RawFd;
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
+use slab::Slab;
+use std::os::fd::RawFd;
 
 pub struct Handle {
     pub callback: Py<PyAny>,
@@ -26,7 +26,7 @@ impl IoHandles {
 
     pub fn add_reader(&mut self, fd: RawFd, callback: Py<PyAny>) {
         let entry = self.fd_map.entry(fd).or_insert((None, None));
-        
+
         if let Some(key) = entry.0 {
             // Update existing
             if let Some(handle) = self.readers.get_mut(key) {
@@ -59,8 +59,8 @@ impl IoHandles {
     }
 
     pub fn add_writer(&mut self, fd: RawFd, callback: Py<PyAny>) {
-         let entry = self.fd_map.entry(fd).or_insert((None, None));
-        
+        let entry = self.fd_map.entry(fd).or_insert((None, None));
+
         if let Some(key) = entry.1 {
             // Update existing
             if let Some(handle) = self.writers.get_mut(key) {
@@ -78,7 +78,7 @@ impl IoHandles {
     }
 
     pub fn remove_writer(&mut self, fd: RawFd) -> bool {
-         if let Some(entry) = self.fd_map.get_mut(&fd) {
+        if let Some(entry) = self.fd_map.get_mut(&fd) {
             if let Some(key) = entry.1.take() {
                 self.writers.remove(key);
                 if entry.0.is_none() {
@@ -89,15 +89,17 @@ impl IoHandles {
         }
         false
     }
-    
+
     pub fn get_reader(&self, fd: RawFd) -> Option<&Handle> {
-        self.fd_map.get(&fd)
+        self.fd_map
+            .get(&fd)
             .and_then(|(r, _)| *r)
             .and_then(|key| self.readers.get(key))
     }
 
     pub fn get_writer(&self, fd: RawFd) -> Option<&Handle> {
-        self.fd_map.get(&fd)
+        self.fd_map
+            .get(&fd)
             .and_then(|(_, w)| *w)
             .and_then(|key| self.writers.get(key))
     }

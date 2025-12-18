@@ -13,10 +13,13 @@ impl ThreadPoolExecutor {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Failed to create thread pool: {}", e)
-            ))?;
-        
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to create thread pool: {}",
+                    e
+                ))
+            })?;
+
         Ok(Self {
             runtime: Arc::new(runtime),
         })

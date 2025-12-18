@@ -1,15 +1,16 @@
+use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use std::net::{TcpStream, SocketAddr};
-use std::os::fd::{AsRawFd, RawFd};
-use std::io::{Write, self};
 use std::collections::VecDeque;
-use parking_lot::Mutex;
+use std::io::{self, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::os::fd::{AsRawFd, RawFd};
 
-use crate::utils::VeloxResult;
-use crate::event_loop::VeloxLoop;
 use super::future::{CompletedFuture, PendingFuture};
-use crate::transports::{TransportFactory, DefaultTransportFactory, StreamTransport, Transport};
+use crate::constants::{DEFAULT_HIGH, DEFAULT_LOW};
+use crate::event_loop::VeloxLoop;
+use crate::transports::{DefaultTransportFactory, StreamTransport, Transport, TransportFactory};
+use crate::utils::VeloxResult;
 
 // Pure Rust socket wrapper to avoid importing Python's socket module
 #[pyclass(module = "veloxloop._veloxloop")]
@@ -24,17 +25,17 @@ impl SocketWrapper {
     fn getsockname(&self) -> PyResult<(String, u16)> {
         Ok((self.addr.ip().to_string(), self.addr.port()))
     }
-    
+
     fn getpeername(&self) -> PyResult<(String, u16)> {
         if let Some(peer) = self.peer_addr {
             Ok((peer.ip().to_string(), peer.port()))
         } else {
             Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                "Transport endpoint is not connected"
+                "Transport endpoint is not connected",
             ))
         }
     }
-    
+
     #[getter]
     fn family(&self) -> i32 {
         match self.addr {
@@ -42,7 +43,7 @@ impl SocketWrapper {
             SocketAddr::V6(_) => libc::AF_INET6,
         }
     }
-    
+
     fn fileno(&self) -> RawFd {
         self.fd
     }
@@ -53,11 +54,11 @@ impl SocketWrapper {
             SocketAddr::V6(addr) => {
                 let flowinfo = addr.flowinfo();
                 let scope_id = addr.scope_id();
-                
+
                 let info = pyo3::types::PyDict::new(py);
                 info.set_item("flowinfo", flowinfo)?;
                 info.set_item("scope_id", scope_id)?;
-                
+
                 Ok(Some(info.into()))
             }
             SocketAddr::V4(_) => Ok(None),
@@ -69,7 +70,7 @@ impl SocketWrapper {
     #[cfg(unix)]
     fn setsockopt(&self, level: i32, optname: i32, value: i32) -> PyResult<()> {
         use libc::setsockopt;
-        
+
         unsafe {
             let optval = value as libc::c_int;
             let ret = setsockopt(
@@ -80,12 +81,10 @@ impl SocketWrapper {
                 std::mem::size_of_val(&optval) as libc::socklen_t,
             );
             if ret != 0 {
-                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                    format!(
-                        "Failed to set socket option: {}",
-                        std::io::Error::last_os_error()
-                    ),
-                ));
+                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                    "Failed to set socket option: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
         }
         Ok(())
@@ -95,7 +94,7 @@ impl SocketWrapper {
     #[cfg(windows)]
     fn setsockopt(&self, level: i32, optname: i32, value: i32) -> PyResult<()> {
         use winapi::um::winsock2::setsockopt;
-        
+
         unsafe {
             let optval = value as i32;
             let ret = setsockopt(
@@ -106,12 +105,10 @@ impl SocketWrapper {
                 std::mem::size_of_val(&optval) as i32,
             );
             if ret != 0 {
-                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                    format!(
-                        "Failed to set socket option: {}",
-                        std::io::Error::last_os_error()
-                    ),
-                ));
+                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                    "Failed to set socket option: {}",
+                    std::io::Error::last_os_error()
+                )));
             }
         }
         Ok(())
@@ -120,11 +117,19 @@ impl SocketWrapper {
 
 impl SocketWrapper {
     pub(crate) fn new(fd: RawFd, addr: SocketAddr) -> Self {
-        Self { fd, addr, peer_addr: None }
+        Self {
+            fd,
+            addr,
+            peer_addr: None,
+        }
     }
-    
+
     pub(crate) fn new_with_peer(fd: RawFd, addr: SocketAddr, peer_addr: SocketAddr) -> Self {
-        Self { fd, addr, peer_addr: Some(peer_addr) }
+        Self {
+            fd,
+            addr,
+            peer_addr: Some(peer_addr),
+        }
     }
 }
 
@@ -153,7 +158,7 @@ impl TcpServer {
             Ok(pyo3::types::PyList::empty(py).into())
         }
     }
-    
+
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(listener) = self.listener.as_ref() {
             let fd = listener.as_raw_fd();
@@ -161,34 +166,34 @@ impl TcpServer {
         }
         self.active = false;
         self.listener = None;
-        
+
         // Resolve serve_forever future if it exists
         if let Some(future) = self.serve_forever_future.lock().as_ref() {
             future.bind(py).borrow().set_result(py, py.None())?;
         }
-        
+
         Ok(())
     }
-    
+
     fn get_loop(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.loop_.clone_ref(py).into_any())
     }
-    
+
     fn is_serving(&self) -> bool {
-         self.active
+        self.active
     }
-    
+
     pub fn fd(&self) -> Option<RawFd> {
         self.listener.as_ref().map(|l| l.as_raw_fd())
     }
-    
+
     // wait_closed is async. We return a completed future-like object
     fn wait_closed(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-         // Create a simple completed future wrapper
-         let fut = CompletedFuture::new(py.None());
-         Ok(Py::new(py, fut)?.into())
+        // Create a simple completed future wrapper
+        let fut = CompletedFuture::new(py.None());
+        Ok(Py::new(py, fut)?.into())
     }
-    
+
     fn __aenter__<'py>(slf: Bound<'py, Self>) -> PyResult<Py<PyAny>> {
         // Async context manager protocol - return a completed future with self
         let py = slf.py();
@@ -196,15 +201,21 @@ impl TcpServer {
         let fut = CompletedFuture::new(server_obj.into());
         Ok(Py::new(py, fut)?.into())
     }
-    
-    fn __aexit__(&mut self, py: Python<'_>, _exc_type: Py<PyAny>, _exc_val: Py<PyAny>, _exc_tb: Py<PyAny>) -> PyResult<Py<PyAny>> {
+
+    fn __aexit__(
+        &mut self,
+        py: Python<'_>,
+        _exc_type: Py<PyAny>,
+        _exc_val: Py<PyAny>,
+        _exc_tb: Py<PyAny>,
+    ) -> PyResult<Py<PyAny>> {
         // Close the server when exiting context
         self.close(py)?;
         // Return a completed future with None
         let fut = CompletedFuture::new(py.None());
         Ok(Py::new(py, fut)?.into())
     }
-    
+
     fn _on_accept(&self, py: Python<'_>) -> PyResult<()> {
         // Accept
         // We need mutable access or interior mutability? TcpListener accept takes &self.
@@ -212,24 +223,26 @@ impl TcpServer {
             match listener.accept() {
                 Ok((stream, _addr)) => {
                     // Create protocol
-                     let protocol = self.protocol_factory.call0(py)?;
-                     // Create Transport using factory
-                     let factory = DefaultTransportFactory;
-                     let loop_py = self.loop_.clone_ref(py).into_any();
-                     
-                     let transport_py = factory.create_tcp(
-                         py,
-                         loop_py,
-                         stream,
-                         protocol.clone_ref(py),
-                     )?;
-                     
-                     // Connection made
-                     protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;
-                     // Start reading
-                     let read_ready = transport_py.getattr(py, "_read_ready")?;
-                     let fd = transport_py.getattr(py, "fileno")?.call0(py)?.extract::<i32>(py)?;
-                     self.loop_.bind(py).borrow().add_reader(py, fd, read_ready)?;
+                    let protocol = self.protocol_factory.call0(py)?;
+                    // Create Transport using factory
+                    let factory = DefaultTransportFactory;
+                    let loop_py = self.loop_.clone_ref(py).into_any();
+
+                    let transport_py =
+                        factory.create_tcp(py, loop_py, stream, protocol.clone_ref(py))?;
+
+                    // Connection made
+                    protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;
+                    // Start reading
+                    let read_ready = transport_py.getattr(py, "_read_ready")?;
+                    let fd = transport_py
+                        .getattr(py, "fileno")?
+                        .call0(py)?
+                        .extract::<i32>(py)?;
+                    self.loop_
+                        .bind(py)
+                        .borrow()
+                        .add_reader(py, fd, read_ready)?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e.into()),
@@ -241,9 +254,9 @@ impl TcpServer {
     /// Set SO_REUSEADDR option on the server socket
     fn set_reuse_address(&self, enabled: bool) -> PyResult<()> {
         if let Some(listener) = self.listener.as_ref() {
+            use libc::{SO_REUSEADDR, SOL_SOCKET, setsockopt};
             use std::os::unix::io::AsRawFd;
-            use libc::{setsockopt, SOL_SOCKET, SO_REUSEADDR};
-            
+
             let fd = listener.as_raw_fd();
             unsafe {
                 let optval: libc::c_int = if enabled { 1 } else { 0 };
@@ -255,9 +268,10 @@ impl TcpServer {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!("Failed to set SO_REUSEADDR: {}", std::io::Error::last_os_error()),
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set SO_REUSEADDR: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
@@ -269,7 +283,7 @@ impl TcpServer {
     fn set_reuse_port(&self, enabled: bool) -> PyResult<()> {
         if let Some(listener) = self.listener.as_ref() {
             use std::os::unix::io::AsRawFd;
-            
+
             let fd = listener.as_raw_fd();
             unsafe {
                 let optval: libc::c_int = if enabled { 1 } else { 0 };
@@ -281,29 +295,29 @@ impl TcpServer {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!("Failed to set SO_REUSEPORT: {}", std::io::Error::last_os_error()),
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set SO_REUSEPORT: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
         Ok(())
     }
     /// Serve forever - runs the server until explicitly closed
-    /// This method implements asyncio.Server.serve_forever() behavior
     fn serve_forever(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         // Create a PendingFuture that will be resolved when close() is called
         let future = Py::new(py, PendingFuture::new())?;
         *self.serve_forever_future.lock() = Some(future.clone_ref(py));
-        
+
         Ok(future.into_any())
     }
-    
+
     /// Start serving - begin accepting connections
     fn start_serving(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let mut self_ = slf.borrow_mut();
-        
+
         if !self_.active {
             self_.active = true;
             if let Some(listener) = self_.listener.as_ref() {
@@ -312,7 +326,10 @@ impl TcpServer {
                 drop(self_); // Drop the mutable borrow before calling getattr
                 let on_accept = slf.getattr("_on_accept")?;
                 let loop_ = slf.borrow().loop_.clone_ref(py);
-                loop_.bind(py).borrow().add_reader(py, fd, on_accept.unbind())?;
+                loop_
+                    .bind(py)
+                    .borrow()
+                    .add_reader(py, fd, on_accept.unbind())?;
             }
         }
         Ok(())
@@ -334,10 +351,14 @@ pub struct TcpTransport {
     write_buffer_low: usize,
 }
 
-
 // Implement Transport trait for TcpTransport
 impl crate::transports::Transport for TcpTransport {
-    fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    fn get_extra_info(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         // Delegate to the pymethods implementation
         match name {
             "peername" => {
@@ -369,18 +390,17 @@ impl crate::transports::Transport for TcpTransport {
                 }
                 Ok(default.unwrap_or_else(|| py.None()))
             }
-            _ => Ok(default.unwrap_or_else(|| py.None()))
+            _ => Ok(default.unwrap_or_else(|| py.None())),
         }
     }
-    
+
     fn is_closing(&self) -> bool {
         self.closing
     }
-    
+
     fn get_fd(&self) -> RawFd {
         self.fd
     }
-    
 }
 
 // Implement StreamTransport trait for TcpTransport
@@ -389,9 +409,9 @@ impl crate::transports::StreamTransport for TcpTransport {
         if self.closing {
             return Ok(());
         }
-        
+
         self.closing = true;
-        
+
         if self.write_buffer.is_empty() {
             self.force_close(py)?;
         } else {
@@ -399,11 +419,11 @@ impl crate::transports::StreamTransport for TcpTransport {
         }
         Ok(())
     }
-    
+
     fn force_close(&mut self, py: Python<'_>) -> PyResult<()> {
         self._force_close(py)
     }
-    
+
     fn write(&mut self, _py: Python<'_>, data: &[u8]) -> PyResult<()> {
         if let Some(mut stream) = self.stream.as_ref() {
             match stream.write(data) {
@@ -424,48 +444,47 @@ impl crate::transports::StreamTransport for TcpTransport {
         }
         Ok(())
     }
-    
+
     fn write_eof(&mut self) -> PyResult<()> {
         if let Some(stream) = self.stream.as_ref() {
             stream.shutdown(std::net::Shutdown::Write)?;
         }
         Ok(())
     }
-    
+
     fn get_write_buffer_size(&self) -> usize {
         self.write_buffer.len()
     }
-    
-    fn set_write_buffer_limits(&mut self, py: Python<'_>, high: Option<usize>, low: Option<usize>) -> PyResult<()> {
+
+    fn set_write_buffer_limits(
+        &mut self,
+        py: Python<'_>,
+        high: Option<usize>,
+        low: Option<usize>,
+    ) -> PyResult<()> {
         const DEFAULT_HIGH: usize = 64 * 1024;
-        
+
         let high_limit = high.unwrap_or(DEFAULT_HIGH);
-        let low_limit = low.unwrap_or_else(|| {
-            if high_limit == 0 {
-                0
-            } else {
-                high_limit / 4
-            }
-        });
-        
+        let low_limit = low.unwrap_or_else(|| if high_limit == 0 { 0 } else { high_limit / 4 });
+
         // Special case: high=0 means disable flow control (both should be 0)
         // Otherwise, validate that low < high
         if high_limit > 0 && low_limit >= high_limit {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "low must be less than high"
+                "low must be less than high",
             ));
         }
-        
+
         self.write_buffer_high = high_limit;
         self.write_buffer_low = low_limit;
-        
+
         if high_limit > 0 && self.write_buffer.len() > self.write_buffer_high {
             let _ = self.protocol.call_method0(py, "pause_writing");
         }
-        
+
         Ok(())
     }
-    
+
     fn read_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(stream) = self.stream.as_ref() {
             let mut buf = [0u8; 65536]; // Increased from 4KB to 64KB for better large message performance
@@ -487,7 +506,8 @@ impl crate::transports::StreamTransport for TcpTransport {
                 }
                 Ok(n) => {
                     let py_data = PyBytes::new(py, &buf[..n]);
-                    self.protocol.call_method1(py, "data_received", (py_data,))?;
+                    self.protocol
+                        .call_method1(py, "data_received", (py_data,))?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(e.into()),
@@ -495,19 +515,19 @@ impl crate::transports::StreamTransport for TcpTransport {
         }
         Ok(())
     }
-    
+
     fn write_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(mut stream) = self.stream.as_ref() {
             // Try to write as much as possible in one go
             while !self.write_buffer.is_empty() {
                 // Make buffer contiguous at the start of each iteration
                 let data = self.write_buffer.make_contiguous();
-                
+
                 match stream.write(data) {
                     Ok(0) => {
                         // Connection closed
                         return Err(PyErr::new::<pyo3::exceptions::PyConnectionError, _>(
-                            "Connection closed during write"
+                            "Connection closed during write",
                         ));
                     }
                     Ok(n) => {
@@ -535,7 +555,12 @@ impl crate::transports::StreamTransport for TcpTransport {
 #[pymethods]
 impl TcpTransport {
     #[pyo3(signature = (name, default=None))]
-    fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    fn get_extra_info(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         // Delegate to trait implementation
         Transport::get_extra_info(self, py, name, default)
     }
@@ -544,13 +569,18 @@ impl TcpTransport {
         // Delegate to trait implementation
         StreamTransport::get_write_buffer_size(self)
     }
-    
+
     #[pyo3(signature = (high=None, low=None))]
-    fn set_write_buffer_limits(&mut self, py: Python<'_>, high: Option<usize>, low: Option<usize>) -> PyResult<()> {
+    fn set_write_buffer_limits(
+        &mut self,
+        py: Python<'_>,
+        high: Option<usize>,
+        low: Option<usize>,
+    ) -> PyResult<()> {
         // Delegate to trait implementation
         StreamTransport::set_write_buffer_limits(self, py, high, low)
     }
-    
+
     fn write_eof(&mut self) -> PyResult<()> {
         // Delegate to trait implementation
         StreamTransport::write_eof(self)
@@ -560,7 +590,7 @@ impl TcpTransport {
         // Delegate to trait implementation
         Transport::is_closing(self)
     }
-    
+
     fn fileno(&self) -> RawFd {
         // Delegate to trait implementation
         Transport::get_fd(self)
@@ -570,7 +600,7 @@ impl TcpTransport {
         let py = slf.py();
         let (should_remove, fd, loop_obj) = {
             let mut self_ = slf.borrow_mut();
-            
+
             if !self_.reading_paused {
                 self_.reading_paused = true;
                 let fd = self_.fd;
@@ -580,7 +610,7 @@ impl TcpTransport {
                 return Ok(());
             }
         }; // Drop mutable borrow before calling into loop
-        
+
         if should_remove {
             let loop_ = loop_obj.bind(py).borrow();
             loop_.remove_reader(py, fd)?;
@@ -591,7 +621,7 @@ impl TcpTransport {
     fn resume_reading(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let mut self_ = slf.borrow_mut();
-        
+
         if self_.reading_paused {
             self_.reading_paused = false;
             let fd = self_.fd;
@@ -607,58 +637,64 @@ impl TcpTransport {
     fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         {
-             let self_ = slf.borrow();
-             if self_.closing {
-                 return Ok(());
-             }
+            let self_ = slf.borrow();
+            if self_.closing {
+                return Ok(());
+            }
         }
-        
+
         let needs_writer;
-        
+
         {
-             let mut self_ = slf.borrow_mut();
-             // Delegate to trait implementation
-             StreamTransport::close(&mut *self_, py)?;
-             needs_writer = !self_.write_buffer.is_empty();
+            let mut self_ = slf.borrow_mut();
+            // Delegate to trait implementation
+            StreamTransport::close(&mut *self_, py)?;
+            needs_writer = !self_.write_buffer.is_empty();
         }
-        
+
         if needs_writer {
-             // Ensure writer is active to flush buffer
-             let self_ = slf.borrow();
-             let fd = self_.fd;
-             let method = slf.getattr("_write_ready")?;
-             self_.loop_.bind(py).borrow().add_writer(py, fd, method.unbind())?;
+            // Ensure writer is active to flush buffer
+            let self_ = slf.borrow();
+            let fd = self_.fd;
+            let method = slf.getattr("_write_ready")?;
+            self_
+                .loop_
+                .bind(py)
+                .borrow()
+                .add_writer(py, fd, method.unbind())?;
         }
         Ok(())
     }
-    
+
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
         // Immediate close without flushing
         self._force_close(py)
     }
-    
+
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
         let fd = self.fd;
-        
+
         let loop_ = self.loop_.bind(py).borrow();
         loop_.remove_reader(py, fd)?;
         loop_.remove_writer(py, fd)?;
         drop(loop_);
-        
-        self.stream = None; 
-        
+
+        self.stream = None;
+
         // Notify Protocol
-        let _ = self.protocol.call_method1(py, "connection_lost", (py.None(),));
+        let _ = self
+            .protocol
+            .call_method1(py, "connection_lost", (py.None(),));
         Ok(())
     }
 
     fn write(slf: &Bound<'_, Self>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
         let bytes = data.as_bytes();
         let mut self_ = slf.borrow_mut();
-        
+
         // Delegate to trait implementation
         StreamTransport::write(&mut *self_, slf.py(), bytes)?;
-        
+
         // Register writer if needed
         if !self_.write_buffer.is_empty() {
             drop(self_);
@@ -666,7 +702,7 @@ impl TcpTransport {
         }
         Ok(())
     }
-    
+
     // Internal callback called by loop when writable
     fn _write_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         // Delegate to trait implementation
@@ -675,7 +711,7 @@ impl TcpTransport {
 
     fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        
+
         // Read data and prepare callbacks without holding the mutable borrow
         enum Action {
             Data(Vec<u8>),
@@ -683,7 +719,7 @@ impl TcpTransport {
             WouldBlock,
             Error(io::Error),
         }
-        
+
         // Read loop: continue reading until WouldBlock to maximize throughput
         loop {
             let action = {
@@ -702,7 +738,7 @@ impl TcpTransport {
                     Action::WouldBlock
                 }
             }; // Drop borrow before calling Python callbacks
-            
+
             match action {
                 Action::Data(data) => {
                     let py_data = PyBytes::new(py, &data);
@@ -729,16 +765,16 @@ impl TcpTransport {
                 Action::Error(e) => return Err(e.into()),
             }
         }
-        
+
         Ok(())
     }
 
     /// Set TCP_NODELAY option on the socket
     fn set_tcp_nodelay(&self, enabled: bool) -> PyResult<()> {
         if let Some(stream) = self.stream.as_ref() {
+            use libc::{IPPROTO_TCP, TCP_NODELAY, setsockopt};
             use std::os::unix::io::AsRawFd;
-            use libc::{setsockopt, IPPROTO_TCP, TCP_NODELAY};
-            
+
             let fd = stream.as_raw_fd();
             unsafe {
                 let optval: libc::c_int = if enabled { 1 } else { 0 };
@@ -750,9 +786,10 @@ impl TcpTransport {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!("Failed to set TCP_NODELAY: {}", std::io::Error::last_os_error()),
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set TCP_NODELAY: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
@@ -762,9 +799,9 @@ impl TcpTransport {
     /// Set SO_KEEPALIVE option on the socket
     fn set_keepalive(&self, enabled: bool) -> PyResult<()> {
         if let Some(stream) = self.stream.as_ref() {
+            use libc::{SO_KEEPALIVE, SOL_SOCKET, setsockopt};
             use std::os::unix::io::AsRawFd;
-            use libc::{setsockopt, SOL_SOCKET, SO_KEEPALIVE};
-            
+
             let fd = stream.as_raw_fd();
             unsafe {
                 let optval: libc::c_int = if enabled { 1 } else { 0 };
@@ -776,9 +813,10 @@ impl TcpTransport {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!("Failed to set SO_KEEPALIVE: {}", std::io::Error::last_os_error()),
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set SO_KEEPALIVE: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
@@ -788,9 +826,9 @@ impl TcpTransport {
     /// Set SO_REUSEADDR option on the socket
     fn set_reuse_address(&self, enabled: bool) -> PyResult<()> {
         if let Some(stream) = self.stream.as_ref() {
+            use libc::{SO_REUSEADDR, SOL_SOCKET, setsockopt};
             use std::os::unix::io::AsRawFd;
-            use libc::{setsockopt, SOL_SOCKET, SO_REUSEADDR};
-            
+
             let fd = stream.as_raw_fd();
             unsafe {
                 let optval: libc::c_int = if enabled { 1 } else { 0 };
@@ -802,9 +840,10 @@ impl TcpTransport {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!("Failed to set SO_REUSEADDR: {}", std::io::Error::last_os_error()),
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set SO_REUSEADDR: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
@@ -815,9 +854,9 @@ impl TcpTransport {
     #[cfg(target_os = "linux")]
     fn set_keepalive_time(&self, seconds: u32) -> PyResult<()> {
         if let Some(stream) = self.stream.as_ref() {
+            use libc::{IPPROTO_TCP, setsockopt};
             use std::os::unix::io::AsRawFd;
-            use libc::{setsockopt, IPPROTO_TCP};
-            
+
             let fd = stream.as_raw_fd();
             unsafe {
                 let optval = seconds as libc::c_int;
@@ -829,9 +868,10 @@ impl TcpTransport {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!("Failed to set TCP_KEEPIDLE: {}", std::io::Error::last_os_error()),
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set TCP_KEEPIDLE: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
@@ -842,9 +882,9 @@ impl TcpTransport {
     #[cfg(target_os = "linux")]
     fn set_keepalive_interval(&self, seconds: u32) -> PyResult<()> {
         if let Some(stream) = self.stream.as_ref() {
+            use libc::{IPPROTO_TCP, setsockopt};
             use std::os::unix::io::AsRawFd;
-            use libc::{setsockopt, IPPROTO_TCP};
-            
+
             let fd = stream.as_raw_fd();
             unsafe {
                 let optval = seconds as libc::c_int;
@@ -856,9 +896,10 @@ impl TcpTransport {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!("Failed to set TCP_KEEPINTVL: {}", std::io::Error::last_os_error()),
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set TCP_KEEPINTVL: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
@@ -869,9 +910,9 @@ impl TcpTransport {
     #[cfg(target_os = "linux")]
     fn set_keepalive_count(&self, count: u32) -> PyResult<()> {
         if let Some(stream) = self.stream.as_ref() {
+            use libc::{IPPROTO_TCP, setsockopt};
             use std::os::unix::io::AsRawFd;
-            use libc::{setsockopt, IPPROTO_TCP};
-            
+
             let fd = stream.as_raw_fd();
             unsafe {
                 let optval = count as libc::c_int;
@@ -883,9 +924,10 @@ impl TcpTransport {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!("Failed to set TCP_KEEPCNT: {}", std::io::Error::last_os_error()),
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set TCP_KEEPCNT: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
@@ -894,7 +936,11 @@ impl TcpTransport {
 }
 
 impl TcpServer {
-    pub fn new(listener: std::net::TcpListener, loop_: Py<VeloxLoop>, protocol_factory: Py<PyAny>) -> Self {
+    pub fn new(
+        listener: std::net::TcpListener,
+        loop_: Py<VeloxLoop>,
+        protocol_factory: Py<PyAny>,
+    ) -> Self {
         Self {
             listener: Some(listener),
             loop_,
@@ -903,7 +949,7 @@ impl TcpServer {
             serve_forever_future: Mutex::new(None),
         }
     }
-    
+
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         if let Some(l) = self.listener.as_ref() {
             l.accept()
@@ -914,15 +960,15 @@ impl TcpServer {
 }
 
 impl TcpTransport {
-    pub fn new(loop_: Py<VeloxLoop>, stream: std::net::TcpStream, protocol: Py<PyAny>) -> VeloxResult<Self> {
+    pub fn new(
+        loop_: Py<VeloxLoop>,
+        stream: std::net::TcpStream,
+        protocol: Py<PyAny>,
+    ) -> VeloxResult<Self> {
         stream.set_nonblocking(true)?;
         stream.set_nodelay(true).ok(); // lower latency (disable Nagle algorithm)
         let fd = stream.as_raw_fd();
-        
-        // Default buffer limits from asyncio
-        const DEFAULT_HIGH: usize = 64 * 1024;  // 64 KB
-        const DEFAULT_LOW: usize = 16 * 1024;   // 16 KB (64KB / 4)
-        
+
         let transport = Self {
             fd,
             stream: Some(stream),
@@ -936,11 +982,14 @@ impl TcpTransport {
         };
         Ok(transport)
     }
-    
+
     fn add_writer(&self, slf: &Bound<'_, Self>) -> PyResult<()> {
         let method = slf.getattr("_write_ready")?;
         let py = slf.py();
-        self.loop_.bind(py).borrow().add_writer(py, self.fd, method.unbind())?;
+        self.loop_
+            .bind(py)
+            .borrow()
+            .add_writer(py, self.fd, method.unbind())?;
         Ok(())
     }
 }

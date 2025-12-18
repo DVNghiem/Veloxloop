@@ -1,17 +1,17 @@
+use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use std::sync::Arc;
-use parking_lot::Mutex;
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
-use crate::poller::LoopPoller;
-use crate::handles::IoHandles;
-use crate::callbacks::{CallbackQueue, Callback};
-use crate::timers::Timers;
-use crate::utils::{VeloxResult, VeloxError};
-use crate::transports::tcp::TcpServer;
-use crate::transports::future::PendingFuture;
+use crate::callbacks::{Callback, CallbackQueue};
 use crate::executor::ThreadPoolExecutor;
+use crate::handles::IoHandles;
+use crate::poller::LoopPoller;
+use crate::timers::Timers;
+use crate::transports::future::PendingFuture;
+use crate::transports::tcp::TcpServer;
+use crate::utils::{VeloxError, VeloxResult};
 use std::os::fd::{AsRawFd, RawFd};
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -61,53 +61,53 @@ impl VeloxLoop {
     fn time(&self) -> f64 {
         self.start_time.elapsed().as_secs_f64()
     }
-    
+
     fn run_forever(&self, py: Python<'_>) -> VeloxResult<()> {
         self.running.store(true, Ordering::SeqCst);
         self.stopped.store(false, Ordering::SeqCst);
-        
+
         // Use polling::Events
         let mut events = polling::Events::new();
-        
+
         while self.running.load(Ordering::SeqCst) && !self.stopped.load(Ordering::SeqCst) {
             self._run_once(py, &mut events)?;
-            
+
             // Check if stopped after processing callbacks (future might be done)
             if self.stopped.load(Ordering::SeqCst) {
                 break;
             }
-            
+
             // Allow Python signals (Ctrl+C) to interrupt
             if let Err(e) = py.check_signals() {
                 return Err(VeloxError::Python(e));
             }
         }
-        
+
         self.running.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     pub fn add_reader(&self, _py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
         let poller = self.poller.clone();
-        
+
         // Lock handles once
         let mut handles = self.handles.lock();
         let reader_exists = handles.get_reader(fd).is_some();
         let writer_exists = handles.get_writer(fd).is_some();
-        
+
         // Add or modify
         handles.add_reader(fd, callback);
         drop(handles); // Drop lock before poller
-        
+
         // Update Poller
         let mut ev = polling::Event::readable(fd as usize);
         if writer_exists {
-            ev.writable = true; 
+            ev.writable = true;
         }
         if !reader_exists && !writer_exists {
-             poller.register(fd, ev)?;
+            poller.register(fd, ev)?;
         } else {
-             poller.modify(fd, ev)?;
+            poller.modify(fd, ev)?;
         }
         Ok(())
     }
@@ -117,7 +117,7 @@ impl VeloxLoop {
         if handles.remove_reader(fd) {
             let writer_exists = handles.get_writer(fd).is_some();
             drop(handles);
-            
+
             if writer_exists {
                 // Downgrade to W only
                 let ev = polling::Event::writable(fd as usize);
@@ -131,22 +131,22 @@ impl VeloxLoop {
             Ok(false)
         }
     }
-    
+
     pub fn add_writer(&self, _py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
         let poller = self.poller.clone();
-        
+
         let mut handles = self.handles.lock();
         let reader_exists = handles.get_reader(fd).is_some();
         let writer_exists = handles.get_writer(fd).is_some();
-        
+
         handles.add_writer(fd, callback);
         drop(handles);
-        
+
         let mut ev = polling::Event::writable(fd as usize);
         if reader_exists {
             ev.readable = true;
         }
-        
+
         if !writer_exists && !reader_exists {
             poller.register(fd, ev)?;
         } else {
@@ -160,43 +160,68 @@ impl VeloxLoop {
         if handles.remove_writer(fd) {
             let reader_exists = handles.get_reader(fd).is_some();
             drop(handles);
-            
+
             if reader_exists {
-                 let ev = polling::Event::readable(fd as usize);
-                 self.poller.modify(fd, ev)?;
+                let ev = polling::Event::readable(fd as usize);
+                self.poller.modify(fd, ev)?;
             } else {
-                 self.poller.delete(fd)?;
+                self.poller.delete(fd)?;
             }
             Ok(true)
         } else {
             Ok(false)
         }
     }
-    
+
     // Callbacks
     #[pyo3(signature = (callback, *args, context=None))]
     fn call_soon(&self, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) {
-        self.callbacks.push(Callback { callback, args, context });
+        self.callbacks.push(Callback {
+            callback,
+            args,
+            context,
+        });
     }
-    
+
     #[pyo3(signature = (callback, *args, context=None))]
-    fn call_soon_threadsafe(&self, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) {
+    fn call_soon_threadsafe(
+        &self,
+        callback: Py<PyAny>,
+        args: Vec<Py<PyAny>>,
+        context: Option<Py<PyAny>>,
+    ) {
         // Push naturally notifies.
-        self.callbacks.push(Callback { callback, args, context });
+        self.callbacks.push(Callback {
+            callback,
+            args,
+            context,
+        });
     }
-    
+
     #[pyo3(signature = (delay, callback, *args, context=None))]
-    fn call_later(&self, delay: f64, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) -> u64 {
+    fn call_later(
+        &self,
+        delay: f64,
+        callback: Py<PyAny>,
+        args: Vec<Py<PyAny>>,
+        context: Option<Py<PyAny>>,
+    ) -> u64 {
         let now = (self.time() * 1_000_000_000.0) as u64;
         let delay_ns = (delay * 1_000_000_000.0) as u64;
         let when = now + delay_ns;
         self.timers.lock().insert(when, callback, args, context)
     }
-    
+
     #[pyo3(signature = (when, callback, *args, context=None))]
-    fn call_at(&self, when: f64, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) -> u64 {
-         let when_ns = (when * 1_000_000_000.0) as u64;
-         self.timers.lock().insert(when_ns, callback, args, context)
+    fn call_at(
+        &self,
+        when: f64,
+        callback: Py<PyAny>,
+        args: Vec<Py<PyAny>>,
+        context: Option<Py<PyAny>>,
+    ) -> u64 {
+        let when_ns = (when * 1_000_000_000.0) as u64;
+        self.timers.lock().insert(when_ns, callback, args, context)
     }
 
     fn _cancel_timer(&self, timer_id: u64) {
@@ -215,12 +240,12 @@ impl VeloxLoop {
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
-    
+
     fn get_debug(&self) -> bool {
         let val = self.debug.load(Ordering::SeqCst);
         val
     }
-    
+
     fn set_debug(&self, enabled: bool) {
         self.debug.store(enabled, Ordering::SeqCst);
     }
@@ -245,21 +270,21 @@ impl VeloxLoop {
             *exec_guard = Some(ThreadPoolExecutor::new()?);
         }
         let executor_ref = exec_guard.as_ref().unwrap();
-        
+
         // Create a future to return to Python
         let future = self.create_future(py)?;
         let future_clone = future.clone_ref(py);
-        
+
         // Clone the necessary objects for the spawned task
         let func_clone = func.clone_ref(py);
         let args_clone: Py<PyTuple> = args.clone().unbind();
-        
+
         // Spawn the blocking task
         executor_ref.spawn_blocking(move || {
             let _ = Python::attach(move |py| {
                 // Call the Python function
                 let result = func_clone.call1(py, args_clone.bind(py));
-                
+
                 // Schedule callback to set the future result
                 match result {
                     Ok(val) => {
@@ -273,7 +298,7 @@ impl VeloxLoop {
                 }
             });
         });
-        
+
         Ok(future.into_any())
     }
 
@@ -296,8 +321,8 @@ impl VeloxLoop {
         proto: i32,
         flags: i32,
     ) -> PyResult<Py<PyAny>> {
-        use pyo3::types::{PyString, PyBytes};
-        
+        use pyo3::types::{PyBytes, PyString};
+
         // Convert host to Option<String>, handling both str and bytes
         let host_str = match host {
             Some(h) => {
@@ -307,13 +332,13 @@ impl VeloxLoop {
                     Some(String::from_utf8_lossy(b.as_bytes()).to_string())
                 } else {
                     return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                        "host must be str, bytes, or None"
+                        "host must be str, bytes, or None",
                     ));
                 }
             }
             None => None,
         };
-        
+
         // Convert port to Option<String>, handling both str and bytes
         let port_str = match port {
             Some(p) => {
@@ -325,30 +350,31 @@ impl VeloxLoop {
                     Some(i.to_string())
                 } else {
                     return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                        "port must be str, bytes, int, or None"
+                        "port must be str, bytes, int, or None",
                     ));
                 }
             }
             None => None,
         };
-        
+
         // Get or create default executor
         let mut exec_guard = self.executor.lock();
         if exec_guard.is_none() {
             *exec_guard = Some(ThreadPoolExecutor::new()?);
         }
         let executor_ref = exec_guard.as_ref().unwrap();
-        
+
         // Create a future to return to Python
         let future = self.create_future(py)?;
         let future_clone = future.clone_ref(py);
-        
+
         // Spawn the blocking DNS resolution task
         executor_ref.spawn_blocking(move || {
             let _ = Python::attach(move |py| {
                 // Perform DNS resolution using libc getaddrinfo
-                let result = perform_getaddrinfo(py, host_str, port_str, family, r#type, proto, flags);
-                
+                let result =
+                    perform_getaddrinfo(py, host_str, port_str, family, r#type, proto, flags);
+
                 // Schedule callback to set the future result
                 match result {
                     Ok(val) => {
@@ -361,7 +387,7 @@ impl VeloxLoop {
                 }
             });
         });
-        
+
         Ok(future.into_any())
     }
 
@@ -378,20 +404,20 @@ impl VeloxLoop {
             *exec_guard = Some(ThreadPoolExecutor::new()?);
         }
         let executor_ref = exec_guard.as_ref().unwrap();
-        
+
         // Extract address and port from sockaddr tuple
         let addr_str: String = sockaddr.get_item(0)?.extract()?;
         let port: u16 = sockaddr.get_item(1)?.extract()?;
-        
+
         // Create a future to return to Python
         let future = self.create_future(py)?;
         let future_clone = future.clone_ref(py);
-        
+
         // Spawn the blocking reverse DNS resolution task
         executor_ref.spawn_blocking(move || {
             let _ = Python::attach(move |py| {
                 let result = perform_getnameinfo(py, &addr_str, port, flags);
-                
+
                 // Schedule callback to set the future result
                 match result {
                     Ok(val) => {
@@ -404,7 +430,7 @@ impl VeloxLoop {
                 }
             });
         });
-        
+
         Ok(future.into_any())
     }
 
@@ -424,12 +450,12 @@ impl VeloxLoop {
             let eh = self.exception_handler.lock();
             eh.as_ref().map(|h| h.clone_ref(py))
         };
-        
+
         if let Some(handler) = handler {
             // Call handler with (loop, context) as per asyncio API
             // Pass None for loop and the context dict
             match handler.call(py, (py.None(), context.as_any()), None) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
                     // If custom handler fails, fall back to default
                     eprintln!("Error in custom exception handler: {:?}", e);
@@ -461,12 +487,12 @@ impl VeloxLoop {
         if let Some(msg) = message {
             eprintln!("Exception in event loop: {}", msg);
         }
-        
+
         let exception = context.bind(py).get_item("exception")?;
         if let Some(exc) = exception {
             eprintln!("Exception details: {:?}", exc);
         }
-        
+
         Ok(())
     }
 
@@ -510,7 +536,7 @@ impl VeloxLoop {
 
         // Collect all aclose() coroutines
         let mut close_coros = Vec::new();
-        for generator in generators {                                                                                           
+        for generator in generators {
             if let Ok(aclose) = generator.getattr(py, "aclose") {
                 if let Ok(coro) = aclose.call0(py) {
                     close_coros.push(coro);
@@ -521,11 +547,11 @@ impl VeloxLoop {
         // Use asyncio.gather to await all aclose() coroutines
         let asyncio = py.import("asyncio")?;
         let gather = asyncio.getattr("gather")?;
-        
+
         // Convert Vec to Python tuple
         let coros_tuple = PyTuple::new(py, &close_coros)?;
         let close_task = gather.call1(coros_tuple)?;
-        
+
         Ok(close_task.unbind())
     }
 
@@ -534,51 +560,53 @@ impl VeloxLoop {
         Py::new(py, PendingFuture::new())
     }
 
-    fn sock_connect(slf: &Bound<'_, Self>, sock: Py<PyAny>, address: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
-        use std::net::SocketAddr;
+    fn sock_connect(
+        slf: &Bound<'_, Self>,
+        sock: Py<PyAny>,
+        address: Bound<'_, PyAny>,
+    ) -> PyResult<Py<PyAny>> {
         use pyo3::types::PyTuple;
-        
+        use std::net::SocketAddr;
+
         let py = slf.py();
         let self_ = slf.borrow();
-        
+
         // Get the socket's file descriptor
         let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
-        
+
         // Parse the address - it should be a tuple (host, port) for TCP
-        let tuple: Bound<'_, PyTuple> = address.extract()
-            .map_err(|_| PyErr::new::<pyo3::exceptions::PyTypeError, _>(
-                "address must be a tuple (host, port)"
-            ))?;
-        
+        let tuple: Bound<'_, PyTuple> = address.extract().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyTypeError, _>("address must be a tuple (host, port)")
+        })?;
+
         let host: String = tuple.get_item(0)?.extract()?;
         let port: u16 = tuple.get_item(1)?.extract()?;
-        
+
         // Parse the host as an IP address
-        let ip_addr: std::net::IpAddr = host.parse()
-            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Invalid IP address: {}", host)
-            ))?;
-        
+        let ip_addr: std::net::IpAddr = host.parse().map_err(|_| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid IP address: {}", host))
+        })?;
+
         let addr = SocketAddr::new(ip_addr, port);
-        
+
         // Perform non-blocking connect using the raw fd
         use socket2::SockAddr;
         let sock_addr: SockAddr = addr.into();
-        
+
         unsafe {
             let ret = libc::connect(
                 fd,
                 sock_addr.as_ptr() as *const libc::sockaddr,
-                sock_addr.len()
+                sock_addr.len(),
             );
-            
+
             if ret == 0 {
                 // Immediate success (rare)
                 let fut = PendingFuture::new();
                 fut.set_result(py, py.None())?;
                 return Ok(Py::new(py, fut)?.into_any());
             }
-            
+
             let err = std::io::Error::last_os_error();
             match err.kind() {
                 std::io::ErrorKind::WouldBlock => {
@@ -591,49 +619,51 @@ impl VeloxLoop {
                     // For other errors (including ENETUNREACH), propagate them
                     // The caller (aiohappyeyeballs) will handle fallback to other addresses
                     return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        err.to_string()
+                        err.to_string(),
                     ));
                 }
             }
         }
-        
+
         // Connection in progress - wait for the socket to become writable
         let future = self_.create_future(py)?;
         let future_clone = future.clone_ref(py);
-        
+
         // Create a callback that will be called when the socket is writable
         // We'll wrap it in a simple Callable struct
         #[pyclass]
         struct SockConnectCallback {
             future: Py<PendingFuture>,
         }
-        
+
         #[pymethods]
         impl SockConnectCallback {
             fn __call__(&self, py: Python<'_>) -> PyResult<()> {
-                self.future.bind(py).call_method1("set_result", (py.None(),))?;
+                self.future
+                    .bind(py)
+                    .call_method1("set_result", (py.None(),))?;
                 Ok(())
             }
         }
-        
+
         let callback_obj = SockConnectCallback {
             future: future_clone,
         };
         let callback = Py::new(py, callback_obj)?;
-        
+
         // Add writer to wait for socket to be writable
         self_.add_writer(py, fd, callback.into_any())?;
-        
+
         // Create a done callback to remove the writer when future completes
         let fd_copy = fd;
         let loop_ref = slf.clone().unbind();
-        
+
         #[pyclass]
         struct RemoveWriterCallback {
             fd: RawFd,
             loop_: Py<VeloxLoop>,
         }
-        
+
         #[pymethods]
         impl RemoveWriterCallback {
             fn __call__(&self, py: Python<'_>, _fut: Py<PyAny>) -> PyResult<()> {
@@ -642,60 +672,65 @@ impl VeloxLoop {
                 Ok(())
             }
         }
-        
+
         let done_callback_obj = RemoveWriterCallback {
             fd: fd_copy,
             loop_: loop_ref,
         };
         let done_callback = Py::new(py, done_callback_obj)?;
-        future.bind(py).borrow().add_done_callback(done_callback.into_any())?;
-        
+        future
+            .bind(py)
+            .borrow()
+            .add_done_callback(done_callback.into_any())?;
+
         Ok(future.into_any())
     }
 
     fn sock_accept(slf: &Bound<'_, Self>, sock: Py<PyAny>) -> PyResult<Py<PyAny>> {
         use crate::callbacks::SockAcceptCallback;
-        
+
         let py = slf.py();
         let self_ = slf.borrow();
-        
+
         // Get the socket's file descriptor
         let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
-        
+
         // Try to accept immediately (non-blocking)
         unsafe {
             let mut addr: libc::sockaddr_storage = std::mem::zeroed();
-            let mut addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-            
+            let mut addr_len: libc::socklen_t =
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+
             let client_fd = libc::accept(
                 fd,
                 &mut addr as *mut _ as *mut libc::sockaddr,
-                &mut addr_len
+                &mut addr_len,
             );
-            
+
             if client_fd >= 0 {
                 // Success - create Python socket object and return immediately
-                use pyo3::types::{PyString, PyInt, PyTuple};
-                
+                use pyo3::types::{PyInt, PyString, PyTuple};
+
                 let socket_module = py.import("socket")?;
                 let client_sock = socket_module.call_method1("fromfd", (client_fd, 2, 1))?;
-                
+
                 // Set non-blocking on client socket
                 let flags = libc::fcntl(client_fd, libc::F_GETFL, 0);
                 if flags >= 0 {
                     libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
                 }
-                
+
                 // Parse the address
                 let addr_tuple = if addr_len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
                     let addr_in = &*((&addr) as *const _ as *const libc::sockaddr_in);
                     if addr_in.sin_family == libc::AF_INET as u16 {
                         let ip = u32::from_be(addr_in.sin_addr.s_addr);
                         let port = u16::from_be(addr_in.sin_port);
-                        let ip_str = format!("{}.{}.{}.{}", 
-                            (ip >> 24) & 0xff, 
-                            (ip >> 16) & 0xff, 
-                            (ip >> 8) & 0xff, 
+                        let ip_str = format!(
+                            "{}.{}.{}.{}",
+                            (ip >> 24) & 0xff,
+                            (ip >> 16) & 0xff,
+                            (ip >> 8) & 0xff,
                             ip & 0xff
                         );
                         let ip_py = PyString::new(py, &ip_str);
@@ -711,14 +746,14 @@ impl VeloxLoop {
                     let port_py = PyInt::new(py, 0);
                     PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
                 };
-                
+
                 let result = PyTuple::new(py, vec![client_sock.as_any(), addr_tuple.as_any()])?;
-                
+
                 let fut = PendingFuture::new();
                 fut.set_result(py, result.into())?;
                 return Ok(Py::new(py, fut)?.into_any());
             }
-            
+
             let err = std::io::Error::last_os_error();
             match err.kind() {
                 std::io::ErrorKind::WouldBlock => {
@@ -728,37 +763,39 @@ impl VeloxLoop {
                     // Expected: no pending connection
                 }
                 _ => {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string()));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        err.to_string(),
+                    ));
                 }
             }
         }
-        
+
         // No pending connection - wait for socket to become readable
         let future = self_.create_future(py)?;
         let loop_ref = slf.clone().unbind();
-        
+
         let callback_obj = SockAcceptCallback::new(loop_ref, future.clone_ref(py), fd);
         let callback = Py::new(py, callback_obj)?;
-        
+
         self_.add_reader(py, fd, callback.into_any())?;
-        
+
         Ok(future.into_any())
     }
 
     fn sock_recv(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
         use crate::callbacks::SockRecvCallback;
         use pyo3::types::PyBytes;
-        
+
         let py = slf.py();
         let self_ = slf.borrow();
-        
+
         let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
-        
+
         // Try to recv immediately
         let mut buf = vec![0u8; nbytes];
         unsafe {
             let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
-            
+
             if n >= 0 {
                 buf.truncate(n as usize);
                 let bytes = PyBytes::new(py, &buf);
@@ -766,49 +803,51 @@ impl VeloxLoop {
                 fut.set_result(py, bytes.into())?;
                 return Ok(Py::new(py, fut)?.into_any());
             }
-            
+
             let err = std::io::Error::last_os_error();
             match err.kind() {
                 std::io::ErrorKind::WouldBlock => {}
                 _ if err.raw_os_error() == Some(libc::EAGAIN) => {}
                 _ => {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string()));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        err.to_string(),
+                    ));
                 }
             }
         }
-        
+
         // Would block - wait for readable
         let future = self_.create_future(py)?;
         let loop_ref = slf.clone().unbind();
-        
+
         let callback_obj = SockRecvCallback::new(loop_ref, future.clone_ref(py), fd, nbytes);
         let callback = Py::new(py, callback_obj)?;
-        
+
         self_.add_reader(py, fd, callback.into_any())?;
-        
+
         Ok(future.into_any())
     }
 
     fn sock_sendall(slf: &Bound<'_, Self>, sock: Py<PyAny>, data: &[u8]) -> PyResult<Py<PyAny>> {
         use crate::callbacks::SockSendallCallback;
-                                                                                                                                                            
+
         let py = slf.py();
         let self_ = slf.borrow();
-        
+
         let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
         let data_vec = data.to_vec();
-        
+
         // Try to send all data immediately
         let mut total_sent = 0;
         while total_sent < data_vec.len() {
             unsafe {
                 let n = libc::send(
-                    fd, 
-                    data_vec[total_sent..].as_ptr() as *const libc::c_void, 
-                    data_vec.len() - total_sent, 
-                    0
+                    fd,
+                    data_vec[total_sent..].as_ptr() as *const libc::c_void,
+                    data_vec.len() - total_sent,
+                    0,
                 );
-                
+
                 if n > 0 {
                     total_sent += n as usize;
                 } else {
@@ -817,70 +856,90 @@ impl VeloxLoop {
                         std::io::ErrorKind::WouldBlock => break,
                         _ if err.raw_os_error() == Some(libc::EAGAIN) => break,
                         _ => {
-                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string()));
+                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                                err.to_string(),
+                            ));
                         }
                     }
                 }
             }
         }
-        
+
         if total_sent == data_vec.len() {
             // All data sent
             let fut = PendingFuture::new();
             fut.set_result(py, py.None())?;
             return Ok(Py::new(py, fut)?.into_any());
         }
-        
+
         // Need to wait for writable
         let future = self_.create_future(py)?;
         let loop_ref = slf.clone().unbind();
         let remaining_data = data_vec[total_sent..].to_vec();
-        
-        let callback_obj = SockSendallCallback::new(loop_ref, future.clone_ref(py), fd, remaining_data, 0);
+
+        let callback_obj =
+            SockSendallCallback::new(loop_ref, future.clone_ref(py), fd, remaining_data, 0);
         let callback = Py::new(py, callback_obj)?;
-        
+
         self_.add_writer(py, fd, callback.into_any())?;
-        
+
         Ok(future.into_any())
     }
 
     #[pyo3(signature = (protocol_factory, host=None, port=None, **_kwargs))]
-    fn create_connection(slf: &Bound<'_, Self>, protocol_factory: Py<PyAny>, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+    fn create_connection(
+        slf: &Bound<'_, Self>,
+        protocol_factory: Py<PyAny>,
+        host: Option<&str>,
+        port: Option<u16>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
         let py = slf.py();
         let self_ = slf.borrow();
-        
+
         let host = host.unwrap_or("127.0.0.1");
         let port = port.unwrap_or(0);
         let addr_str = format!("{}:{}", host, port);
-        
+
         // Extract SSL context and server_hostname from kwargs
-        let ssl_context = _kwargs.as_ref()
+        let ssl_context = _kwargs
+            .as_ref()
             .and_then(|kw| kw.get_item("ssl").ok().flatten())
             .and_then(|v| v.extract::<Py<crate::transports::ssl::SSLContext>>().ok());
-        
-        let server_hostname = _kwargs.as_ref()
+
+        let server_hostname = _kwargs
+            .as_ref()
             .and_then(|kw| kw.get_item("server_hostname").ok().flatten())
             .and_then(|v| v.extract::<String>().ok())
-            .or_else(|| if ssl_context.is_some() { Some(host.to_string()) } else { None });
-        
+            .or_else(|| {
+                if ssl_context.is_some() {
+                    Some(host.to_string())
+                } else {
+                    None
+                }
+            });
+
         // Resolve address (blocking for now - DNS resolution is blocking in this MVP)
         // using std::net::ToSocketAddrs.
         let mut addrs = std::net::ToSocketAddrs::to_socket_addrs(&addr_str)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-            
-        let addr = addrs.next().ok_or_else(|| PyErr::new::<pyo3::exceptions::PyOSError, _>("No address found"))?;
-        
+
+        let addr = addrs
+            .next()
+            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyOSError, _>("No address found"))?;
+
         // Use socket2 for non-blocking connect
-        use socket2::{Socket, Domain, Type};
+        use socket2::{Domain, Socket, Type};
         // Use IPv6 detection from utils for better handling
         let is_ipv6 = addr.is_ipv6();
         let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
         let socket = Socket::new(domain, Type::STREAM, None)
-             .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-             
-        socket.set_nonblocking(true)
-             .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-             
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+
         // Connect (non-blocking)
         match socket.connect(&addr.into()) {
             Ok(_) => {
@@ -896,18 +955,19 @@ impl VeloxLoop {
                 // 36 on macOS/BSD, 115 on Linux
             }
             Err(e) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                    format!("Connection failed: {}", e)
-                ));
+                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                    "Connection failed: {}",
+                    e
+                )));
             }
         }
-        
+
         let stream: std::net::TcpStream = socket.into();
         let fd = stream.as_raw_fd();
-        
+
         // Create Future using Rust implementation
         let fut = self_.create_future(py)?;
-        
+
         // Create Callback - with SSL support
         use crate::callbacks::AsyncConnectCallback;
         let loop_obj = slf.clone().unbind();
@@ -920,44 +980,55 @@ impl VeloxLoop {
             server_hostname,
         );
         let callback_py = Py::new(py, callback)?.into_any();
-        
+
         // Register Writer (for Connect)
         self_.add_writer(py, fd, callback_py)?;
-        
+
         Ok(fut.into_any())
-    }    
+    }
 
     #[pyo3(signature = (protocol_factory, host=None, port=None, **_kwargs))]
-    fn create_server(slf: &Bound<'_, Self>, protocol_factory: Py<PyAny>, host: Option<&str>, port: Option<u16>, _kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<Py<PyAny>> {
+    fn create_server(
+        slf: &Bound<'_, Self>,
+        protocol_factory: Py<PyAny>,
+        host: Option<&str>,
+        port: Option<u16>,
+        _kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Py<PyAny>> {
         let py = slf.py();
         let self_ = slf.borrow();
         let loop_obj = slf.clone().unbind();
-        
+
         let host = host.unwrap_or("127.0.0.1");
         let port = port.unwrap_or(0);
         let addr = format!("{}:{}", host, port);
-        
+
         let listener = std::net::TcpListener::bind(&addr)?;
         listener.set_nonblocking(true)?;
-        
+
         // Create Server object
-        let server = TcpServer::new(listener, loop_obj.clone_ref(py), protocol_factory.clone_ref(py));
+        let server = TcpServer::new(
+            listener,
+            loop_obj.clone_ref(py),
+            protocol_factory.clone_ref(py),
+        );
         let server_py = Py::new(py, server)?;
-        
+
         // Register Accept Handler
         // The server needs to be polled for reading (accept).
         // TcpServer defines `_on_accept`.
         let on_accept = server_py.getattr(py, "_on_accept")?;
-        
+
         // Get fd directly from TcpServer instead of calling Python method
-        let fd = server_py.borrow(py).fd()
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Server has no listener"))?;
-        
+        let fd = server_py.borrow(py).fd().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Server has no listener")
+        })?;
+
         self_.add_reader(py, fd, on_accept)?;
-        
+
         // Return Server object wrapped in completed future
         let fut = crate::transports::future::CompletedFuture::new(server_py.into_any());
-        
+
         Ok(Py::new(py, fut)?.into_any())
     }
 
@@ -975,15 +1046,15 @@ impl VeloxLoop {
         let py = slf.py();
         let self_ = slf.borrow();
         let loop_obj = slf.clone().unbind();
-        
+
         let host = host.unwrap_or("127.0.0.1");
         let port = port.unwrap_or(0);
         let addr = format!("{}:{}", host, port);
         let limit = limit.unwrap_or(65536); // 64KB default buffer
-        
+
         let listener = std::net::TcpListener::bind(&addr)?;
         listener.set_nonblocking(true)?;
-        
+
         // Create StreamServer object
         let server = crate::transports::stream_server::StreamServer::new(
             listener,
@@ -992,19 +1063,20 @@ impl VeloxLoop {
             limit,
         );
         let server_py = Py::new(py, server)?;
-        
+
         // Register Accept Handler
         let on_accept = server_py.getattr(py, "_on_accept")?;
-        
+
         // Get fd from server
-        let fd = server_py.borrow(py).get_fd()
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Server has no listener"))?;
-        
+        let fd = server_py.borrow(py).get_fd().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Server has no listener")
+        })?;
+
         self_.add_reader(py, fd, on_accept)?;
-        
+
         // Return Server object wrapped in completed future
         let fut = crate::transports::future::CompletedFuture::new(server_py.into_any());
-        
+
         Ok(Py::new(py, fut)?.into_any())
     }
 
@@ -1020,15 +1092,18 @@ impl VeloxLoop {
         let py = slf.py();
         let loop_obj = slf.clone().unbind();
         let limit = limit.unwrap_or(65536); // 64KB default buffer
-        
+
         let addr = format!("{}:{}", host, port);
         let stream = std::net::TcpStream::connect(&addr)?;
         stream.set_nonblocking(true)?;
-        
+
         // Create StreamReader and StreamWriter
         let reader = Py::new(py, crate::streams::StreamReader::new(Some(limit)))?;
-        let writer = Py::new(py, crate::streams::StreamWriter::new(Some(65536), Some(16384)))?;
-        
+        let writer = Py::new(
+            py,
+            crate::streams::StreamWriter::new(Some(65536), Some(16384)),
+        )?;
+
         // Create StreamTransport (now returns Py<StreamTransport>)
         let transport_py = crate::transports::stream_server::StreamTransport::new(
             py,
@@ -1037,17 +1112,17 @@ impl VeloxLoop {
             reader.clone_ref(py),
             writer.clone_ref(py),
         )?;
-        
+
         // Register read callback
         let read_ready = transport_py.getattr(py, "_read_ready")?;
         let fd = transport_py.borrow(py).get_fd();
         slf.borrow().add_reader(py, fd, read_ready)?;
-        
+
         // Return (reader, writer) tuple wrapped in completed future
         let result = (reader.into_any(), writer.into_any());
         let result_tuple = pyo3::types::PyTuple::new(py, &[result.0, result.1])?;
         let fut = crate::transports::future::CompletedFuture::new(result_tuple.into());
-        
+
         Ok(Py::new(py, fut)?.into_any())
     }
 
@@ -1062,22 +1137,22 @@ impl VeloxLoop {
         let py = slf.py();
         let self_ = slf.borrow();
         let loop_obj = slf.clone().unbind();
-        
+
         // Extract optional parameters from kwargs
         let allow_broadcast = kwargs
             .and_then(|k| k.get_item("allow_broadcast").ok())
             .and_then(|v| v.and_then(|val| val.extract::<bool>().ok()))
             .unwrap_or(false);
-            
+
         let reuse_port = kwargs
             .and_then(|k| k.get_item("reuse_port").ok())
             .and_then(|v| v.and_then(|val| val.extract::<bool>().ok()))
             .unwrap_or(false);
-        
+
         // Create UDP socket
-        use socket2::{Socket, Domain, Type, Protocol};
+        use socket2::{Domain, Protocol, Socket, Type};
         use std::net::SocketAddr;
-        
+
         // Determine address family from local_addr or remote_addr
         // Using helper function for better IPv6 detection
         let is_ipv6 = if let Some((ref host, _)) = local_addr {
@@ -1087,20 +1162,22 @@ impl VeloxLoop {
         } else {
             false
         };
-        
+
         let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
         let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-        
-        socket.set_nonblocking(true)
+
+        socket
+            .set_nonblocking(true)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-        
+
         // Set socket options
         if allow_broadcast {
-            socket.set_broadcast(true)
+            socket
+                .set_broadcast(true)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
         }
-        
+
         #[cfg(all(unix, not(target_os = "solaris")))]
         if reuse_port {
             use std::os::fd::AsRawFd;
@@ -1115,56 +1192,57 @@ impl VeloxLoop {
                     std::mem::size_of_val(&optval) as libc::socklen_t,
                 );
                 if ret != 0 {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        format!("Failed to set SO_REUSEPORT: {}", std::io::Error::last_os_error())
-                    ));
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Failed to set SO_REUSEPORT: {}",
+                        std::io::Error::last_os_error()
+                    )));
                 }
             }
         }
-        
+
         // Bind to local address if provided
         if let Some((host, port)) = local_addr {
             let addr_str = format!("{}:{}", host, port);
-            let bind_addr: SocketAddr = addr_str
-                .parse()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Invalid local address: {}", e)
-                ))?;
-            socket.bind(&bind_addr.into())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                    format!("Failed to bind: {}", e)
-                ))?;
+            let bind_addr: SocketAddr = addr_str.parse().map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Invalid local address: {}",
+                    e
+                ))
+            })?;
+            socket.bind(&bind_addr.into()).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("Failed to bind: {}", e))
+            })?;
         }
-        
+
         // Parse remote address if provided
         let remote_sockaddr = if let Some((host, port)) = remote_addr {
             let addr_str = format!("{}:{}", host, port);
-            let addr: SocketAddr = addr_str
-                .parse()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    format!("Invalid remote address: {}", e)
-                ))?;
-            
+            let addr: SocketAddr = addr_str.parse().map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Invalid remote address: {}",
+                    e
+                ))
+            })?;
+
             // Connect to remote address (this filters incoming packets)
-            socket.connect(&addr.into())
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                    format!("Failed to connect: {}", e)
-                ))?;
+            socket.connect(&addr.into()).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("Failed to connect: {}", e))
+            })?;
             Some(addr)
         } else {
             None
         };
-        
+
         let udp_socket: std::net::UdpSocket = socket.into();
-        
+
         // Create protocol instance
         let protocol = protocol_factory.call0(py)?;
-        
+
         // Create transport using factory
-        use crate::transports::{TransportFactory, DefaultTransportFactory};
+        use crate::transports::{DefaultTransportFactory, TransportFactory};
         let factory = DefaultTransportFactory;
         let loop_py = loop_obj.clone_ref(py).into_any();
-        
+
         let transport_py = factory.create_udp(
             py,
             loop_py,
@@ -1173,22 +1251,22 @@ impl VeloxLoop {
             remote_sockaddr,
             allow_broadcast,
         )?;
-        
-        let fd = transport_py.getattr(py, "fileno")?.call0(py)?.extract::<i32>(py)?;
-        
+
+        let fd = transport_py
+            .getattr(py, "fileno")?
+            .call0(py)?
+            .extract::<i32>(py)?;
+
         // Call protocol.connection_made(transport)
         protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;
-        
+
         // Register read handler
         let read_ready = transport_py.getattr(py, "_read_ready")?;
         self_.add_reader(py, fd, read_ready)?;
-        
+
         // Return (transport, protocol) tuple wrapped in completed future
-        let result_tuple = PyTuple::new(py, vec![
-            transport_py.into_any(),
-            protocol.into_any(),
-        ])?;
-        
+        let result_tuple = PyTuple::new(py, vec![transport_py.into_any(), protocol.into_any()])?;
+
         let fut = crate::transports::future::CompletedFuture::new(result_tuple.into());
         Ok(Py::new(py, fut)?.into_any())
     }
@@ -1196,126 +1274,136 @@ impl VeloxLoop {
 
 impl VeloxLoop {
     fn _run_once(&self, py: Python<'_>, events: &mut polling::Events) -> VeloxResult<()> {
-         // Calculate Timeout
-         let has_callbacks = !self.callbacks.is_empty();
-         let timeout = if has_callbacks {
-             Some(Duration::from_secs(0))
-         } else {
-             let timers = self.timers.lock();
-             if let Some(next) = timers.next_expiry() { // Removed self.timers.next_expiry() to use lock
-                 let now = (self.time() * 1_000_000_000.0) as u64;
-                 if next > now {
-                     Some(Duration::from_nanos(next - now))
-                 } else {
-                     Some(Duration::from_secs(0))
-                 }
-             } else {
-                 // Default to a small timeout to avoid blocking indefinitely
-                 // This allows the loop to check for stop() calls
-                 // Use 10ms for better responsiveness
-                 Some(Duration::from_millis(10))
-             }
-         };
-         
-         // Poll
-         match self.poller.poll(events, timeout) {
-             Ok(_) => {},
-             Err(e) => {
-                 // Ignore EINTR?
-                 return Err(e);
-             }
-         }
-         
-         // Process I/O Events - OPTIMIZED: Batch lock acquisition and defer epoll re-arming
-         // First pass: Collect all callbacks with single lock acquisition
-         let mut pending_callbacks: Vec<(std::os::fd::RawFd, Option<Py<PyAny>>, Option<Py<PyAny>>, bool, bool)> = Vec::with_capacity(events.len());
-         
-         {
-             let handles = self.handles.lock();
-             for event in events.iter() {
-                 let fd = event.key as std::os::fd::RawFd;
-                 
-                 let reader_cb = if event.readable {
-                     if let Some(handle) = handles.get_reader(fd) {
-                         if !handle.cancelled {
-                             Some(handle.callback.clone_ref(py))
-                         } else {
-                             None
-                         }
-                     } else {
-                         None
-                     }
-                 } else {
-                     None
-                 };
-                 
-                 let writer_cb = if event.writable {
-                     if let Some(handle) = handles.get_writer(fd) {
-                         if !handle.cancelled {
-                             Some(handle.callback.clone_ref(py))
-                         } else {
-                             None
-                         }
-                     } else {
-                         None
-                     }
-                 } else {
-                     None
-                 };
-                 
-                 // Track if we need to re-arm this FD
-                 let has_reader = handles.get_reader(fd).is_some();
-                 let has_writer = handles.get_writer(fd).is_some();
-                 
-                 pending_callbacks.push((fd, reader_cb, writer_cb, has_reader, has_writer));
-             }
-         } // Lock released before dispatching callbacks
-         
-         // Second pass: Dispatch callbacks (without holding lock)
-         for (_, reader_cb, writer_cb, _, _) in &pending_callbacks {
-             if let Some(cb) = reader_cb {
-                 if let Err(e) = cb.call0(py) {
-                     e.print(py);
-                 }
-             }
-             if let Some(cb) = writer_cb {
-                 if let Err(e) = cb.call0(py) {
-                     e.print(py);
-                 }
-             }
-         }
-         
-         // Third pass: Batch re-arm all FDs (oneshot support for polling v3)
-         for (fd, _, _, has_reader, has_writer) in pending_callbacks {
-             if has_reader || has_writer {
-                 let ev = if has_reader && has_writer {
-                     let mut e = polling::Event::readable(fd as usize);
-                     e.writable = true;
-                     e
-                 } else if has_reader {
-                     polling::Event::readable(fd as usize)
-                 } else {
-                     polling::Event::writable(fd as usize)
-                 };
-                 
-                 // Ignore errors (e.g. if concurrently closed)
-                 let _ = self.poller.modify(fd, ev);
-             }
-         }
-            // Process Timers
-          let now_ns = (self.time() * 1_000_000_000.0) as u64;
-          let expired = self.timers.lock().pop_expired(now_ns);
-         for entry in expired {
-             let _ = entry.callback.bind(py).call(PyTuple::new(py, entry.args)?, None);
-         }
-         
-         // Process Callbacks (call_soon)
-         let callbacks = self.callbacks.pop_all();
-         for cb in callbacks {
-             let _ = cb.callback.bind(py).call(PyTuple::new(py, cb.args)?, None);
-         }
-         
-         Ok(())
+        // Calculate Timeout
+        let has_callbacks = !self.callbacks.is_empty();
+        let timeout = if has_callbacks {
+            Some(Duration::from_secs(0))
+        } else {
+            let timers = self.timers.lock();
+            if let Some(next) = timers.next_expiry() {
+                // Removed self.timers.next_expiry() to use lock
+                let now = (self.time() * 1_000_000_000.0) as u64;
+                if next > now {
+                    Some(Duration::from_nanos(next - now))
+                } else {
+                    Some(Duration::from_secs(0))
+                }
+            } else {
+                // Default to a small timeout to avoid blocking indefinitely
+                // This allows the loop to check for stop() calls
+                // Use 10ms for better responsiveness
+                Some(Duration::from_millis(10))
+            }
+        };
+
+        // Poll
+        match self.poller.poll(events, timeout) {
+            Ok(_) => {}
+            Err(e) => {
+                // Ignore EINTR?
+                return Err(e);
+            }
+        }
+
+        // Process I/O Events - OPTIMIZED: Batch lock acquisition and defer epoll re-arming
+        // First pass: Collect all callbacks with single lock acquisition
+        let mut pending_callbacks: Vec<(
+            std::os::fd::RawFd,
+            Option<Py<PyAny>>,
+            Option<Py<PyAny>>,
+            bool,
+            bool,
+        )> = Vec::with_capacity(events.len());
+
+        {
+            let handles = self.handles.lock();
+            for event in events.iter() {
+                let fd = event.key as std::os::fd::RawFd;
+
+                let reader_cb = if event.readable {
+                    if let Some(handle) = handles.get_reader(fd) {
+                        if !handle.cancelled {
+                            Some(handle.callback.clone_ref(py))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let writer_cb = if event.writable {
+                    if let Some(handle) = handles.get_writer(fd) {
+                        if !handle.cancelled {
+                            Some(handle.callback.clone_ref(py))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                // Track if we need to re-arm this FD
+                let has_reader = handles.get_reader(fd).is_some();
+                let has_writer = handles.get_writer(fd).is_some();
+
+                pending_callbacks.push((fd, reader_cb, writer_cb, has_reader, has_writer));
+            }
+        } // Lock released before dispatching callbacks
+
+        // Second pass: Dispatch callbacks (without holding lock)
+        for (_, reader_cb, writer_cb, _, _) in &pending_callbacks {
+            if let Some(cb) = reader_cb {
+                if let Err(e) = cb.call0(py) {
+                    e.print(py);
+                }
+            }
+            if let Some(cb) = writer_cb {
+                if let Err(e) = cb.call0(py) {
+                    e.print(py);
+                }
+            }
+        }
+
+        // Third pass: Batch re-arm all FDs (oneshot support for polling v3)
+        for (fd, _, _, has_reader, has_writer) in pending_callbacks {
+            if has_reader || has_writer {
+                let ev = if has_reader && has_writer {
+                    let mut e = polling::Event::readable(fd as usize);
+                    e.writable = true;
+                    e
+                } else if has_reader {
+                    polling::Event::readable(fd as usize)
+                } else {
+                    polling::Event::writable(fd as usize)
+                };
+
+                // Ignore errors (e.g. if concurrently closed)
+                let _ = self.poller.modify(fd, ev);
+            }
+        }
+        // Process Timers
+        let now_ns = (self.time() * 1_000_000_000.0) as u64;
+        let expired = self.timers.lock().pop_expired(now_ns);
+        for entry in expired {
+            let _ = entry
+                .callback
+                .bind(py)
+                .call(PyTuple::new(py, entry.args)?, None);
+        }
+
+        // Process Callbacks (call_soon)
+        let callbacks = self.callbacks.pop_all();
+        for cb in callbacks {
+            let _ = cb.callback.bind(py).call(PyTuple::new(py, cb.args)?, None);
+        }
+
+        Ok(())
     }
 }
 
@@ -1329,27 +1417,33 @@ fn perform_getaddrinfo(
     protocol: i32,
     flags: i32,
 ) -> PyResult<Py<PyAny>> {
-    use std::ffi::{CString, CStr};
-    use std::ptr;
+    use pyo3::types::{PyInt, PyList, PyString};
+    use std::ffi::{CStr, CString};
     use std::mem;
-    use pyo3::types::{PyList, PyString, PyInt};
-    
+    use std::ptr;
+
     unsafe {
         let mut hints: libc::addrinfo = mem::zeroed();
         hints.ai_family = family;
         hints.ai_socktype = socktype;
         hints.ai_protocol = protocol;
         hints.ai_flags = flags;
-        
-        let c_host = host.as_ref().map(|h| CString::new(h.as_str()).ok()).flatten();
-        let c_port = port.as_ref().map(|p| CString::new(p.as_str()).ok()).flatten();
-        
+
+        let c_host = host
+            .as_ref()
+            .map(|h| CString::new(h.as_str()).ok())
+            .flatten();
+        let c_port = port
+            .as_ref()
+            .map(|p| CString::new(p.as_str()).ok())
+            .flatten();
+
         let host_ptr = c_host.as_ref().map_or(ptr::null(), |s| s.as_ptr());
         let port_ptr = c_port.as_ref().map_or(ptr::null(), |s| s.as_ptr());
-        
+
         let mut res: *mut libc::addrinfo = ptr::null_mut();
         let ret = libc::getaddrinfo(host_ptr, port_ptr, &hints, &mut res);
-        
+
         if ret != 0 {
             let error_msg = if ret == libc::EAI_SYSTEM {
                 format!("getaddrinfo failed: {}", std::io::Error::last_os_error())
@@ -1360,33 +1454,38 @@ fn perform_getaddrinfo(
             };
             return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(error_msg));
         }
-        
+
         // Convert the linked list of addrinfo to Python list
         let py_list = PyList::empty(py);
         let mut current = res;
-        
+
         while !current.is_null() {
             let info = &*current;
-            
+
             // Extract family, socktype, protocol
             let fam = info.ai_family;
             let stype = info.ai_socktype;
             let proto = info.ai_protocol;
-            
+
             // Extract canonname
             let canonname = if info.ai_canonname.is_null() {
                 String::new()
             } else {
-                CStr::from_ptr(info.ai_canonname).to_string_lossy().to_string()
+                CStr::from_ptr(info.ai_canonname)
+                    .to_string_lossy()
+                    .to_string()
             };
-            
+
             // Extract sockaddr
             if info.ai_family == libc::AF_INET {
                 let addr = &*(info.ai_addr as *const libc::sockaddr_in);
                 let ip_bytes = addr.sin_addr.s_addr.to_ne_bytes();
-                let ip = format!("{}.{}.{}.{}", ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]);
+                let ip = format!(
+                    "{}.{}.{}.{}",
+                    ip_bytes[0], ip_bytes[1], ip_bytes[2], ip_bytes[3]
+                );
                 let port = u16::from_be(addr.sin_port);
-                
+
                 let fam_py = PyInt::new(py, fam);
                 let stype_py = PyInt::new(py, stype);
                 let proto_py = PyInt::new(py, proto);
@@ -1394,14 +1493,17 @@ fn perform_getaddrinfo(
                 let ip_py = PyString::new(py, &ip);
                 let port_py = PyInt::new(py, port);
                 let addr_tuple = PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?;
-                
-                let tuple = PyTuple::new(py, vec![
-                    fam_py.as_any(),
-                    stype_py.as_any(),
-                    proto_py.as_any(),
-                    canon_py.as_any(),
-                    addr_tuple.as_any(),
-                ])?;
+
+                let tuple = PyTuple::new(
+                    py,
+                    vec![
+                        fam_py.as_any(),
+                        stype_py.as_any(),
+                        proto_py.as_any(),
+                        canon_py.as_any(),
+                        addr_tuple.as_any(),
+                    ],
+                )?;
                 py_list.append(tuple)?;
             } else if info.ai_family == libc::AF_INET6 {
                 let addr = &*(info.ai_addr as *const libc::sockaddr_in6);
@@ -1420,7 +1522,7 @@ fn perform_getaddrinfo(
                 let port = u16::from_be(addr.sin6_port);
                 let flowinfo = addr.sin6_flowinfo;
                 let scope_id = addr.sin6_scope_id;
-                
+
                 let fam_py = PyInt::new(py, fam);
                 let stype_py = PyInt::new(py, stype);
                 let proto_py = PyInt::new(py, proto);
@@ -1429,57 +1531,59 @@ fn perform_getaddrinfo(
                 let port_py = PyInt::new(py, port);
                 let flowinfo_py = PyInt::new(py, flowinfo);
                 let scope_py = PyInt::new(py, scope_id);
-                let addr_tuple = PyTuple::new(py, vec![
-                    ip_py.as_any(),
-                    port_py.as_any(),
-                    flowinfo_py.as_any(),
-                    scope_py.as_any(),
-                ])?;
-                
-                let tuple = PyTuple::new(py, vec![
-                    fam_py.as_any(),
-                    stype_py.as_any(),
-                    proto_py.as_any(),
-                    canon_py.as_any(),
-                    addr_tuple.as_any(),
-                ])?;
+                let addr_tuple = PyTuple::new(
+                    py,
+                    vec![
+                        ip_py.as_any(),
+                        port_py.as_any(),
+                        flowinfo_py.as_any(),
+                        scope_py.as_any(),
+                    ],
+                )?;
+
+                let tuple = PyTuple::new(
+                    py,
+                    vec![
+                        fam_py.as_any(),
+                        stype_py.as_any(),
+                        proto_py.as_any(),
+                        canon_py.as_any(),
+                        addr_tuple.as_any(),
+                    ],
+                )?;
                 py_list.append(tuple)?;
             }
-            
+
             current = info.ai_next;
         }
-        
+
         libc::freeaddrinfo(res);
-        
+
         Ok(py_list.into())
     }
 }
 
-fn perform_getnameinfo(
-    py: Python<'_>,
-    addr: &str,
-    port: u16,
-    flags: i32,
-) -> PyResult<Py<PyAny>> {
+fn perform_getnameinfo(py: Python<'_>, addr: &str, port: u16, flags: i32) -> PyResult<Py<PyAny>> {
+    use pyo3::types::PyString;
     use std::ffi::CStr;
     use std::mem;
     use std::net::{IpAddr, SocketAddr};
-    use pyo3::types::PyString;
-    
+
     // Parse the address
-    let ip_addr: IpAddr = addr.parse()
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid IP address: {}", e)))?;
-    
+    let ip_addr: IpAddr = addr.parse().map_err(|e| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid IP address: {}", e))
+    })?;
+
     let sock_addr = SocketAddr::new(ip_addr, port);
-    
+
     // Use constants directly since libc may not export them on all platforms
     const NI_MAXHOST: usize = 1025;
     const NI_MAXSERV: usize = 32;
-    
+
     unsafe {
         let mut host = vec![0u8; NI_MAXHOST];
         let mut serv = vec![0u8; NI_MAXSERV];
-        
+
         // Create the sockaddr structure that will live for the duration of getnameinfo call
         let ret = match sock_addr {
             SocketAddr::V4(v4_addr) => {
@@ -1487,7 +1591,7 @@ fn perform_getnameinfo(
                 sa.sin_family = libc::AF_INET as _;
                 sa.sin_port = v4_addr.port().to_be();
                 sa.sin_addr.s_addr = u32::from_ne_bytes(v4_addr.ip().octets());
-                
+
                 libc::getnameinfo(
                     &sa as *const libc::sockaddr_in as *const libc::sockaddr,
                     mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
@@ -1505,7 +1609,7 @@ fn perform_getnameinfo(
                 sa.sin6_addr.s6_addr = v6_addr.ip().octets();
                 sa.sin6_flowinfo = v6_addr.flowinfo();
                 sa.sin6_scope_id = v6_addr.scope_id();
-                
+
                 libc::getnameinfo(
                     &sa as *const libc::sockaddr_in6 as *const libc::sockaddr,
                     mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
@@ -1517,7 +1621,7 @@ fn perform_getnameinfo(
                 )
             }
         };
-        
+
         if ret != 0 {
             let error_msg = if ret == libc::EAI_SYSTEM {
                 format!("getnameinfo failed: {}", std::io::Error::last_os_error())
@@ -1528,7 +1632,7 @@ fn perform_getnameinfo(
             };
             return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(error_msg));
         }
-        
+
         // Convert C strings to Rust strings
         let hostname = CStr::from_ptr(host.as_ptr() as *const libc::c_char)
             .to_string_lossy()
@@ -1536,12 +1640,12 @@ fn perform_getnameinfo(
         let servname = CStr::from_ptr(serv.as_ptr() as *const libc::c_char)
             .to_string_lossy()
             .to_string();
-        
+
         // Return tuple (hostname, servname)
         let host_py = PyString::new(py, &hostname);
         let serv_py = PyString::new(py, &servname);
         let result_tuple = PyTuple::new(py, vec![host_py.as_any(), serv_py.as_any()])?;
-        
+
         Ok(result_tuple.into())
     }
 }

@@ -1,5 +1,5 @@
-use pyo3::prelude::*;
 use crate::event_loop::VeloxLoop;
+use pyo3::prelude::*;
 use std::cell::RefCell;
 
 thread_local! {
@@ -21,7 +21,9 @@ impl VeloxLoopPolicy {
             if let Some(loop_) = cell.borrow().as_ref() {
                 Ok(loop_.clone_ref(py))
             } else {
-                 Err(pyo3::exceptions::PyRuntimeError::new_err("There is no current event loop in thread 'VeloxLoopPolicy'."))
+                Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "There is no current event loop in thread 'VeloxLoopPolicy'.",
+                ))
             }
         })
     }
@@ -32,7 +34,7 @@ impl VeloxLoopPolicy {
         });
         Ok(())
     }
-    
+
     fn new_event_loop(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let loop_instance = VeloxLoop::new(None)?;
         Ok(Py::new(py, loop_instance)?.into())

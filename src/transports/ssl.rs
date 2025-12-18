@@ -1,19 +1,19 @@
+use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use rustls::{ClientConfig, ServerConfig, RootCertStore};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::fs::File;
 use std::io::{BufReader, Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use parking_lot::Mutex;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-use crate::utils::VeloxResult;
+use crate::constants::{DEFAULT_HIGH, DEFAULT_LOW};
 use crate::event_loop::VeloxLoop;
-use crate::transports::{Transport, StreamTransport};
-
+use crate::transports::{StreamTransport, Transport};
+use crate::utils::VeloxResult;
 
 /// SSL/TLS Context for configuring secure connections
 #[pyclass(module = "veloxloop._veloxloop")]
@@ -37,79 +37,82 @@ impl SSLContext {
     #[staticmethod]
     fn create_client_context(py: Python<'_>) -> PyResult<Py<SSLContext>> {
         let mut root_store = RootCertStore::empty();
-        
+
         // Load system root certificates
         let native_certs = rustls_native_certs::load_native_certs();
         for cert in native_certs.certs {
             root_store.add(cert).ok();
         }
-        
+
         // If no native certs loaded, use webpki-roots as fallback
         if root_store.is_empty() {
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
-        
+
         let config = ClientConfig::builder()
             .with_root_certificates(root_store)
             .with_no_client_auth();
-        
+
         let ctx = SSLContext {
             client_config: Some(Arc::new(config)),
             server_config: None,
             purpose: SSLPurpose::ServerAuth,
             check_hostname: true,
         };
-        
+
         Py::new(py, ctx)
     }
-    
+
     /// Create a new SSL context for server connections
     #[staticmethod]
     fn create_server_context(py: Python<'_>) -> PyResult<Py<SSLContext>> {
         let ctx = SSLContext {
             client_config: None,
-            server_config: None,  // Will be configured with load_cert_chain
+            server_config: None, // Will be configured with load_cert_chain
             purpose: SSLPurpose::ClientAuth,
             check_hostname: false,
         };
-        
+
         Py::new(py, ctx)
     }
-    
+
     /// Load certificate chain and private key for server context
     #[pyo3(signature = (certfile, keyfile=None))]
     fn load_cert_chain(&mut self, certfile: String, keyfile: Option<String>) -> PyResult<()> {
         let keyfile = keyfile.unwrap_or_else(|| certfile.clone());
-        
+
         // Load certificates
-        let cert_file = File::open(&certfile)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
-                format!("Certificate file not found: {}", e)
-            ))?;
+        let cert_file = File::open(&certfile).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
+                "Certificate file not found: {}",
+                e
+            ))
+        })?;
         let mut cert_reader = BufReader::new(cert_file);
-        let cert_chain: Vec<CertificateDer> = certs(&mut cert_reader)
-            .filter_map(Result::ok)
-            .collect();
-        
+        let cert_chain: Vec<CertificateDer> =
+            certs(&mut cert_reader).filter_map(Result::ok).collect();
+
         if cert_chain.is_empty() {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "No certificates found in certfile"
+                "No certificates found in certfile",
             ));
         }
-        
+
         // Load private key
-        let key_file = File::open(&keyfile)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
-                format!("Key file not found: {}", e)
-            ))?;
+        let key_file = File::open(&keyfile).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
+                "Key file not found: {}",
+                e
+            ))
+        })?;
         let mut key_reader = BufReader::new(key_file);
-        
+
         // Try PKCS8 first, then RSA
         let private_key_der = {
             let pkcs8_keys = pkcs8_private_keys(&mut key_reader)
                 .filter_map(Result::ok)
                 .collect::<Vec<_>>();
-            
+
             if !pkcs8_keys.is_empty() {
                 PrivateKeyDer::Pkcs8(pkcs8_keys.into_iter().next().unwrap())
             } else {
@@ -119,74 +122,84 @@ impl SSLContext {
                 let rsa_keys = rsa_private_keys(&mut key_reader)
                     .filter_map(Result::ok)
                     .collect::<Vec<_>>();
-                
+
                 if !rsa_keys.is_empty() {
                     PrivateKeyDer::Pkcs1(rsa_keys.into_iter().next().unwrap())
                 } else {
                     return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        "No private key found in keyfile"
+                        "No private key found in keyfile",
                     ));
                 }
             }
         };
-        
+
         // Build server config
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(cert_chain, private_key_der)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Failed to configure TLS: {}", e)
-            ))?;
-        
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Failed to configure TLS: {}",
+                    e
+                ))
+            })?;
+
         self.server_config = Some(Arc::new(config));
         Ok(())
     }
-    
+
     /// Set whether to check hostname (client contexts only)
     fn set_check_hostname(&mut self, check: bool) {
         self.check_hostname = check;
     }
-    
+
     /// Load CA certificates for verification
     #[pyo3(signature = (cafile=None, capath=None))]
-    fn load_verify_locations(&mut self, cafile: Option<String>, capath: Option<String>) -> PyResult<()> {
+    fn load_verify_locations(
+        &mut self,
+        cafile: Option<String>,
+        capath: Option<String>,
+    ) -> PyResult<()> {
         if let Some(cafile_path) = cafile {
             let mut root_store = RootCertStore::empty();
-            
-            let ca_file = File::open(&cafile_path)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(
-                    format!("CA file not found: {}", e)
-                ))?;
+
+            let ca_file = File::open(&cafile_path).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyFileNotFoundError, _>(format!(
+                    "CA file not found: {}",
+                    e
+                ))
+            })?;
             let mut ca_reader = BufReader::new(ca_file);
-            let ca_certs: Vec<CertificateDer> = certs(&mut ca_reader)
-                .filter_map(Result::ok)
-                .collect();
-            
+            let ca_certs: Vec<CertificateDer> =
+                certs(&mut ca_reader).filter_map(Result::ok).collect();
+
             for cert in ca_certs {
-                root_store.add(cert)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("Failed to add CA certificate: {}", e)
-                    ))?;
+                root_store.add(cert).map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                        "Failed to add CA certificate: {}",
+                        e
+                    ))
+                })?;
             }
-            
+
             // Rebuild client config with custom root store
             let config = ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth();
-            
+
             self.client_config = Some(Arc::new(config));
         }
-        
+
         if capath.is_some() {
             // Directory-based CA loading not implemented yet
             return Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
-                "Loading CA certificates from directory is not yet supported"
+                "Loading CA certificates from directory is not yet supported",
             ));
         }
-        
+
         Ok(())
     }
-    
+
     /// Get the purpose of this context
     fn __repr__(&self) -> String {
         match self.purpose {
@@ -241,42 +254,42 @@ impl TlsConnection {
             }
         }
     }
-    
+
     fn write_tls(&mut self, stream: &mut TcpStream) -> std::io::Result<()> {
         match self {
             TlsConnection::Client(conn) => conn.write_tls(stream).map(|_| ()),
             TlsConnection::Server(conn) => conn.write_tls(stream).map(|_| ()),
         }
     }
-    
+
     fn wants_write(&self) -> bool {
         match self {
             TlsConnection::Client(conn) => conn.wants_write(),
             TlsConnection::Server(conn) => conn.wants_write(),
         }
     }
-    
+
     fn is_handshaking(&self) -> bool {
         match self {
             TlsConnection::Client(conn) => conn.is_handshaking(),
             TlsConnection::Server(conn) => conn.is_handshaking(),
         }
     }
-    
+
     fn reader(&mut self) -> Box<dyn Read + '_> {
         match self {
             TlsConnection::Client(conn) => Box::new(conn.reader()),
             TlsConnection::Server(conn) => Box::new(conn.reader()),
         }
     }
-    
+
     fn writer(&mut self) -> Box<dyn Write + '_> {
         match self {
             TlsConnection::Client(conn) => Box::new(conn.writer()),
             TlsConnection::Server(conn) => Box::new(conn.writer()),
         }
     }
-    
+
     fn peer_certificates(&self) -> Option<Vec<CertificateDer<'static>>> {
         match self {
             TlsConnection::Client(conn) => conn.peer_certificates().map(|c| c.to_vec()),
@@ -285,10 +298,14 @@ impl TlsConnection {
     }
 }
 
-
 // Implement Transport trait for SSLTransport
 impl crate::transports::Transport for SSLTransport {
-    fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    fn get_extra_info(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         match name {
             "peername" => {
                 let state = self.tls_state.lock();
@@ -304,12 +321,8 @@ impl crate::transports::Transport for SSLTransport {
                 }
                 Ok(default.unwrap_or_else(|| py.None()))
             }
-            "sslcontext" => {
-                Ok(self.ssl_context.clone_ref(py).into_any())
-            }
-            "ssl_object" => {
-                Ok(py.None())
-            }
+            "sslcontext" => Ok(self.ssl_context.clone_ref(py).into_any()),
+            "ssl_object" => Ok(py.None()),
             "peercert" => {
                 let state = self.tls_state.lock();
                 let conn = &state.connection;
@@ -321,59 +334,52 @@ impl crate::transports::Transport for SSLTransport {
                 }
                 Ok(default.unwrap_or_else(|| py.None()))
             }
-            "cipher" => {
-                Ok(default.unwrap_or_else(|| py.None()))
-            }
-            "compression" => {
-                Ok(default.unwrap_or_else(|| py.None()))
-            }
-            _ => {
-                Ok(default.unwrap_or_else(|| py.None()))
-            }
+            "cipher" => Ok(default.unwrap_or_else(|| py.None())),
+            "compression" => Ok(default.unwrap_or_else(|| py.None())),
+            _ => Ok(default.unwrap_or_else(|| py.None())),
         }
     }
-    
+
     fn is_closing(&self) -> bool {
         self.closing
     }
-    
+
     fn get_fd(&self) -> RawFd {
         self.fd
     }
-    
 }
 
-// Implement StreamTransport trait for SSLTransport  
+// Implement StreamTransport trait for SSLTransport
 impl crate::transports::StreamTransport for SSLTransport {
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         if self.closing {
             return Ok(());
         }
-        
+
         self.closing = true;
-        
+
         if self.write_buffer.is_empty() {
             self.force_close(py)?;
         }
         Ok(())
     }
-    
+
     fn force_close(&mut self, py: Python<'_>) -> PyResult<()> {
         self._force_close(py)
     }
-    
+
     fn write(&mut self, _py: Python<'_>, data: &[u8]) -> PyResult<()> {
         if self.closing {
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "Cannot write to closing transport"
+                "Cannot write to closing transport",
             ));
         }
-        
+
         self.write_buffer.extend_from_slice(data);
-        
+
         let mut state = self.tls_state.lock();
         let mut writer = state.connection.writer();
-        
+
         match writer.write_all(data) {
             Ok(_) => {
                 drop(writer);
@@ -388,62 +394,60 @@ impl crate::transports::StreamTransport for SSLTransport {
             Err(e) => Err(e.into()),
         }
     }
-    
+
     fn write_eof(&mut self) -> PyResult<()> {
         let state = self.tls_state.lock();
         state.stream.shutdown(std::net::Shutdown::Write)?;
         Ok(())
     }
-    
+
     fn get_write_buffer_size(&self) -> usize {
         self.write_buffer.len()
     }
-    
-    fn set_write_buffer_limits(&mut self, py: Python<'_>, high: Option<usize>, low: Option<usize>) -> PyResult<()> {
-        const DEFAULT_HIGH: usize = 64 * 1024;
-        
+
+    fn set_write_buffer_limits(
+        &mut self,
+        py: Python<'_>,
+        high: Option<usize>,
+        low: Option<usize>,
+    ) -> PyResult<()> {
+
         let high_limit = high.unwrap_or(DEFAULT_HIGH);
-        let low_limit = low.unwrap_or_else(|| {
-            if high_limit == 0 {
-                0
-            } else {
-                high_limit / 4
-            }
-        });
-        
+        let low_limit = low.unwrap_or_else(|| if high_limit == 0 { 0 } else { high_limit / 4 });
+
         // Special case: high=0 means disable flow control (both should be 0)
         // Otherwise, validate that low < high
         if high_limit > 0 && low_limit >= high_limit {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "low must be less than high"
+                "low must be less than high",
             ));
         }
-        
+
         self.write_buffer_high = high_limit;
         self.write_buffer_low = low_limit;
-        
+
         if high_limit > 0 && self.write_buffer.len() > self.write_buffer_high {
             let _ = self.protocol.call_method0(py, "pause_writing");
         }
-        
+
         Ok(())
     }
-    
+
     fn read_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         let mut state = self.tls_state.lock();
-        
+
         // Read TLS records - split the mutable borrows
         let result = {
             let TlsState { connection, stream } = &mut *state;
             connection.process_tls_records(stream)
         };
-        
+
         match result {
             Ok(_) => {}
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
             Err(e) => return Err(e.into()),
         }
-        
+
         // Handle handshake
         if state.connection.is_handshaking() {
             if state.connection.wants_write() {
@@ -454,19 +458,20 @@ impl crate::transports::StreamTransport for SSLTransport {
                     Err(e) => return Err(e.into()),
                 }
             }
-            
+
             if !state.connection.is_handshaking() && !self.handshake_complete {
                 drop(state);
                 self.handshake_complete = true;
-                self.protocol.call_method1(py, "connection_made", (py.None(),))?;
+                self.protocol
+                    .call_method1(py, "connection_made", (py.None(),))?;
             }
             return Ok(());
         }
-        
+
         // Read application data
         let mut buf = [0u8; 4096];
         let mut reader = state.connection.reader();
-        
+
         match reader.read(&mut buf) {
             Ok(0) => {
                 drop(reader);
@@ -488,18 +493,19 @@ impl crate::transports::StreamTransport for SSLTransport {
                 drop(reader);
                 drop(state);
                 let py_data = PyBytes::new(py, &data);
-                self.protocol.call_method1(py, "data_received", (py_data,))?;
+                self.protocol
+                    .call_method1(py, "data_received", (py_data,))?;
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => return Err(e.into()),
         }
-        
+
         Ok(())
     }
-    
+
     fn write_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         let mut state = self.tls_state.lock();
-        
+
         if state.connection.wants_write() {
             let TlsState { connection, stream } = &mut *state;
             match connection.write_tls(stream) {
@@ -513,7 +519,7 @@ impl crate::transports::StreamTransport for SSLTransport {
                 Err(e) => return Err(e.into()),
             }
         }
-        
+
         Ok(())
     }
 }
@@ -521,7 +527,12 @@ impl crate::transports::StreamTransport for SSLTransport {
 #[pymethods]
 impl SSLTransport {
     #[pyo3(signature = (name, default=None))]
-    fn get_extra_info(&self, py: Python<'_>, name: &str, default: Option<Py<PyAny>>) -> PyResult<Py<PyAny>> {
+    fn get_extra_info(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        default: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
         // Delegate to trait implementation
         Transport::get_extra_info(self, py, name, default)
     }
@@ -530,9 +541,14 @@ impl SSLTransport {
         // Delegate to trait implementation
         StreamTransport::get_write_buffer_size(self)
     }
-    
+
     #[pyo3(signature = (high=None, low=None))]
-    fn set_write_buffer_limits(&mut self, py: Python<'_>, high: Option<usize>, low: Option<usize>) -> PyResult<()> {
+    fn set_write_buffer_limits(
+        &mut self,
+        py: Python<'_>,
+        high: Option<usize>,
+        low: Option<usize>,
+    ) -> PyResult<()> {
         // Delegate to trait implementation
         StreamTransport::set_write_buffer_limits(self, py, high, low)
     }
@@ -546,7 +562,7 @@ impl SSLTransport {
         // Delegate to trait implementation
         Transport::is_closing(self)
     }
-    
+
     fn fileno(&self) -> RawFd {
         // Delegate to trait implementation
         Transport::get_fd(self)
@@ -555,7 +571,7 @@ impl SSLTransport {
     fn pause_reading(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let mut self_ = slf.borrow_mut();
-        
+
         if !self_.reading_paused {
             self_.reading_paused = true;
             let fd = self_.fd;
@@ -568,7 +584,7 @@ impl SSLTransport {
     fn resume_reading(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let mut self_ = slf.borrow_mut();
-        
+
         if self_.reading_paused {
             self_.reading_paused = false;
             let fd = self_.fd;
@@ -589,17 +605,17 @@ impl SSLTransport {
                 return Ok(());
             }
         }
-        
+
         let needs_writer;
         let should_force_close;
-        
+
         {
             let mut self_ = slf.borrow_mut();
             self_.closing = true;
             should_force_close = self_.write_buffer.is_empty();
             needs_writer = !self_.write_buffer.is_empty();
         }
-        
+
         if should_force_close {
             let mut self_ = slf.borrow_mut();
             self_._force_close(py)?;
@@ -607,43 +623,49 @@ impl SSLTransport {
             let self_ = slf.borrow();
             let fd = self_.fd;
             let method = slf.getattr("_write_ready")?;
-            self_.loop_.bind(py).borrow().add_writer(py, fd, method.unbind())?;
+            self_
+                .loop_
+                .bind(py)
+                .borrow()
+                .add_writer(py, fd, method.unbind())?;
         }
         Ok(())
     }
-    
+
     fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
         // Immediate close without flushing
         self._force_close(py)
     }
-    
+
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
         let fd = self.fd;
-        
+
         let loop_ = self.loop_.bind(py).borrow();
         loop_.remove_reader(py, fd)?;
         loop_.remove_writer(py, fd)?;
         drop(loop_);
-        
+
         // Stream will be dropped when tls_state is dropped
-        
-        let _ = self.protocol.call_method1(py, "connection_lost", (py.None(),));
+
+        let _ = self
+            .protocol
+            .call_method1(py, "connection_lost", (py.None(),));
         Ok(())
     }
 
     fn write(slf: &Bound<'_, Self>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
         let py = slf.py();
         let bytes = data.as_bytes();
-        
+
         // Add data to write buffer
         {
             let mut self_ = slf.borrow_mut();
             self_.write_buffer.extend_from_slice(bytes);
         }
-        
+
         // Try to flush immediately
         Self::_write_ready(slf)?;
-        
+
         // Register writer if needed
         let self_ = slf.borrow();
         let state = self_.tls_state.lock();
@@ -654,44 +676,52 @@ impl SSLTransport {
             drop(state);
             drop(self_);
             let loop_ = slf.borrow().loop_.clone_ref(py);
-            loop_.bind(py).borrow().add_writer(py, fd, method.unbind())?;
+            loop_
+                .bind(py)
+                .borrow()
+                .add_writer(py, fd, method.unbind())?;
         }
-        
+
         Ok(())
     }
-    
+
     fn _write_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        
+
         // Get necessary data without holding borrows
         let (fd, loop_ref) = {
             let self_ = slf.borrow();
             (self_.fd, self_.loop_.clone_ref(py))
         };
-        
+
         // Process writes
         loop {
             let (should_write_app_data, should_write_tls, _, _) = {
                 let self_ = slf.borrow();
                 let state = self_.tls_state.lock();
                 let conn = &state.connection;
-                
+
                 let should_write_app = !self_.write_buffer.is_empty();
                 let should_write_tls = conn.wants_write();
                 let buffer_empty = self_.write_buffer.is_empty();
                 let wants_write = conn.wants_write();
-                
+
                 drop(state);
                 drop(self_);
-                (should_write_app, should_write_tls, buffer_empty, wants_write)
+                (
+                    should_write_app,
+                    should_write_tls,
+                    buffer_empty,
+                    wants_write,
+                )
             };
-            
+
             // Write application data to TLS
             if should_write_app_data {
                 let mut self_ = slf.borrow_mut();
                 let mut state = self_.tls_state.lock();
                 let conn = &mut state.connection;
-                
+
                 if !self_.write_buffer.is_empty() {
                     let mut writer = conn.writer();
                     match writer.write(&self_.write_buffer) {
@@ -718,14 +748,16 @@ impl SSLTransport {
                     drop(self_);
                 }
             }
-            
+
             // Write TLS data to socket
             if should_write_tls || should_write_app_data {
                 let self_ = slf.borrow_mut();
                 let mut state = self_.tls_state.lock();
-                
+
                 // Use &mut TcpStream from state - split borrow
-                let TlsState { connection, stream, .. } = &mut *state;
+                let TlsState {
+                    connection, stream, ..
+                } = &mut *state;
                 match connection.write_tls(stream) {
                     Ok(_) => {}
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -744,7 +776,7 @@ impl SSLTransport {
             } else {
                 break;
             }
-            
+
             // Check if we're done
             let done = {
                 let self_ = slf.borrow();
@@ -755,12 +787,12 @@ impl SSLTransport {
                 drop(self_);
                 result
             };
-            
+
             if done {
                 break;
             }
         }
-        
+
         // Remove writer if nothing left to write
         let should_remove_writer = {
             let self_ = slf.borrow();
@@ -771,17 +803,17 @@ impl SSLTransport {
             drop(self_);
             result
         };
-        
+
         if should_remove_writer {
             loop_ref.bind(py).borrow().remove_writer(py, fd).ok();
         }
-        
+
         Ok(())
     }
 
     fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        
+
         // Get protocol reference
         let (protocol, _, _, handshake_complete) = {
             let self_ = slf.borrow();
@@ -792,13 +824,15 @@ impl SSLTransport {
                 self_.handshake_complete,
             )
         };
-        
+
         // Read TLS records from socket
         {
             let self_ = slf.borrow_mut();
             let mut state = self_.tls_state.lock();
-            
-            let TlsState { connection, stream, .. } = &mut *state;
+
+            let TlsState {
+                connection, stream, ..
+            } = &mut *state;
             match connection.process_tls_records(stream) {
                 Ok(_) => {}
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -815,7 +849,7 @@ impl SSLTransport {
             drop(state);
             drop(self_);
         }
-        
+
         // Check if handshake just completed
         let handshake_just_completed = {
             let self_ = slf.borrow();
@@ -826,35 +860,35 @@ impl SSLTransport {
             drop(self_);
             result
         };
-        
+
         if handshake_just_completed {
             slf.borrow_mut().handshake_complete = true;
-            
+
             // Notify protocol of connection
             let transport_py: Py<PyAny> = slf.clone().unbind().into();
             protocol.call_method1(py, "connection_made", (transport_py,))?;
-            
+
             // Trigger write if needed for handshake completion
             Self::_write_ready(slf)?;
-            
+
             return Ok(());
         }
-        
+
         // Read application data
         let data_read = {
             let self_ = slf.borrow_mut();
             let mut state = self_.tls_state.lock();
             let conn = &mut state.connection;
-            
+
             let mut buf = vec![0u8; 16384];
             let mut reader = conn.reader();
-            
+
             match reader.read(&mut buf) {
                 Ok(0) => {
                     drop(reader);
                     drop(state);
                     drop(self_);
-                    
+
                     // EOF
                     if let Ok(res) = protocol.call_method0(py, "eof_received") {
                         if let Ok(keep_open) = res.extract::<bool>(py) {
@@ -890,13 +924,13 @@ impl SSLTransport {
                 }
             }
         };
-        
+
         // Deliver data to protocol
         if let Some(data) = data_read {
             let py_data = PyBytes::new(py, &data);
             protocol.call_method1(py, "data_received", (py_data,))?;
         }
-        
+
         // Handle TLS write needs (e.g., post-handshake messages)
         let needs_write = {
             let self_ = slf.borrow();
@@ -907,11 +941,11 @@ impl SSLTransport {
             drop(self_);
             result
         };
-        
+
         if needs_write {
             Self::_write_ready(slf)?;
         }
-        
+
         Ok(())
     }
 }
@@ -927,35 +961,39 @@ impl SSLTransport {
     ) -> VeloxResult<Self> {
         stream.set_nonblocking(true)?;
         let fd = stream.as_raw_fd();
-        
+
         let client_config = {
             let ctx = ssl_context.borrow(py);
-            ctx.client_config.as_ref()
-                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "SSL context not configured for client connections"
-                ))?
+            ctx.client_config
+                .as_ref()
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "SSL context not configured for client connections",
+                    )
+                })?
                 .clone()
         };
-        
-        let server_name = server_hostname.as_ref()
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "server_hostname is required for client SSL connections"
-            ))?;
-        
+
+        let server_name = server_hostname.as_ref().ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "server_hostname is required for client SSL connections",
+            )
+        })?;
+
         let server_name = rustls::pki_types::ServerName::try_from(server_name.as_str())
-            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                "Invalid server hostname"
-            ))?
+            .map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>("Invalid server hostname")
+            })?
             .to_owned();
-        
-        let connection = rustls::ClientConnection::new(client_config, server_name)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Failed to create TLS connection: {}", e)
-            ))?;
-        
-        const DEFAULT_HIGH: usize = 64 * 1024;
-        const DEFAULT_LOW: usize = 16 * 1024;
-        
+
+        let connection =
+            rustls::ClientConnection::new(client_config, server_name).map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "Failed to create TLS connection: {}",
+                    e
+                ))
+            })?;
+
         let transport = Self {
             fd,
             tls_state: Mutex::new(TlsState {
@@ -973,10 +1011,10 @@ impl SSLTransport {
             ssl_context,
             handshake_complete: false,
         };
-        
+
         Ok(transport)
     }
-    
+
     pub fn new_server(
         loop_: Py<VeloxLoop>,
         stream: TcpStream,
@@ -986,24 +1024,26 @@ impl SSLTransport {
     ) -> VeloxResult<Self> {
         stream.set_nonblocking(true)?;
         let fd = stream.as_raw_fd();
-        
+
         let server_config = {
             let ctx = ssl_context.borrow(py);
-            ctx.server_config.as_ref()
-                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                    "SSL context not configured for server connections"
-                ))?
+            ctx.server_config
+                .as_ref()
+                .ok_or_else(|| {
+                    PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                        "SSL context not configured for server connections",
+                    )
+                })?
                 .clone()
         };
-        
-        let connection = rustls::ServerConnection::new(server_config)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Failed to create TLS connection: {}", e)
-            ))?;
-        
-        const DEFAULT_HIGH: usize = 64 * 1024;
-        const DEFAULT_LOW: usize = 16 * 1024;
-        
+
+        let connection = rustls::ServerConnection::new(server_config).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Failed to create TLS connection: {}",
+                e
+            ))
+        })?;
+
         let transport = Self {
             fd,
             tls_state: Mutex::new(TlsState {
@@ -1021,7 +1061,7 @@ impl SSLTransport {
             ssl_context,
             handshake_complete: false,
         };
-        
+
         Ok(transport)
     }
 }

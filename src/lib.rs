@@ -1,27 +1,28 @@
 use pyo3::prelude::*;
 
-mod utils;
-mod handles;
-mod poller;
 mod callbacks;
-mod timers;
 mod event_loop;
-mod policy;
-mod transports;
 mod executor;
-mod streams;
+mod handles;
+mod policy;
+mod poller;
 mod socket;
+mod streams;
+mod timers;
+mod transports;
+mod utils;
+mod constants;
 
+use callbacks::AsyncConnectCallback;
 use event_loop::VeloxLoop;
-use transports::tcp::{TcpTransport, TcpServer, SocketWrapper};
-use transports::udp::{UdpTransport, UdpSocketWrapper};
+use policy::VeloxLoopPolicy;
+use socket::SocketOptions;
+use streams::{StreamReader, StreamWriter};
+use transports::future::CompletedFuture;
 use transports::ssl::{SSLContext, SSLTransport};
 use transports::stream_server::{StreamServer, StreamTransport};
-use transports::future::CompletedFuture;
-use callbacks::AsyncConnectCallback;
-use policy::VeloxLoopPolicy;
-use streams::{StreamReader, StreamWriter};
-use socket::SocketOptions;
+use transports::tcp::{SocketWrapper, TcpServer, TcpTransport};
+use transports::udp::{UdpSocketWrapper, UdpTransport};
 
 #[pymodule(gil_used = false)]
 fn _veloxloop(m: &Bound<'_, PyModule>) -> PyResult<()> {

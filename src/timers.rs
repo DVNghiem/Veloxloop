@@ -1,5 +1,5 @@
-use pyo3::prelude::*;
 use priority_queue::PriorityQueue;
+use pyo3::prelude::*;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
@@ -27,7 +27,13 @@ impl Timers {
         }
     }
 
-    pub fn insert(&mut self, when: u64, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) -> u64 {
+    pub fn insert(
+        &mut self,
+        when: u64,
+        callback: Py<PyAny>,
+        args: Vec<Py<PyAny>>,
+        context: Option<Py<PyAny>>,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -49,26 +55,26 @@ impl Timers {
 
     pub fn pop_expired(&mut self, now: u64) -> Vec<TimerEntry> {
         let mut expired = Vec::new();
-        
+
         // Check top
         loop {
-             if let Some((_, Reverse(when))) = self.pq.peek() {
-                 if *when <= now {
-                     if let Some((id, _)) = self.pq.pop() {
-                         if let Some(entry) = self.entries.remove(&id) {
-                             expired.push(entry);
-                         }
-                     }
-                 } else {
-                     break;
-                 }
-             } else {
-                 break;
-             }
+            if let Some((_, Reverse(when))) = self.pq.peek() {
+                if *when <= now {
+                    if let Some((id, _)) = self.pq.pop() {
+                        if let Some(entry) = self.entries.remove(&id) {
+                            expired.push(entry);
+                        }
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
         expired
     }
-    
+
     pub fn next_expiry(&self) -> Option<u64> {
         self.pq.peek().map(|(_, Reverse(when))| *when)
     }
