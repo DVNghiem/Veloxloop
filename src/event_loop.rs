@@ -1,10 +1,11 @@
 use parking_lot::Mutex;
-use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
+use pyo3::{IntoPyObjectExt, prelude::*};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::callbacks::{Callback, CallbackQueue};
+use crate::callbacks::{Callback, CallbackQueue, RemoveWriterCallback, SockConnectCallback};
+use crate::constants::{NI_MAXHOST, NI_MAXSERV};
 use crate::executor::ThreadPoolExecutor;
 use crate::handles::IoHandles;
 use crate::poller::LoopPoller;
@@ -629,59 +630,18 @@ impl VeloxLoop {
         let future = self_.create_future(py)?;
         let future_clone = future.clone_ref(py);
 
-        // Create a callback that will be called when the socket is writable
-        // We'll wrap it in a simple Callable struct
-        #[pyclass]
-        struct SockConnectCallback {
-            future: Py<PendingFuture>,
-        }
+        let callback = SockConnectCallback::new(future_clone).into_py_any(py)?;
 
-        #[pymethods]
-        impl SockConnectCallback {
-            fn __call__(&self, py: Python<'_>) -> PyResult<()> {
-                self.future
-                    .bind(py)
-                    .call_method1("set_result", (py.None(),))?;
-                Ok(())
-            }
-        }
-
-        let callback_obj = SockConnectCallback {
-            future: future_clone,
-        };
-        let callback = Py::new(py, callback_obj)?;
-
-        // Add writer to wait for socket to be writable
-        self_.add_writer(py, fd, callback.into_any())?;
+        // Add writer to wait for socket to become writable
+        self_.add_writer(py, fd, callback)?;
 
         // Create a done callback to remove the writer when future completes
-        let fd_copy = fd;
         let loop_ref = slf.clone().unbind();
-
-        #[pyclass]
-        struct RemoveWriterCallback {
-            fd: RawFd,
-            loop_: Py<VeloxLoop>,
-        }
-
-        #[pymethods]
-        impl RemoveWriterCallback {
-            fn __call__(&self, py: Python<'_>, _fut: Py<PyAny>) -> PyResult<()> {
-                // Remove writer through the event loop's remove_writer method
-                self.loop_.bind(py).borrow().remove_writer(py, self.fd)?;
-                Ok(())
-            }
-        }
-
-        let done_callback_obj = RemoveWriterCallback {
-            fd: fd_copy,
-            loop_: loop_ref,
-        };
-        let done_callback = Py::new(py, done_callback_obj)?;
+        let done_callback_obj = RemoveWriterCallback::new(fd, loop_ref).into_py_any(py)?;
         future
             .bind(py)
             .borrow()
-            .add_done_callback(done_callback.into_any())?;
+            .add_done_callback(done_callback_obj)?;
 
         Ok(future.into_any())
     }
@@ -774,10 +734,9 @@ impl VeloxLoop {
         let future = self_.create_future(py)?;
         let loop_ref = slf.clone().unbind();
 
-        let callback_obj = SockAcceptCallback::new(loop_ref, future.clone_ref(py), fd);
-        let callback = Py::new(py, callback_obj)?;
-
-        self_.add_reader(py, fd, callback.into_any())?;
+        let callback =
+            SockAcceptCallback::new(loop_ref, future.clone_ref(py), fd).into_py_any(py)?;
+        self_.add_reader(py, fd, callback)?;
 
         Ok(future.into_any())
     }
@@ -1575,10 +1534,6 @@ fn perform_getnameinfo(py: Python<'_>, addr: &str, port: u16, flags: i32) -> PyR
     })?;
 
     let sock_addr = SocketAddr::new(ip_addr, port);
-
-    // Use constants directly since libc may not export them on all platforms
-    const NI_MAXHOST: usize = 1025;
-    const NI_MAXSERV: usize = 32;
 
     unsafe {
         let mut host = vec![0u8; NI_MAXHOST];

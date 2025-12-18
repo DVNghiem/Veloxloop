@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod callbacks;
+mod constants;
 mod event_loop;
 mod executor;
 mod handles;
@@ -11,7 +12,6 @@ mod streams;
 mod timers;
 mod transports;
 mod utils;
-mod constants;
 
 use callbacks::AsyncConnectCallback;
 use event_loop::VeloxLoop;

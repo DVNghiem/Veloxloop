@@ -1,7 +1,10 @@
-use crate::{constants::{DEFAULT_HIGH, DEFAULT_LIMIT, DEFAULT_LOW}, transports::future::PendingFuture};
+use crate::{
+    constants::{DEFAULT_HIGH, DEFAULT_LIMIT, DEFAULT_LOW},
+    transports::future::PendingFuture,
+};
 use memchr::memchr;
 use parking_lot::Mutex;
-use pyo3::IntoPyObjectExt; 
+use pyo3::IntoPyObjectExt;
 #[allow(unused)]
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -33,7 +36,6 @@ impl StreamReader {
     #[new]
     #[pyo3(signature = (limit=None))]
     pub fn new(limit: Option<usize>) -> Self {
-
         Self {
             inner: Arc::new(Mutex::new(StreamReaderInner {
                 buffer: Vec::with_capacity(DEFAULT_LIMIT),
@@ -409,7 +411,6 @@ impl StreamWriter {
     #[new]
     #[pyo3(signature = (high_water=None, low_water=None))]
     pub fn new(high_water: Option<usize>, low_water: Option<usize>) -> Self {
-
         let high = high_water.unwrap_or(DEFAULT_HIGH);
         let low = low_water.unwrap_or(DEFAULT_LOW);
 

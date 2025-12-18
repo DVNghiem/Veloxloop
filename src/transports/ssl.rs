@@ -411,7 +411,6 @@ impl crate::transports::StreamTransport for SSLTransport {
         high: Option<usize>,
         low: Option<usize>,
     ) -> PyResult<()> {
-
         let high_limit = high.unwrap_or(DEFAULT_HIGH);
         let low_limit = low.unwrap_or_else(|| if high_limit == 0 { 0 } else { high_limit / 4 });
 

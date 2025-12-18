@@ -330,7 +330,7 @@ impl StreamServer {
                 Ok((stream, _addr)) => {
                     // Create StreamReader and StreamWriter
                     let reader = Py::new(py, StreamReader::new(Some(self.limit)))?;
-                    let writer = Py::new(py, StreamWriter::new(Some(64*1024), Some(16*1024)))?;
+                    let writer = Py::new(py, StreamWriter::new(Some(64 * 1024), Some(16 * 1024)))?;
 
                     // Create StreamTransport (now returns Py<StreamTransport>)
                     let transport_py = StreamTransport::new(

@@ -412,3 +412,45 @@ impl SockSendallCallback {
         }
     }
 }
+
+#[pyclass]
+pub struct SockConnectCallback {
+    future: Py<PendingFuture>,
+}
+
+#[pymethods]
+impl SockConnectCallback {
+    fn __call__(&self, py: Python<'_>) -> PyResult<()> {
+        self.future
+            .bind(py)
+            .call_method1("set_result", (py.None(),))?;
+        Ok(())
+    }
+}
+
+impl SockConnectCallback {
+    pub fn new(future: Py<PendingFuture>) -> Self {
+        Self { future }
+    }
+}
+
+#[pyclass]
+pub struct RemoveWriterCallback {
+    fd: RawFd,
+    loop_: Py<VeloxLoop>,
+}
+
+impl RemoveWriterCallback {
+    pub fn new(fd: RawFd, loop_: Py<VeloxLoop>) -> Self {
+        Self { fd, loop_ }
+    }
+}
+
+#[pymethods]
+impl RemoveWriterCallback {
+    fn __call__(&self, py: Python<'_>, _fut: Py<PyAny>) -> PyResult<()> {
+        // Remove writer through the event loop's remove_writer method
+        self.loop_.bind(py).borrow().remove_writer(py, self.fd)?;
+        Ok(())
+    }
+}
