@@ -24,6 +24,16 @@ struct StreamReaderInner {
     waiters: Vec<(WaiterType, Py<PendingFuture>)>,
 }
 
+impl StreamReaderInner {
+    fn feed_data(&mut self, data: &[u8]) {
+        self.buffer.extend_from_slice(data);
+    }
+
+    fn feed_eof(&mut self) {
+        self.eof = true;
+    }
+}
+
 #[derive(Clone)]
 enum WaiterType {
     ReadLine,
@@ -53,9 +63,18 @@ impl StreamReader {
             return Ok(());
         }
 
+        self.feed_data_native(py, data)
+    }
+
+    /// Feed data into the buffer from Rust and wake up waiters
+    pub fn feed_data_native(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+
         {
             let mut inner = self.inner.lock();
-            inner.buffer.extend_from_slice(data);
+            inner.feed_data(data);
         }
 
         // Try to satisfy waiting futures
@@ -65,9 +84,14 @@ impl StreamReader {
 
     /// Signal EOF and wake up all waiters
     pub fn feed_eof(&self, py: Python<'_>) -> PyResult<()> {
+        self.feed_eof_native(py)
+    }
+
+    /// Signal EOF from Rust and wake up all waiters
+    pub fn feed_eof_native(&self, py: Python<'_>) -> PyResult<()> {
         {
             let mut inner = self.inner.lock();
-            inner.eof = true;
+            inner.feed_eof();
         }
         self._wakeup_waiters(py)?;
         Ok(())
@@ -386,6 +410,16 @@ impl StreamReader {
 
         Ok(n)
     }
+
+    /// Internal method to get the inner state for direct coupling
+    pub(crate) fn get_inner(&self) -> Arc<Mutex<StreamReaderInner>> {
+        self.inner.clone()
+    }
+}
+
+/// Trait for transport to trigger write flush from StreamWriter without Python
+pub trait StreamWriterProxy: Send + Sync {
+    fn trigger_write(&self, py: Python<'_>) -> PyResult<()>;
 }
 
 #[pyclass(module = "veloxloop._veloxloop")]
@@ -402,8 +436,10 @@ pub struct StreamWriter {
     low_water: usize,
     /// Drain waiters - futures waiting for buffer to drain
     drain_waiters: Arc<Mutex<Vec<Py<PendingFuture>>>>,
-    /// Transport reference for triggering writes
+    /// Transport reference for triggering writes (legacy Python path)
     transport: Arc<Mutex<Option<Py<PyAny>>>>,
+    /// Native transport proxy for triggering writes (optimized path)
+    proxy: Arc<Mutex<Option<Arc<dyn StreamWriterProxy>>>>,
 }
 
 #[pymethods]
@@ -422,13 +458,25 @@ impl StreamWriter {
             low_water: low,
             drain_waiters: Arc::new(Mutex::new(Vec::new())),
             transport: Arc::new(Mutex::new(None)),
+            proxy: Arc::new(Mutex::new(None)),
         }
     }
 
-    /// Internal method to set the transport
+    /// Internal method to set the transport (Python path)
     pub fn _set_transport(&self, transport: Py<PyAny>) {
         *self.transport.lock() = Some(transport);
     }
+}
+
+impl StreamWriter {
+    /// Internal method to set the native proxy (Rust path)
+    pub fn set_proxy(&self, proxy: Arc<dyn StreamWriterProxy>) {
+        *self.proxy.lock() = Some(proxy);
+    }
+}
+
+#[pymethods]
+impl StreamWriter {
 
     /// Write data to the buffer and trigger transport write
     pub fn write(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
@@ -450,7 +498,9 @@ impl StreamWriter {
         drop(buffer);
 
         // Trigger transport to write
-        if let Some(transport) = self.transport.lock().as_ref() {
+        if let Some(proxy) = self.proxy.lock().as_ref() {
+            proxy.trigger_write(py)?;
+        } else if let Some(transport) = self.transport.lock().as_ref() {
             transport.call_method1(py, "_trigger_write", ())?;
         }
 

@@ -7,12 +7,13 @@ use std::time::{Duration, Instant};
 use crate::callbacks::{Callback, CallbackQueue, RemoveWriterCallback, SockConnectCallback};
 use crate::constants::{NI_MAXHOST, NI_MAXSERV};
 use crate::executor::ThreadPoolExecutor;
-use crate::handles::IoHandles;
+use crate::handles::{IoCallback, IoHandles};
 use crate::poller::LoopPoller;
 use crate::timers::Timers;
 use crate::transports::future::PendingFuture;
 use crate::transports::tcp::TcpServer;
 use crate::utils::{VeloxError, VeloxResult};
+use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -89,28 +90,7 @@ impl VeloxLoop {
     }
 
     pub fn add_reader(&self, _py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
-        let poller = self.poller.clone();
-
-        // Lock handles once
-        let mut handles = self.handles.lock();
-        let reader_exists = handles.get_reader(fd).is_some();
-        let writer_exists = handles.get_writer(fd).is_some();
-
-        // Add or modify
-        handles.add_reader(fd, callback);
-        drop(handles); // Drop lock before poller
-
-        // Update Poller
-        let mut ev = polling::Event::readable(fd as usize);
-        if writer_exists {
-            ev.writable = true;
-        }
-        if !reader_exists && !writer_exists {
-            poller.register(fd, ev)?;
-        } else {
-            poller.modify(fd, ev)?;
-        }
-        Ok(())
+        self.add_reader_internal(fd, IoCallback::Python(callback))
     }
 
     pub fn remove_reader(&self, _py: Python<'_>, fd: RawFd) -> PyResult<bool> {
@@ -134,26 +114,7 @@ impl VeloxLoop {
     }
 
     pub fn add_writer(&self, _py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {
-        let poller = self.poller.clone();
-
-        let mut handles = self.handles.lock();
-        let reader_exists = handles.get_reader(fd).is_some();
-        let writer_exists = handles.get_writer(fd).is_some();
-
-        handles.add_writer(fd, callback);
-        drop(handles);
-
-        let mut ev = polling::Event::writable(fd as usize);
-        if reader_exists {
-            ev.readable = true;
-        }
-
-        if !writer_exists && !reader_exists {
-            poller.register(fd, ev)?;
-        } else {
-            poller.modify(fd, ev)?;
-        }
-        Ok(())
+        self.add_writer_internal(fd, IoCallback::Python(callback))
     }
 
     pub fn remove_writer(&self, _py: Python<'_>, fd: RawFd) -> PyResult<bool> {
@@ -163,9 +124,11 @@ impl VeloxLoop {
             drop(handles);
 
             if reader_exists {
+                // Downgrade to R only
                 let ev = polling::Event::readable(fd as usize);
                 self.poller.modify(fd, ev)?;
             } else {
+                // Remove
                 self.poller.delete(fd)?;
             }
             Ok(true)
@@ -173,8 +136,79 @@ impl VeloxLoop {
             Ok(false)
         }
     }
+}
 
-    // Callbacks
+// Rust-only methods for VeloxLoop
+impl VeloxLoop {
+    pub fn add_reader_native(
+        &self,
+        fd: RawFd,
+        callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>,
+    ) -> PyResult<()> {
+        self.add_reader_internal(fd, IoCallback::Native(callback))
+    }
+
+    fn add_reader_internal(&self, fd: RawFd, callback: IoCallback) -> PyResult<()> {
+        let poller = self.poller.clone();
+
+        // Lock handles once
+        let mut handles = self.handles.lock();
+        let reader_exists = handles.get_reader(fd).is_some();
+        let writer_exists = handles.get_writer(fd).is_some();
+
+        // Add or modify
+        handles.add_reader(fd, callback);
+        drop(handles); // Drop lock before poller
+
+        let mut ev = polling::Event::readable(fd as usize);
+        if writer_exists {
+            ev.writable = true;
+        }
+
+        if reader_exists || writer_exists {
+            poller.modify(fd, ev)?;
+        } else {
+            poller.register(fd, ev)?;
+        }
+        Ok(())
+    }
+
+    pub fn add_writer_native(
+        &self,
+        fd: RawFd,
+        callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>,
+    ) -> PyResult<()> {
+        self.add_writer_internal(fd, IoCallback::Native(callback))
+    }
+
+    fn add_writer_internal(&self, fd: RawFd, callback: IoCallback) -> PyResult<()> {
+        let poller = self.poller.clone();
+
+        // Lock handles once
+        let mut handles = self.handles.lock();
+        let reader_exists = handles.get_reader(fd).is_some();
+        let writer_exists = handles.get_writer(fd).is_some();
+
+        // Add or modify
+        handles.add_writer(fd, callback);
+        drop(handles); // Drop lock before poller
+
+        let mut ev = polling::Event::writable(fd as usize);
+        if reader_exists {
+            ev.readable = true;
+        }
+
+        if reader_exists || writer_exists {
+            poller.modify(fd, ev)?;
+        } else {
+            poller.register(fd, ev)?;
+        }
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl VeloxLoop {
     #[pyo3(signature = (callback, *args, context=None))]
     fn call_soon(&self, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) {
         self.callbacks.push(Callback {
@@ -685,7 +719,6 @@ impl VeloxLoop {
                     let addr_in = &*((&addr) as *const _ as *const libc::sockaddr_in);
                     if addr_in.sin_family == libc::AF_INET as u16 {
                         let ip = u32::from_be(addr_in.sin_addr.s_addr);
-                        let port = u16::from_be(addr_in.sin_port);
                         let ip_str = format!(
                             "{}.{}.{}.{}",
                             (ip >> 24) & 0xff,
@@ -694,7 +727,7 @@ impl VeloxLoop {
                             ip & 0xff
                         );
                         let ip_py = PyString::new(py, &ip_str);
-                        let port_py = PyInt::new(py, port);
+                        let port_py = PyInt::new(py, u16::from_be(addr_in.sin_port));
                         PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
                     } else {
                         let ip_py = PyString::new(py, "");
@@ -1066,16 +1099,19 @@ impl VeloxLoop {
         // Create StreamTransport (now returns Py<StreamTransport>)
         let transport_py = crate::transports::stream_server::StreamTransport::new(
             py,
-            loop_obj,
+            loop_obj.clone_ref(py),
             stream,
             reader.clone_ref(py),
             writer.clone_ref(py),
         )?;
 
-        // Register read callback
-        let read_ready = transport_py.getattr(py, "_read_ready")?;
+        // Add reader (native path)
+        let transport_clone = transport_py.clone_ref(py);
+        let read_callback = Arc::new(move |py: Python<'_>| {
+            transport_clone.bind(py).borrow_mut()._read_ready(py)
+        });
         let fd = transport_py.borrow(py).get_fd();
-        slf.borrow().add_reader(py, fd, read_ready)?;
+        slf.borrow().add_reader_native(fd, read_callback)?;
 
         // Return (reader, writer) tuple wrapped in completed future
         let result = (reader.into_any(), writer.into_any());
@@ -1219,9 +1255,16 @@ impl VeloxLoop {
         // Call protocol.connection_made(transport)
         protocol.call_method1(py, "connection_made", (transport_py.clone_ref(py),))?;
 
-        // Register read handler
-        let read_ready = transport_py.getattr(py, "_read_ready")?;
-        self_.add_reader(py, fd, read_ready)?;
+        // Register read handler (native path)
+        let transport_clone = transport_py.clone_ref(py);
+        let read_callback = Arc::new(move |py: Python<'_>| {
+            let b = transport_clone.bind(py);
+            let udp = b.downcast::<crate::transports::udp::UdpTransport>().map_err(|_| {
+                PyErr::new::<pyo3::exceptions::PyTypeError, _>("Expected UdpTransport")
+            })?;
+            udp.borrow()._read_ready(py)
+        });
+        slf.borrow().add_reader_native(fd, read_callback)?;
 
         // Return (transport, protocol) tuple wrapped in completed future
         let result_tuple = PyTuple::new(py, vec![transport_py.into_any(), protocol.into_any()])?;
@@ -1268,11 +1311,19 @@ impl VeloxLoop {
         // First pass: Collect all callbacks with single lock acquisition
         let mut pending_callbacks: Vec<(
             std::os::fd::RawFd,
-            Option<Py<PyAny>>,
-            Option<Py<PyAny>>,
+            Option<clone_choice::Choice>,
+            Option<clone_choice::Choice>,
             bool,
             bool,
         )> = Vec::with_capacity(events.len());
+
+        mod clone_choice {
+            use super::*;
+            pub enum Choice {
+                Python(Py<PyAny>),
+                Native(Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>),
+            }
+        }
 
         {
             let handles = self.handles.lock();
@@ -1282,7 +1333,10 @@ impl VeloxLoop {
                 let reader_cb = if event.readable {
                     if let Some(handle) = handles.get_reader(fd) {
                         if !handle.cancelled {
-                            Some(handle.callback.clone_ref(py))
+                            match &handle.callback {
+                                IoCallback::Python(cb) => Some(clone_choice::Choice::Python(cb.clone_ref(py))),
+                                IoCallback::Native(cb) => Some(clone_choice::Choice::Native(cb.clone())),
+                            }
                         } else {
                             None
                         }
@@ -1296,7 +1350,10 @@ impl VeloxLoop {
                 let writer_cb = if event.writable {
                     if let Some(handle) = handles.get_writer(fd) {
                         if !handle.cancelled {
-                            Some(handle.callback.clone_ref(py))
+                            match &handle.callback {
+                                IoCallback::Python(cb) => Some(clone_choice::Choice::Python(cb.clone_ref(py))),
+                                IoCallback::Native(cb) => Some(clone_choice::Choice::Native(cb.clone())),
+                            }
                         } else {
                             None
                         }
@@ -1318,12 +1375,20 @@ impl VeloxLoop {
         // Second pass: Dispatch callbacks (without holding lock)
         for (_, reader_cb, writer_cb, _, _) in &pending_callbacks {
             if let Some(cb) = reader_cb {
-                if let Err(e) = cb.call0(py) {
+                let res = match cb {
+                    clone_choice::Choice::Python(cb) => cb.call0(py).map(|_| ()),
+                    clone_choice::Choice::Native(cb) => cb(py),
+                };
+                if let Err(e) = res {
                     e.print(py);
                 }
             }
             if let Some(cb) = writer_cb {
-                if let Err(e) = cb.call0(py) {
+                let res = match cb {
+                    clone_choice::Choice::Python(cb) => cb.call0(py).map(|_| ()),
+                    clone_choice::Choice::Native(cb) => cb(py),
+                };
+                if let Err(e) = res {
                     e.print(py);
                 }
             }

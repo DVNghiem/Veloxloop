@@ -1,10 +1,16 @@
 use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
 use slab::Slab;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::Arc;
+
+pub enum IoCallback {
+    Python(Py<PyAny>),
+    Native(Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>),
+}
 
 pub struct Handle {
-    pub callback: Py<PyAny>,
+    pub callback: IoCallback,
     pub cancelled: bool,
 }
 
@@ -24,7 +30,7 @@ impl IoHandles {
         }
     }
 
-    pub fn add_reader(&mut self, fd: RawFd, callback: Py<PyAny>) {
+    pub fn add_reader(&mut self, fd: RawFd, callback: IoCallback) {
         let entry = self.fd_map.entry(fd).or_insert((None, None));
 
         if let Some(key) = entry.0 {
@@ -43,6 +49,26 @@ impl IoHandles {
         }
     }
 
+    pub fn add_reader_native(&mut self, fd: RawFd, callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>) -> PyResult<()> {
+        let entry = self.fd_map.entry(fd).or_insert((None, None));
+
+        if let Some(key) = entry.0 {
+            // Update existing
+            if let Some(handle) = self.readers.get_mut(key) {
+                handle.callback = IoCallback::Native(callback);
+                handle.cancelled = false;
+            }
+        } else {
+            // Add reader (native path)
+            let key = self.readers.insert(Handle {
+                callback: IoCallback::Native(callback),
+                cancelled: false,
+            });
+            entry.0 = Some(key);
+        }
+        Ok(())
+    }
+
     pub fn remove_reader(&mut self, fd: RawFd) -> bool {
         if let Some(entry) = self.fd_map.get_mut(&fd) {
             if let Some(key) = entry.0.take() {
@@ -58,7 +84,7 @@ impl IoHandles {
         false
     }
 
-    pub fn add_writer(&mut self, fd: RawFd, callback: Py<PyAny>) {
+    pub fn add_writer(&mut self, fd: RawFd, callback: IoCallback) {
         let entry = self.fd_map.entry(fd).or_insert((None, None));
 
         if let Some(key) = entry.1 {

@@ -225,6 +225,9 @@ pub struct SSLTransport {
     server_hostname: Option<String>,
     ssl_context: Py<SSLContext>,
     handshake_complete: bool,
+    // Native callbacks
+    read_callback_native: Arc<Mutex<Option<Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>>>>,
+    write_callback_native: Arc<Mutex<Option<Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>>>>,
 }
 
 struct TlsState {
@@ -587,11 +590,15 @@ impl SSLTransport {
         if self_.reading_paused {
             self_.reading_paused = false;
             let fd = self_.fd;
-            drop(self_); // Drop borrow before calling getattr
-            let method = slf.getattr("_read_ready")?;
+            drop(self_); // Drop borrow before calling into loop
+            
+            let slf_clone = slf.clone().unbind();
+            let read_callback = Arc::new(move |py: Python<'_>| {
+                SSLTransport::_read_ready(&slf_clone.bind(py))
+            });
             let self_ = slf.borrow();
             let loop_ = self_.loop_.bind(py).borrow();
-            loop_.add_reader(py, fd, method.unbind())?;
+            loop_.add_reader_native(fd, read_callback)?;
         }
         Ok(())
     }
@@ -619,14 +626,16 @@ impl SSLTransport {
             let mut self_ = slf.borrow_mut();
             self_._force_close(py)?;
         } else if needs_writer {
-            let self_ = slf.borrow();
-            let fd = self_.fd;
-            let method = slf.getattr("_write_ready")?;
-            self_
+            let fd = slf.borrow().fd;
+            let slf_clone = slf.clone().unbind();
+            let write_callback = Arc::new(move |py: Python<'_>| {
+                SSLTransport::_write_ready(&slf_clone.bind(py))
+            });
+            slf.borrow()
                 .loop_
                 .bind(py)
                 .borrow()
-                .add_writer(py, fd, method.unbind())?;
+                .add_writer_native(fd, write_callback)?;
         }
         Ok(())
     }
@@ -671,20 +680,23 @@ impl SSLTransport {
         let conn = &state.connection;
         if conn.wants_write() || !self_.write_buffer.is_empty() {
             let fd = self_.fd;
-            let method = slf.getattr("_write_ready")?;
+            let slf_clone = slf.clone().unbind();
+            let write_callback = Arc::new(move |py: Python<'_>| {
+                SSLTransport::_write_ready(&slf_clone.bind(py))
+            });
             drop(state);
             drop(self_);
             let loop_ = slf.borrow().loop_.clone_ref(py);
             loop_
                 .bind(py)
                 .borrow()
-                .add_writer(py, fd, method.unbind())?;
+                .add_writer_native(fd, write_callback)?;
         }
 
         Ok(())
     }
 
-    fn _write_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
+    pub(crate) fn _write_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
 
         // Get necessary data without holding borrows
@@ -810,7 +822,7 @@ impl SSLTransport {
         Ok(())
     }
 
-    fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
+    pub(crate) fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
 
         // Get protocol reference
@@ -993,25 +1005,22 @@ impl SSLTransport {
                 ))
             })?;
 
-        let transport = Self {
+        Ok(Self {
             fd,
-            tls_state: Mutex::new(TlsState {
-                stream,
-                connection: TlsConnection::Client(connection),
-            }),
+            tls_state: Mutex::new(TlsState { stream, connection: TlsConnection::Client(connection) }),
             protocol,
             loop_,
             closing: false,
             reading_paused: false,
-            write_buffer: Vec::new(),
+            write_buffer: Vec::with_capacity(65536),
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,
             server_hostname,
             ssl_context,
             handshake_complete: false,
-        };
-
-        Ok(transport)
+            read_callback_native: Arc::new(Mutex::new(None)),
+            write_callback_native: Arc::new(Mutex::new(None)),
+        })
     }
 
     pub fn new_server(
@@ -1043,7 +1052,7 @@ impl SSLTransport {
             ))
         })?;
 
-        let transport = Self {
+        Ok(Self {
             fd,
             tls_state: Mutex::new(TlsState {
                 stream,
@@ -1053,14 +1062,14 @@ impl SSLTransport {
             loop_,
             closing: false,
             reading_paused: false,
-            write_buffer: Vec::new(),
+            write_buffer: Vec::with_capacity(65536),
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,
             server_hostname: None,
             ssl_context,
             handshake_complete: false,
-        };
-
-        Ok(transport)
+            read_callback_native: Arc::new(Mutex::new(None)),
+            write_callback_native: Arc::new(Mutex::new(None)),
+        })
     }
 }

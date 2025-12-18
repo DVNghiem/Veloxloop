@@ -21,9 +21,24 @@ pub struct StreamTransport {
     closing: bool,
     // Shared write buffer between StreamWriter and transport
     write_buffer: Arc<Mutex<Vec<u8>>>,
-    // Cached write callback for registering writer
-    write_callback: Arc<Mutex<Option<Py<PyAny>>>>,
+    // Cached write callback for registering writer (native path)
+    write_callback_native: Arc<Mutex<Option<Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>>>>,
 }
+
+/// Native proxy for StreamWriter to trigger writes on StreamTransport
+struct StreamTransportProxy {
+    transport: Py<StreamTransport>,
+}
+
+impl crate::streams::StreamWriterProxy for StreamTransportProxy {
+    fn trigger_write(&self, py: Python<'_>) -> PyResult<()> {
+        let transport = self.transport.bind(py);
+        let mut transport_borrow = transport.borrow_mut();
+        transport_borrow._trigger_write(py)
+    }
+}
+unsafe impl Send for StreamTransportProxy {}
+unsafe impl Sync for StreamTransportProxy {}
 
 #[pymethods]
 impl StreamTransport {
@@ -70,7 +85,7 @@ impl StreamTransport {
         self.closing
     }
 
-    fn _read_ready(&mut self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn _read_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(stream) = self.stream.as_mut() {
             // Read loop: continue reading until WouldBlock to maximize throughput
             loop {
@@ -159,11 +174,10 @@ impl StreamTransport {
                     // If still have data, register writer callback
                     if !buffer.is_empty() {
                         drop(buffer);
-                        if let Some(callback) = self.write_callback.lock().as_ref() {
-                            self.loop_.bind(py).borrow().add_writer(
-                                py,
+                        if let Some(callback) = self.write_callback_native.lock().as_ref() {
+                            self.loop_.bind(py).borrow().add_writer_native(
                                 self.fd,
-                                callback.clone_ref(py),
+                                callback.clone(),
                             )?;
                         }
                     }
@@ -256,19 +270,23 @@ impl StreamTransport {
 
         let transport_py = Py::new(py, transport)?;
 
-        // Cache the write callback
-        let write_ready = transport_py.getattr(py, "_write_ready")?;
+        // Cache the write callback (native path)
+        let transport_clone = transport_py.clone_ref(py);
+        let write_callback = Arc::new(move |py: Python<'_>| {
+            let mut t = transport_clone.bind(py).borrow_mut();
+            t._write_ready(py)
+        });
         transport_py
             .borrow(py)
-            .write_callback
+            .write_callback_native
             .lock()
-            .replace(write_ready);
+            .replace(write_callback);
 
-        // Set the transport reference in the writer
-        writer
-            .bind(py)
-            .borrow()
-            ._set_transport(transport_py.clone_ref(py).into_any());
+        // Set the transport proxy in the writer for native trigger_write
+        let proxy = Arc::new(StreamTransportProxy {
+            transport: transport_py.clone_ref(py),
+        });
+        writer.bind(py).borrow().set_proxy(proxy);
 
         Ok(transport_py)
     }
@@ -341,13 +359,17 @@ impl StreamServer {
                         writer.clone_ref(py),
                     )?;
 
-                    // Register read callback
-                    let read_ready = transport_py.getattr(py, "_read_ready")?;
+                    // Register read callback (native path)
+                    let transport_clone = transport_py.clone_ref(py);
+                    let read_callback = Arc::new(move |py: Python<'_>| {
+                        let mut t = transport_clone.bind(py).borrow_mut();
+                        t._read_ready(py)
+                    });
                     let fd = transport_py.borrow(py).fd;
                     self.loop_
                         .bind(py)
                         .borrow()
-                        .add_reader(py, fd, read_ready)?;
+                        .add_reader_native(fd, read_callback)?;
 
                     // Note: write callback is cached in transport and will be registered when data is written
 
