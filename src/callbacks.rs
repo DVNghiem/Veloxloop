@@ -103,23 +103,41 @@ impl AsyncConnectCallback {
                                     let transport_clone = transport_py.clone_ref(py);
                                     let read_callback = Arc::new(move |py: Python<'_>| {
                                         let b = transport_clone.bind(py);
-                                        let ssl_transport = b.downcast::<crate::transports::ssl::SSLTransport>().map_err(|_| {
-                                            PyErr::new::<pyo3::exceptions::PyTypeError, _>("Expected SSLTransport")
-                                        })?;
-                                        crate::transports::ssl::SSLTransport::_read_ready(ssl_transport)
+                                        let ssl_transport = b
+                                            .cast::<crate::transports::ssl::SSLTransport>()
+                                            .map_err(|_| {
+                                                PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                                                    "Expected SSLTransport",
+                                                )
+                                            })?;
+                                        crate::transports::ssl::SSLTransport::_read_ready(
+                                            ssl_transport,
+                                        )
                                     });
-                                    self.loop_.bind(py).borrow().add_reader_native(fd, read_callback)?;
- 
+                                    self.loop_
+                                        .bind(py)
+                                        .borrow()
+                                        .add_reader_native(fd, read_callback)?;
+
                                     // Add writer for SSL handshake
                                     let transport_clone_w = transport_py.clone_ref(py);
                                     let write_callback = Arc::new(move |py: Python<'_>| {
                                         let b = transport_clone_w.bind(py);
-                                        let ssl_transport = b.downcast::<crate::transports::ssl::SSLTransport>().map_err(|_| {
-                                            PyErr::new::<pyo3::exceptions::PyTypeError, _>("Expected SSLTransport")
-                                        })?;
-                                        crate::transports::ssl::SSLTransport::_write_ready(ssl_transport)
+                                        let ssl_transport = b
+                                            .cast::<crate::transports::ssl::SSLTransport>()
+                                            .map_err(|_| {
+                                                PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                                                    "Expected SSLTransport",
+                                                )
+                                            })?;
+                                        crate::transports::ssl::SSLTransport::_write_ready(
+                                            ssl_transport,
+                                        )
                                     });
-                                    self.loop_.bind(py).borrow().add_writer_native(fd, write_callback)?;
+                                    self.loop_
+                                        .bind(py)
+                                        .borrow()
+                                        .add_writer_native(fd, write_callback)?;
 
                                     Ok((transport_py, protocol.clone_ref(py)))
                                 } else {
@@ -133,8 +151,15 @@ impl AsyncConnectCallback {
 
                                     // Attempt to link StreamReader for direct path if it's a StreamReaderProtocol
                                     if let Ok(reader_attr) = protocol.getattr(py, "_reader") {
-                                        if let Ok(reader) = reader_attr.extract::<Py<crate::streams::StreamReader>>(py) {
-                                            if let Ok(tcp_transport) = transport_py.bind(py).downcast::<crate::transports::tcp::TcpTransport>() {
+                                        if let Ok(reader) =
+                                            reader_attr
+                                                .extract::<Py<crate::streams::StreamReader>>(py)
+                                        {
+                                            if let Ok(tcp_transport) =
+                                                transport_py
+                                                    .bind(py)
+                                                    .cast::<crate::transports::tcp::TcpTransport>()
+                                            {
                                                 tcp_transport.borrow_mut()._link_reader(reader);
                                             }
                                         }
@@ -151,9 +176,13 @@ impl AsyncConnectCallback {
                                     let transport_clone = transport_py.clone_ref(py);
                                     let read_callback = Arc::new(move |py: Python<'_>| {
                                         let b = transport_clone.bind(py);
-                                        let tcp = b.downcast::<crate::transports::tcp::TcpTransport>().map_err(|_| {
-                                            PyErr::new::<pyo3::exceptions::PyTypeError, _>("Expected TcpTransport")
-                                        })?;
+                                        let tcp = b
+                                            .cast::<crate::transports::tcp::TcpTransport>()
+                                            .map_err(|_| {
+                                                PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                                                    "Expected TcpTransport",
+                                                )
+                                            })?;
                                         crate::transports::tcp::TcpTransport::_read_ready(tcp)
                                     });
                                     loop_ref.borrow().add_reader_native(fd, read_callback)?;

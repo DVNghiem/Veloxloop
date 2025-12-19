@@ -9,7 +9,7 @@ use crate::event_loop::VeloxLoop;
 use crate::streams::{StreamReader, StreamWriter};
 use crate::utils::VeloxResult;
 
-/// A high-performance stream-based transport that directly integrates StreamReader/StreamWriter
+/// stream-based transport that directly integrates StreamReader/StreamWriter
 /// This avoids the Protocol API overhead for stream-based communication
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct StreamTransport {
@@ -22,7 +22,7 @@ pub struct StreamTransport {
     // Shared write buffer between StreamWriter and transport
     write_buffer: Arc<Mutex<Vec<u8>>>,
     // Cached write callback for registering writer (native path)
-    write_callback_native: Arc<Mutex<Option<Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>>>>,
+    write_callback: Arc<Mutex<Option<Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>>>>,
 }
 
 /// Native proxy for StreamWriter to trigger writes on StreamTransport
@@ -33,7 +33,7 @@ struct StreamTransportProxy {
 impl crate::streams::StreamWriterProxy for StreamTransportProxy {
     fn trigger_write(&self, py: Python<'_>) -> PyResult<()> {
         let transport = self.transport.bind(py);
-        let mut transport_borrow = transport.borrow_mut();
+        let transport_borrow = transport.borrow_mut();
         transport_borrow._trigger_write(py)
     }
 }
@@ -174,11 +174,11 @@ impl StreamTransport {
                     // If still have data, register writer callback
                     if !buffer.is_empty() {
                         drop(buffer);
-                        if let Some(callback) = self.write_callback_native.lock().as_ref() {
-                            self.loop_.bind(py).borrow().add_writer_native(
-                                self.fd,
-                                callback.clone(),
-                            )?;
+                        if let Some(callback) = self.write_callback.lock().as_ref() {
+                            self.loop_
+                                .bind(py)
+                                .borrow()
+                                .add_writer_native(self.fd, callback.clone())?;
                         }
                     }
                 }
@@ -278,7 +278,7 @@ impl StreamTransport {
         });
         transport_py
             .borrow(py)
-            .write_callback_native
+            .write_callback
             .lock()
             .replace(write_callback);
 

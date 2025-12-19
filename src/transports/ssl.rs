@@ -225,9 +225,6 @@ pub struct SSLTransport {
     server_hostname: Option<String>,
     ssl_context: Py<SSLContext>,
     handshake_complete: bool,
-    // Native callbacks
-    read_callback_native: Arc<Mutex<Option<Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>>>>,
-    write_callback_native: Arc<Mutex<Option<Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>>>>,
 }
 
 struct TlsState {
@@ -591,11 +588,10 @@ impl SSLTransport {
             self_.reading_paused = false;
             let fd = self_.fd;
             drop(self_); // Drop borrow before calling into loop
-            
+
             let slf_clone = slf.clone().unbind();
-            let read_callback = Arc::new(move |py: Python<'_>| {
-                SSLTransport::_read_ready(&slf_clone.bind(py))
-            });
+            let read_callback =
+                Arc::new(move |py: Python<'_>| SSLTransport::_read_ready(&slf_clone.bind(py)));
             let self_ = slf.borrow();
             let loop_ = self_.loop_.bind(py).borrow();
             loop_.add_reader_native(fd, read_callback)?;
@@ -628,9 +624,8 @@ impl SSLTransport {
         } else if needs_writer {
             let fd = slf.borrow().fd;
             let slf_clone = slf.clone().unbind();
-            let write_callback = Arc::new(move |py: Python<'_>| {
-                SSLTransport::_write_ready(&slf_clone.bind(py))
-            });
+            let write_callback =
+                Arc::new(move |py: Python<'_>| SSLTransport::_write_ready(&slf_clone.bind(py)));
             slf.borrow()
                 .loop_
                 .bind(py)
@@ -681,9 +676,8 @@ impl SSLTransport {
         if conn.wants_write() || !self_.write_buffer.is_empty() {
             let fd = self_.fd;
             let slf_clone = slf.clone().unbind();
-            let write_callback = Arc::new(move |py: Python<'_>| {
-                SSLTransport::_write_ready(&slf_clone.bind(py))
-            });
+            let write_callback =
+                Arc::new(move |py: Python<'_>| SSLTransport::_write_ready(&slf_clone.bind(py)));
             drop(state);
             drop(self_);
             let loop_ = slf.borrow().loop_.clone_ref(py);
@@ -1007,7 +1001,10 @@ impl SSLTransport {
 
         Ok(Self {
             fd,
-            tls_state: Mutex::new(TlsState { stream, connection: TlsConnection::Client(connection) }),
+            tls_state: Mutex::new(TlsState {
+                stream,
+                connection: TlsConnection::Client(connection),
+            }),
             protocol,
             loop_,
             closing: false,
@@ -1018,8 +1015,6 @@ impl SSLTransport {
             server_hostname,
             ssl_context,
             handshake_complete: false,
-            read_callback_native: Arc::new(Mutex::new(None)),
-            write_callback_native: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1068,8 +1063,6 @@ impl SSLTransport {
             server_hostname: None,
             ssl_context,
             handshake_complete: false,
-            read_callback_native: Arc::new(Mutex::new(None)),
-            write_callback_native: Arc::new(Mutex::new(None)),
         })
     }
 }

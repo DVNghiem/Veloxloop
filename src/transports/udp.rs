@@ -4,13 +4,11 @@ use pyo3::types::{PyBytes, PyInt, PyString, PyTuple};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::Arc;
 
 use crate::event_loop::VeloxLoop;
 use crate::transports::{DatagramTransport, Transport};
 use crate::utils::VeloxResult;
 
-/// Pure Rust UDP socket wrapper to avoid importing Python's socket module
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct UdpSocketWrapper {
     fd: RawFd,
@@ -62,8 +60,6 @@ pub struct UdpTransport {
     local_addr: Option<SocketAddr>,
     remote_addr: Option<SocketAddr>,
     allow_broadcast: bool,
-    // Native callback
-    read_callback_native: Arc<Mutex<Option<Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>>>>,
 }
 
 impl crate::transports::Transport for UdpTransport {
@@ -395,7 +391,6 @@ impl UdpTransport {
             local_addr,
             remote_addr,
             allow_broadcast: false,
-            read_callback_native: Arc::new(Mutex::new(None)),
         })
     }
 

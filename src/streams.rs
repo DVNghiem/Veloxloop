@@ -98,7 +98,7 @@ impl StreamReader {
     }
 
     /// Internal method to wake up waiting futures
-    fn _wakeup_waiters(&self, py: Python<'_>) -> PyResult<()> {
+    pub(crate) fn _wakeup_waiters(&self, py: Python<'_>) -> PyResult<()> {
         // Collect satisfied futures to avoid holding the lock while calling Python code
         let mut ready_waiters = Vec::new();
         let mut error_waiters = Vec::new();
@@ -410,11 +410,6 @@ impl StreamReader {
 
         Ok(n)
     }
-
-    /// Internal method to get the inner state for direct coupling
-    pub(crate) fn get_inner(&self) -> Arc<Mutex<StreamReaderInner>> {
-        self.inner.clone()
-    }
 }
 
 /// Trait for transport to trigger write flush from StreamWriter without Python
@@ -466,17 +461,6 @@ impl StreamWriter {
     pub fn _set_transport(&self, transport: Py<PyAny>) {
         *self.transport.lock() = Some(transport);
     }
-}
-
-impl StreamWriter {
-    /// Internal method to set the native proxy (Rust path)
-    pub fn set_proxy(&self, proxy: Arc<dyn StreamWriterProxy>) {
-        *self.proxy.lock() = Some(proxy);
-    }
-}
-
-#[pymethods]
-impl StreamWriter {
 
     /// Write data to the buffer and trigger transport write
     pub fn write(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
@@ -610,6 +594,11 @@ impl StreamWriter {
 
 // Impl block outside of pymethods for Rust-only methods
 impl StreamWriter {
+    /// Internal method to set the native proxy (Rust path)
+    pub fn set_proxy(&self, proxy: Arc<dyn StreamWriterProxy>) {
+        *self.proxy.lock() = Some(proxy);
+    }
+
     /// Get the buffer Arc for sharing with transport (Rust-only method)
     pub(crate) fn get_buffer_arc(&self) -> Arc<Mutex<Vec<u8>>> {
         self.buffer.clone()

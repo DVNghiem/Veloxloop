@@ -11,9 +11,7 @@ use super::future::{CompletedFuture, PendingFuture};
 use crate::constants::{DEFAULT_HIGH, DEFAULT_LOW};
 use crate::event_loop::VeloxLoop;
 use crate::transports::{DefaultTransportFactory, StreamTransport, Transport, TransportFactory};
-use crate::utils::VeloxResult;
 
-// Pure Rust socket wrapper to avoid importing Python's socket module
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct SocketWrapper {
     fd: RawFd,
@@ -237,18 +235,21 @@ impl TcpServer {
 
                     // Attempt to link StreamReader for direct path if it's a StreamReaderProtocol
                     if let Ok(reader_attr) = protocol.getattr(py, "_reader") {
-                        if let Ok(reader) = reader_attr.extract::<Py<crate::streams::StreamReader>>(py) {
-                            if let Ok(mut tcp_transport) = transport_py.bind(py).borrow_mut::<crate::transports::tcp::TcpTransport>() {
-                                tcp_transport._link_reader(reader);
+                        if let Ok(reader) =
+                            reader_attr.extract::<Py<crate::streams::StreamReader>>(py)
+                        {
+                            if let Ok(tcp_transport) = transport_py.extract::<Py<TcpTransport>>(py)
+                            {
+                                tcp_transport.bind(py).borrow_mut()._link_reader(reader);
                             }
                         }
                     }
                     // Start reading (native path)
-                    let transport_clone = transport_py.clone_ref(py);
+                    let transport_clone = transport_py.extract::<Py<TcpTransport>>(py)?;
+                    let fd = transport_clone.bind(py).borrow().fd;
                     let read_callback = Arc::new(move |py: Python<'_>| {
                         TcpTransport::_read_ready(&transport_clone.bind(py))
                     });
-                    let fd = transport_py.borrow(py).fd;
                     self.loop_
                         .bind(py)
                         .borrow()
@@ -334,14 +335,10 @@ impl TcpServer {
                 let fd = listener.as_raw_fd();
                 // Register the accept callback (native path)
                 let slf_clone = slf.clone().unbind();
-                let on_accept = Arc::new(move |py: Python<'_>| {
-                    slf_clone.bind(py).borrow()._on_accept(py)
-                });
+                let on_accept =
+                    Arc::new(move |py: Python<'_>| slf_clone.bind(py).borrow()._on_accept(py));
                 let loop_ = slf.borrow().loop_.clone_ref(py);
-                loop_
-                    .bind(py)
-                    .borrow()
-                    .add_reader_native(fd, on_accept)?;
+                loop_.bind(py).borrow().add_reader_native(fd, on_accept)?;
             }
         }
         Ok(())
@@ -362,25 +359,11 @@ pub struct TcpTransport {
     write_buffer_high: usize,
     write_buffer_low: usize,
     // Native callbacks
-    write_callback_native: Arc<Mutex<Option<Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>>>>,
+    write_callback_native:
+        Arc<Mutex<Option<Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>>>>,
     // Direct path to reader
     reader: Option<Py<crate::streams::StreamReader>>,
 }
-
-/// Native proxy for StreamWriter to trigger writes on TcpTransport
-struct TcpTransportProxy {
-    transport: Py<TcpTransport>,
-}
-
-impl crate::streams::StreamWriterProxy for TcpTransportProxy {
-    fn trigger_write(&self, py: Python<'_>) -> PyResult<()> {
-        let transport = self.transport.bind(py);
-        let mut transport_borrow = transport.borrow_mut();
-        transport_borrow._trigger_write(py)
-    }
-}
-unsafe impl Send for TcpTransportProxy {}
-unsafe impl Sync for TcpTransportProxy {}
 
 // Implement Transport trait for TcpTransport
 impl crate::transports::Transport for TcpTransport {
@@ -518,13 +501,12 @@ impl crate::transports::StreamTransport for TcpTransport {
 
     fn read_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         if let Some(reader_py) = &self.reader {
-            if let Some(stream) = self.stream.as_ref() {
+            if let Some(stream) = self.stream.as_mut() {
                 let reader = reader_py.bind(py).borrow();
                 // Read directly using StreamReader's optimized method
-                let mut s = stream;
-                match reader.read_from_socket(py, &mut s) {
+                match reader.read_from_socket(py, stream) {
                     Ok(0) => {
-                        reader.feed_eof_native();
+                        let _ = reader.feed_eof_native(py);
                         reader._wakeup_waiters(py)?;
                         self.close(py)?;
                     }
@@ -679,11 +661,10 @@ impl TcpTransport {
             self_.reading_paused = false;
             let fd = self_.fd;
             drop(self_); // Drop borrow before calling into loop
-            
+
             let slf_clone = slf.clone().unbind();
-            let read_callback = Arc::new(move |py: Python<'_>| {
-                 TcpTransport::_read_ready(&slf_clone.bind(py))
-            });
+            let read_callback =
+                Arc::new(move |py: Python<'_>| TcpTransport::_read_ready(&slf_clone.bind(py)));
             let self_ = slf.borrow();
             let loop_ = self_.loop_.bind(py).borrow();
             loop_.add_reader_native(fd, read_callback)?;
@@ -714,9 +695,8 @@ impl TcpTransport {
             let self_ = slf.borrow();
             let fd = self_.fd;
             let slf_clone = slf.clone().unbind();
-            let write_callback = Arc::new(move |py: Python<'_>| {
-                slf_clone.bind(py).borrow_mut()._write_ready(py)
-            });
+            let write_callback =
+                Arc::new(move |py: Python<'_>| slf_clone.bind(py).borrow_mut()._write_ready(py));
             self_
                 .loop_
                 .bind(py)
@@ -760,14 +740,14 @@ impl TcpTransport {
         if !self.write_buffer.is_empty() {
             // Try immediate write first
             let res = self.write_ready(py);
-            
+
             // If still have data, ensure writer callback is registered
             if !self.write_buffer.is_empty() {
                 if let Some(callback) = self.write_callback_native.lock().as_ref() {
-                    self.loop_.bind(py).borrow().add_writer_native(
-                        self.fd,
-                        callback.clone(),
-                    )?;
+                    self.loop_
+                        .bind(py)
+                        .borrow()
+                        .add_writer_native(self.fd, callback.clone())?;
                 }
             }
             res
@@ -1078,20 +1058,19 @@ impl TcpTransport {
 
     fn add_writer(&self, slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        
+
         // Initialize native callback if not already done
         let mut cb_native = self.write_callback_native.lock();
         if cb_native.is_none() {
             let slf_clone = slf.clone().unbind();
-            let write_callback = Arc::new(move |py: Python<'_>| {
-                slf_clone.bind(py).borrow_mut()._write_ready(py)
-            });
+            let write_callback =
+                Arc::new(move |py: Python<'_>| slf_clone.bind(py).borrow_mut()._write_ready(py));
             *cb_native = Some(write_callback);
         }
-        
+
         let callback = cb_native.as_ref().unwrap().clone();
         drop(cb_native);
-        
+
         self.loop_
             .bind(py)
             .borrow()
