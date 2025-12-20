@@ -1,9 +1,9 @@
 use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyInt, PyString, PyTuple};
-use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::event_loop::VeloxLoop;
 use crate::poller::LoopPoller;
@@ -20,30 +20,37 @@ pub struct Callback {
 }
 
 pub struct CallbackQueue {
-    queue: Mutex<VecDeque<Callback>>,
+    queue: Mutex<Vec<Callback>>,
     poller: Arc<LoopPoller>, // Needed to wake up the loop
+    pub is_polling: AtomicBool, // True when loop is blocked in poll()
 }
 
 impl CallbackQueue {
     pub fn new(poller: Arc<LoopPoller>) -> Self {
         Self {
-            queue: Mutex::new(VecDeque::new()),
+            queue: Mutex::new(Vec::with_capacity(1024)),
             poller,
+            is_polling: AtomicBool::new(false),
         }
     }
 
     pub fn push(&self, callback: Callback) {
         let mut q = self.queue.lock();
-        q.push_back(callback);
-        //  always notify for now to ensure loop wakes up
-        // Poller::notify is cheap on Linux (eventfd write), verifying calling it is safe.
-        // Let's ensure LoopPoller exposes notify.
-        let _ = self.poller.notify();
+        q.push(callback);
+        drop(q);
+
+        // Only notify if the loop is actually polling
+        if self.is_polling.load(Ordering::Relaxed) {
+            let _ = self.poller.notify();
+        }
     }
 
-    pub fn pop_all(&self) -> VecDeque<Callback> {
+    pub fn swap_into(&self, target: &mut Vec<Callback>) {
         let mut q = self.queue.lock();
-        std::mem::take(&mut *q)
+        if q.is_empty() {
+            return;
+        }
+        std::mem::swap(&mut *q, target);
     }
 
     pub fn is_empty(&self) -> bool {

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crate::callbacks::{Callback, CallbackQueue, RemoveWriterCallback, SockConnectCallback};
 use crate::constants::{NI_MAXHOST, NI_MAXSERV};
 use crate::executor::ThreadPoolExecutor;
-use crate::handles::{IoCallback, IoHandles};
+use crate::handles::{Handle, IoCallback, IoHandles};
 use crate::poller::LoopPoller;
 use crate::timers::Timers;
 use crate::transports::future::{CompletedFuture, PendingFuture};
@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[pyclass(subclass, module = "veloxloop._veloxloop")]
 pub struct VeloxLoop {
     poller: Arc<LoopPoller>, // Arc to share with callbacks
-    handles: Mutex<IoHandles>,
+    handles: IoHandles,
     callbacks: Arc<CallbackQueue>,
     timers: Mutex<Timers>,
     running: AtomicBool,
@@ -29,10 +29,12 @@ pub struct VeloxLoop {
     closed: AtomicBool,
     debug: AtomicBool,
     start_time: Instant,
+    last_poll_time: Mutex<Instant>,
     executor: Arc<Mutex<Option<ThreadPoolExecutor>>>,
     exception_handler: Arc<Mutex<Option<Py<PyAny>>>>,
     task_factory: Arc<Mutex<Option<Py<PyAny>>>>,
     async_generators: Arc<Mutex<Vec<Py<PyAny>>>>,
+    callback_buffer: Mutex<Vec<Callback>>,
 }
 
 // Rust-only methods for VeloxLoop
@@ -48,14 +50,14 @@ impl VeloxLoop {
     fn add_reader_internal(&self, fd: RawFd, callback: IoCallback) -> PyResult<()> {
         let poller = self.poller.clone();
 
-        // Lock handles once
-        let mut handles = self.handles.lock();
-        let reader_exists = handles.get_reader(fd).is_some();
-        let writer_exists = handles.get_writer(fd).is_some();
+        let pin = self.handles.map.guard();
+        let pair = self.handles.get_pair(fd, &pin);
+        let reader_exists = pair.as_ref().and_then(|p| p.0.as_ref()).is_some();
+        let writer_exists = pair.as_ref().and_then(|p| p.1.as_ref()).is_some();
+        drop(pin);
 
         // Add or modify
-        handles.add_reader(fd, callback);
-        drop(handles); // Drop lock before poller
+        self.handles.add_reader(fd, callback);
 
         let mut ev = polling::Event::readable(fd as usize);
         if writer_exists {
@@ -81,14 +83,14 @@ impl VeloxLoop {
     fn add_writer_internal(&self, fd: RawFd, callback: IoCallback) -> PyResult<()> {
         let poller = self.poller.clone();
 
-        // Lock handles once
-        let mut handles = self.handles.lock();
-        let reader_exists = handles.get_reader(fd).is_some();
-        let writer_exists = handles.get_writer(fd).is_some();
+        let pin = self.handles.map.guard();
+        let pair = self.handles.get_pair(fd, &pin);
+        let reader_exists = pair.as_ref().and_then(|p| p.0.as_ref()).is_some();
+        let writer_exists = pair.as_ref().and_then(|p| p.1.as_ref()).is_some();
+        drop(pin);
 
         // Add or modify
-        handles.add_writer(fd, callback);
-        drop(handles); // Drop lock before poller
+        self.handles.add_writer(fd, callback);
 
         let mut ev = polling::Event::writable(fd as usize);
         if reader_exists {
@@ -102,6 +104,14 @@ impl VeloxLoop {
         }
         Ok(())
     }
+
+    pub fn add_tcp_reader(&self, fd: RawFd, transport: Py<crate::transports::tcp::TcpTransport>) -> PyResult<()> {
+        self.add_reader_internal(fd, IoCallback::TcpRead(transport))
+    }
+
+    pub fn add_tcp_writer(&self, fd: RawFd, transport: Py<crate::transports::tcp::TcpTransport>) -> PyResult<()> {
+        self.add_writer_internal(fd, IoCallback::TcpWrite(transport))
+    }
 }
 
 #[pymethods]
@@ -114,7 +124,7 @@ impl VeloxLoop {
 
         Ok(Self {
             poller: poller.clone(),
-            handles: Mutex::new(IoHandles::new()),
+            handles: IoHandles::new(),
             callbacks: Arc::new(CallbackQueue::new(poller)),
             timers: Mutex::new(Timers::new()),
             running: AtomicBool::new(false),
@@ -122,10 +132,12 @@ impl VeloxLoop {
             closed: AtomicBool::new(false),
             debug: AtomicBool::new(debug_val),
             start_time: Instant::now(),
+            last_poll_time: Mutex::new(Instant::now()),
             executor: Arc::new(Mutex::new(None)),
             exception_handler: Arc::new(Mutex::new(None)),
             task_factory: Arc::new(Mutex::new(None)),
             async_generators: Arc::new(Mutex::new(Vec::new())),
+            callback_buffer: Mutex::new(Vec::with_capacity(1024)),
         })
     }
 
@@ -163,10 +175,10 @@ impl VeloxLoop {
     }
 
     pub fn remove_reader(&self, _py: Python<'_>, fd: RawFd) -> PyResult<bool> {
-        let mut handles = self.handles.lock();
-        if handles.remove_reader(fd) {
-            let writer_exists = handles.get_writer(fd).is_some();
-            drop(handles);
+        if self.handles.remove_reader(fd) {
+            let pin = self.handles.map.guard();
+            let writer_exists = self.handles.get_writer(fd, &pin).is_some();
+            drop(pin);
 
             if writer_exists {
                 // Downgrade to W only
@@ -187,10 +199,10 @@ impl VeloxLoop {
     }
 
     pub fn remove_writer(&self, _py: Python<'_>, fd: RawFd) -> PyResult<bool> {
-        let mut handles = self.handles.lock();
-        if handles.remove_writer(fd) {
-            let reader_exists = handles.get_reader(fd).is_some();
-            drop(handles);
+        if self.handles.remove_writer(fd) {
+            let pin = self.handles.map.guard();
+            let reader_exists = self.handles.get_reader(fd, &pin).is_some();
+            drop(pin);
 
             if reader_exists {
                 // Downgrade to R only
@@ -1270,149 +1282,133 @@ impl VeloxLoop {
 
 impl VeloxLoop {
     fn _run_once(&self, py: Python<'_>, events: &mut polling::Events) -> VeloxResult<()> {
-        // Calculate Timeout
+        let now = Instant::now();
         let has_callbacks = !self.callbacks.is_empty();
-        let timeout = if has_callbacks {
-            Some(Duration::from_secs(0))
-        } else {
-            let timers = self.timers.lock();
-            if let Some(next) = timers.next_expiry() {
-                // Removed self.timers.next_expiry() to use lock
-                let now = (self.time() * 1_000_000_000.0) as u64;
-                if next > now {
-                    Some(Duration::from_nanos(next - now))
-                } else {
-                    Some(Duration::from_secs(0))
-                }
-            } else {
-                // Default to a small timeout to avoid blocking indefinitely
-                // This allows the loop to check for stop() calls
-                // Use 10ms for better responsiveness
-                Some(Duration::from_millis(10))
-            }
+
+        // Skip-poll logic: if we have callbacks and last poll was recent, don't poll again.
+        let skip_poll = {
+            let last_poll = self.last_poll_time.lock();
+            has_callbacks && now.duration_since(*last_poll).as_nanos() < 50_000
         };
 
-        // Poll
-        match self.poller.poll(events, timeout) {
-            Ok(_) => {}
-            Err(e) => {
-                // Ignore EINTR?
-                return Err(e);
-            }
-        }
-
-        // Process I/O Events - Batch lock acquisition and defer epoll re-arming
-        // First pass: Collect all callbacks with single lock acquisition
-        let mut pending_callbacks: Vec<(
-            std::os::fd::RawFd,
-            Option<clone_choice::Choice>,
-            Option<clone_choice::Choice>,
-            bool,
-            bool,
-        )> = Vec::with_capacity(events.len());
-
-        mod clone_choice {
-            use super::*;
-            pub enum Choice {
-                Python(Py<PyAny>),
-                Native(Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>),
-            }
-        }
-
-        {
-            let handles = self.handles.lock();
-            for event in events.iter() {
-                let fd = event.key as std::os::fd::RawFd;
-
-                let reader_cb = if event.readable {
-                    if let Some(handle) = handles.get_reader(fd) {
-                        if !handle.cancelled {
-                            match &handle.callback {
-                                IoCallback::Python(cb) => {
-                                    Some(clone_choice::Choice::Python(cb.clone_ref(py)))
-                                }
-                                IoCallback::Native(cb) => {
-                                    Some(clone_choice::Choice::Native(cb.clone()))
-                                }
-                            }
-                        } else {
-                            None
-                        }
+        if !skip_poll {
+            // Calculate Timeout
+            let timeout = if has_callbacks {
+                Some(Duration::from_secs(0))
+            } else {
+                let timers = self.timers.lock();
+                if let Some(next) = timers.next_expiry() {
+                    let now_ns = (self.time() * 1_000_000_000.0) as u64;
+                    if next > now_ns {
+                        Some(Duration::from_nanos(next - now_ns))
                     } else {
-                        None
+                        Some(Duration::from_secs(0))
                     }
                 } else {
-                    None
-                };
+                    Some(Duration::from_millis(10))
+                }
+            };
 
-                let writer_cb = if event.writable {
-                    if let Some(handle) = handles.get_writer(fd) {
-                        if !handle.cancelled {
-                            match &handle.callback {
-                                IoCallback::Python(cb) => {
-                                    Some(clone_choice::Choice::Python(cb.clone_ref(py)))
-                                }
-                                IoCallback::Native(cb) => {
-                                    Some(clone_choice::Choice::Native(cb.clone()))
-                                }
-                            }
+            // Poll
+            self.callbacks.is_polling.store(true, Ordering::Release);
+            let res = self.poller.poll(events, timeout);
+            self.callbacks.is_polling.store(false, Ordering::Release);
+
+            match res {
+                Ok(_) => {
+                    let mut last_poll = self.last_poll_time.lock();
+                    *last_poll = Instant::now();
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Process I/O Events
+        if events.len() > 0 {
+            let mut pending: Vec<(RawFd, Option<Arc<Handle>>, Option<Arc<Handle>>, bool, bool)> =
+                Vec::with_capacity(events.len());
+
+            {
+                let pin = self.handles.map.guard();
+                for event in events.iter() {
+                    let fd = event.key as RawFd;
+                    let pair = self.handles.get_pair(fd, &pin);
+
+                    if let Some((r_handle, w_handle)) = pair {
+                        let reader_cb = if event.readable {
+                            r_handle.as_ref().filter(|h| !h.cancelled).cloned()
                         } else {
                             None
-                        }
-                    } else {
-                        None
+                        };
+                        let writer_cb = if event.writable {
+                            w_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                        } else {
+                            None
+                        };
+
+                        pending.push((
+                            fd,
+                            reader_cb,
+                            writer_cb,
+                            r_handle.is_some(),
+                            w_handle.is_some(),
+                        ));
                     }
-                } else {
-                    None
-                };
-
-                // Track if we need to re-arm this FD
-                let has_reader = handles.get_reader(fd).is_some();
-                let has_writer = handles.get_writer(fd).is_some();
-
-                pending_callbacks.push((fd, reader_cb, writer_cb, has_reader, has_writer));
-            }
-        } // Lock released before dispatching callbacks
-
-        // Second pass: Dispatch callbacks (without holding lock)
-        for (_, reader_cb, writer_cb, _, _) in &pending_callbacks {
-            if let Some(cb) = reader_cb {
-                let res = match cb {
-                    clone_choice::Choice::Python(cb) => cb.call0(py).map(|_| ()),
-                    clone_choice::Choice::Native(cb) => cb(py),
-                };
-                if let Err(e) = res {
-                    e.print(py);
                 }
             }
-            if let Some(cb) = writer_cb {
-                let res = match cb {
-                    clone_choice::Choice::Python(cb) => cb.call0(py).map(|_| ()),
-                    clone_choice::Choice::Native(cb) => cb(py),
-                };
-                if let Err(e) = res {
-                    e.print(py);
+
+            // Dispatch I/O
+            for (_, r_h, w_h, _, _) in &pending {
+                if let Some(h) = r_h {
+                    let res = match &h.callback {
+                        IoCallback::Python(cb) => cb.call0(py).map(|_| ()),
+                        IoCallback::Native(cb) => cb(py),
+                        IoCallback::TcpRead(tcp) => {
+                            crate::transports::tcp::TcpTransport::_read_ready(tcp.bind(py))
+                        }
+                        IoCallback::TcpWrite(tcp) => {
+                            let tcp_bound = tcp.bind(py);
+                            crate::transports::tcp::TcpTransport::_write_ready(&mut *tcp_bound.borrow_mut(), py)
+                        }
+                    };
+                    if let Err(e) = res {
+                        e.print(py);
+                    }
+                }
+                if let Some(h) = w_h {
+                    let res = match &h.callback {
+                        IoCallback::Python(cb) => cb.call0(py).map(|_| ()),
+                        IoCallback::Native(cb) => cb(py),
+                        IoCallback::TcpRead(tcp) => {
+                            crate::transports::tcp::TcpTransport::_read_ready(tcp.bind(py))
+                        }
+                        IoCallback::TcpWrite(tcp) => {
+                            let tcp_bound = tcp.bind(py);
+                            crate::transports::tcp::TcpTransport::_write_ready(&mut *tcp_bound.borrow_mut(), py)
+                        }
+                    };
+                    if let Err(e) = res {
+                        e.print(py);
+                    }
+                }
+            }
+
+            // Re-arm FDs
+            for (fd, _, _, has_r, has_w) in pending {
+                if has_r || has_w {
+                    let mut ev = if has_r {
+                        polling::Event::readable(fd as usize)
+                    } else {
+                        polling::Event::writable(fd as usize)
+                    };
+                    if has_r && has_w {
+                        ev.writable = true;
+                    }
+                    let _ = self.poller.modify(fd, ev);
                 }
             }
         }
 
-        // Third pass: Batch re-arm all FDs (oneshot support for polling v3)
-        for (fd, _, _, has_reader, has_writer) in pending_callbacks {
-            if has_reader || has_writer {
-                let ev = if has_reader && has_writer {
-                    let mut e = polling::Event::readable(fd as usize);
-                    e.writable = true;
-                    e
-                } else if has_reader {
-                    polling::Event::readable(fd as usize)
-                } else {
-                    polling::Event::writable(fd as usize)
-                };
-
-                // Ignore errors (e.g. if concurrently closed)
-                let _ = self.poller.modify(fd, ev);
-            }
-        }
         // Process Timers
         let now_ns = (self.time() * 1_000_000_000.0) as u64;
         let expired = self.timers.lock().pop_expired(now_ns);
@@ -1424,8 +1420,11 @@ impl VeloxLoop {
         }
 
         // Process Callbacks (call_soon)
-        let callbacks = self.callbacks.pop_all();
-        for cb in callbacks {
+        let mut cb_batch = self.callback_buffer.lock();
+        cb_batch.clear();
+        self.callbacks.swap_into(&mut *cb_batch);
+
+        for cb in cb_batch.drain(..) {
             let _ = cb.callback.bind(py).call(PyTuple::new(py, cb.args)?, None);
         }
 

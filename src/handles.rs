@@ -1,12 +1,31 @@
+use papaya::{HashMap, Operation};
 use pyo3::prelude::*;
-use rustc_hash::FxHashMap;
-use slab::Slab;
 use std::os::fd::RawFd;
 use std::sync::Arc;
 
 pub enum IoCallback {
     Python(Py<PyAny>),
     Native(Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>),
+    // Specialized handlers for common transports
+    TcpRead(Py<crate::transports::tcp::TcpTransport>),
+    TcpWrite(Py<crate::transports::tcp::TcpTransport>),
+}
+
+impl Clone for IoCallback {
+    fn clone(&self) -> Self {
+        match self {
+            IoCallback::Python(cb) => {
+                Python::attach(|py| IoCallback::Python(cb.clone_ref(py)))
+            }
+            IoCallback::Native(cb) => IoCallback::Native(cb.clone()),
+            IoCallback::TcpRead(cb) => {
+                Python::attach(|py| IoCallback::TcpRead(cb.clone_ref(py)))
+            }
+            IoCallback::TcpWrite(cb) => {
+                Python::attach(|py| IoCallback::TcpWrite(cb.clone_ref(py)))
+            }
+        }
+    }
 }
 
 pub struct Handle {
@@ -15,98 +34,106 @@ pub struct Handle {
 }
 
 pub struct IoHandles {
-    readers: Slab<Handle>,
-    writers: Slab<Handle>,
-    // Mapping from FD to Slab Key for fast lookup
-    fd_map: FxHashMap<RawFd, (Option<usize>, Option<usize>)>,
+    // Maps FD to (Reader, Writer)
+    pub(crate) map: HashMap<RawFd, (Option<Arc<Handle>>, Option<Arc<Handle>>)>,
 }
 
 impl IoHandles {
     pub fn new() -> Self {
         Self {
-            readers: Slab::new(),
-            writers: Slab::new(),
-            fd_map: FxHashMap::default(),
+            map: HashMap::new(),
         }
     }
 
-    pub fn add_reader(&mut self, fd: RawFd, callback: IoCallback) {
-        let entry = self.fd_map.entry(fd).or_insert((None, None));
-
-        if let Some(key) = entry.0 {
-            // Update existing
-            if let Some(handle) = self.readers.get_mut(key) {
-                handle.callback = callback;
-                handle.cancelled = false;
-            }
-        } else {
-            // Insert new
-            let key = self.readers.insert(Handle {
-                callback,
-                cancelled: false,
-            });
-            entry.0 = Some(key);
-        }
+    pub fn add_reader(&self, fd: RawFd, callback: IoCallback) {
+        let pin = self.map.guard();
+        self.map.compute(
+            fd,
+            |prev| {
+                let mut pair = prev.map(|(_k, v)| v.clone()).unwrap_or((None, None));
+                pair.0 = Some(Arc::new(Handle {
+                    callback: callback.clone(),
+                    cancelled: false,
+                }));
+                Operation::<_, ()>::Insert(pair)
+            },
+            &pin,
+        );
     }
 
-    pub fn remove_reader(&mut self, fd: RawFd) -> bool {
-        if let Some(entry) = self.fd_map.get_mut(&fd) {
-            if let Some(key) = entry.0.take() {
-                self.readers.remove(key);
-                // If both reader and writer are gone, we could remove the map entry,
-                // but for now keeping it is fine (minor memory) or we can clean up.
-                if entry.1.is_none() {
-                    self.fd_map.remove(&fd);
+    pub fn remove_reader(&self, fd: RawFd) -> bool {
+        let pin = self.map.guard();
+        let mut existed = false;
+        self.map.compute(
+            fd,
+            |prev| {
+                if let Some((_k, v)) = prev {
+                    let mut pair = v.clone();
+                    if pair.0.is_some() {
+                        existed = true;
+                        pair.0 = None;
+                        if pair.1.is_none() {
+                            return Operation::Remove;
+                        }
+                        return Operation::<_, ()>::Insert(pair);
+                    }
                 }
-                return true;
-            }
-        }
-        false
+                Operation::Abort(())
+            },
+            &pin,
+        );
+        existed
     }
 
-    pub fn add_writer(&mut self, fd: RawFd, callback: IoCallback) {
-        let entry = self.fd_map.entry(fd).or_insert((None, None));
-
-        if let Some(key) = entry.1 {
-            // Update existing
-            if let Some(handle) = self.writers.get_mut(key) {
-                handle.callback = callback;
-                handle.cancelled = false;
-            }
-        } else {
-            // Insert new
-            let key = self.writers.insert(Handle {
-                callback,
-                cancelled: false,
-            });
-            entry.1 = Some(key);
-        }
+    pub fn add_writer(&self, fd: RawFd, callback: IoCallback) {
+        let pin = self.map.guard();
+        self.map.compute(
+            fd,
+            |prev| {
+                let mut pair = prev.map(|(_k, v)| v.clone()).unwrap_or((None, None));
+                pair.1 = Some(Arc::new(Handle {
+                    callback: callback.clone(),
+                    cancelled: false,
+                }));
+                Operation::<_, ()>::Insert(pair)
+            },
+            &pin,
+        );
     }
 
-    pub fn remove_writer(&mut self, fd: RawFd) -> bool {
-        if let Some(entry) = self.fd_map.get_mut(&fd) {
-            if let Some(key) = entry.1.take() {
-                self.writers.remove(key);
-                if entry.0.is_none() {
-                    self.fd_map.remove(&fd);
+    pub fn remove_writer(&self, fd: RawFd) -> bool {
+        let pin = self.map.guard();
+        let mut existed = false;
+        self.map.compute(
+            fd,
+            |prev| {
+                if let Some((_k, v)) = prev {
+                    let mut pair = v.clone();
+                    if pair.1.is_some() {
+                        existed = true;
+                        pair.1 = None;
+                        if pair.0.is_none() {
+                            return Operation::Remove;
+                        }
+                        return Operation::<_, ()>::Insert(pair);
+                    }
                 }
-                return true;
-            }
-        }
-        false
+                Operation::Abort(())
+            },
+            &pin,
+        );
+        existed
     }
 
-    pub fn get_reader(&self, fd: RawFd) -> Option<&Handle> {
-        self.fd_map
-            .get(&fd)
-            .and_then(|(r, _)| *r)
-            .and_then(|key| self.readers.get(key))
+    pub fn get_reader(&self, fd: RawFd, pin: &impl papaya::Guard) -> Option<Arc<Handle>> {
+        self.map.get(&fd, pin).and_then(|v| v.0.as_ref().cloned())
     }
 
-    pub fn get_writer(&self, fd: RawFd) -> Option<&Handle> {
-        self.fd_map
-            .get(&fd)
-            .and_then(|(_, w)| *w)
-            .and_then(|key| self.writers.get(key))
+    pub fn get_writer(&self, fd: RawFd, pin: &impl papaya::Guard) -> Option<Arc<Handle>> {
+        self.map.get(&fd, pin).and_then(|v| v.1.as_ref().cloned())
+    }
+
+    pub fn get_pair(&self, fd: RawFd, pin: &impl papaya::Guard) -> Option<(Option<Arc<Handle>>, Option<Arc<Handle>>)> {
+        self.map.get(&fd, pin).map(|v| ((*v).0.clone(), (*v).1.clone()))
     }
 }
