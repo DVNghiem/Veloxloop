@@ -6,7 +6,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 
 use crate::event_loop::VeloxLoop;
-use crate::transports::{DatagramTransport, Transport};
+use crate::transports::Transport;
 use crate::utils::VeloxResult;
 
 #[pyclass(module = "veloxloop._veloxloop")]
@@ -214,22 +214,26 @@ impl UdpTransport {
 
     fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        {
-            let self_ = slf.borrow();
+        let protocol = {
+            let mut self_ = slf.borrow_mut();
             if self_.closing {
                 return Ok(());
             }
-        }
-
-        {
-            let mut self_ = slf.borrow_mut();
-            // Delegate to trait implementation
-            DatagramTransport::close(&mut *self_, py)?;
-        }
+            self_.closing = true;
+            self_._force_close_internal(py)?;
+            self_.protocol.clone_ref(py)
+        };
+        let _ = protocol.call_method1(py, "connection_lost", (py.None(),));
         Ok(())
     }
 
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
+        self._force_close_internal(py)?;
+        let _ = self.protocol.call_method1(py, "connection_lost", (py.None(),));
+        Ok(())
+    }
+
+    fn _force_close_internal(&mut self, py: Python<'_>) -> PyResult<()> {
         let fd = self.fd;
 
         let loop_ = self.loop_.bind(py).borrow();
@@ -237,11 +241,6 @@ impl UdpTransport {
         drop(loop_);
 
         *self.socket.lock() = None;
-
-        // Notify Protocol
-        let _ = self
-            .protocol
-            .call_method1(py, "connection_lost", (py.None(),));
         Ok(())
     }
 

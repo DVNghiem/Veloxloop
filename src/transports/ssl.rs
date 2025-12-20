@@ -365,7 +365,7 @@ impl crate::transports::StreamTransport for SSLTransport {
     }
 
     fn force_close(&mut self, py: Python<'_>) -> PyResult<()> {
-        self._force_close(py)
+        self._force_close_internal(py)
     }
 
     fn write(&mut self, _py: Python<'_>, data: &[u8]) -> PyResult<()> {
@@ -601,27 +601,31 @@ impl SSLTransport {
 
     fn close(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
+        let mut protocol = None;
+        let mut needs_writer = false;
+
         {
-            let self_ = slf.borrow();
+            let mut self_ = slf.borrow_mut();
             if self_.closing {
                 return Ok(());
             }
-        }
 
-        let needs_writer;
-        let should_force_close;
-
-        {
-            let mut self_ = slf.borrow_mut();
             self_.closing = true;
-            should_force_close = self_.write_buffer.is_empty();
-            needs_writer = !self_.write_buffer.is_empty();
+
+            if self_.write_buffer.is_empty() {
+                self_._force_close_internal(py)?;
+                protocol = Some(self_.protocol.clone_ref(py));
+            } else {
+                needs_writer = true;
+            }
         }
 
-        if should_force_close {
-            let mut self_ = slf.borrow_mut();
-            self_._force_close(py)?;
-        } else if needs_writer {
+        // Notify protocol after dropping borrow
+        if let Some(proto) = protocol {
+            let _ = proto.call_method1(py, "connection_lost", (py.None(),));
+        }
+
+        if needs_writer {
             let fd = slf.borrow().fd;
             let slf_clone = slf.clone().unbind();
             let write_callback =
@@ -635,12 +639,24 @@ impl SSLTransport {
         Ok(())
     }
 
-    fn abort(&mut self, py: Python<'_>) -> PyResult<()> {
-        // Immediate close without flushing
-        self._force_close(py)
+    fn abort(slf: &Bound<'_, Self>) -> PyResult<()> {
+        let py = slf.py();
+        let protocol = {
+            let mut self_ = slf.borrow_mut();
+            self_._force_close_internal(py)?;
+            self_.protocol.clone_ref(py)
+        };
+        let _ = protocol.call_method1(py, "connection_lost", (py.None(),));
+        Ok(())
     }
 
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
+        self._force_close_internal(py)?;
+        let _ = self.protocol.call_method1(py, "connection_lost", (py.None(),));
+        Ok(())
+    }
+
+    fn _force_close_internal(&mut self, py: Python<'_>) -> PyResult<()> {
         let fd = self.fd;
 
         let loop_ = self.loop_.bind(py).borrow();
@@ -649,10 +665,6 @@ impl SSLTransport {
         drop(loop_);
 
         // Stream will be dropped when tls_state is dropped
-
-        let _ = self
-            .protocol
-            .call_method1(py, "connection_lost", (py.None(),));
         Ok(())
     }
 
