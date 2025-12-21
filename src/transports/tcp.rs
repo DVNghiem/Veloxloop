@@ -2,6 +2,7 @@ use bytes::BytesMut;
 use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
@@ -351,13 +352,16 @@ pub struct TcpTransport {
     loop_: Py<VeloxLoop>,
     state: TransportState,
     // Buffer for outgoing data
-    write_buffer: BytesMut,
+    write_buffer: RefCell<BytesMut>,
     // Write buffer limits (high water mark, low water mark)
     write_buffer_high: usize,
     write_buffer_low: usize,
     // Direct path to reader
     reader: Option<Py<crate::streams::StreamReader>>,
 }
+
+unsafe impl Send for TcpTransport {}
+unsafe impl Sync for TcpTransport {}
 
 // Implement Transport trait for TcpTransport
 impl crate::transports::Transport for TcpTransport {
@@ -421,7 +425,7 @@ impl crate::transports::StreamTransport for TcpTransport {
         }
         self.state.insert(TransportState::CLOSING);
 
-        if self.write_buffer.is_empty() {
+        if self.write_buffer.borrow().is_empty() {
             self.force_close(py)?;
         } else {
             // Writer will be added to flush buffer
@@ -441,10 +445,10 @@ impl crate::transports::StreamTransport for TcpTransport {
                 }
                 Ok(n) => {
                     // Partial write - use extend for VecDeque
-                    self.write_buffer.extend(&data[n..]);
+                    self.write_buffer.borrow_mut().extend(&data[n..]);
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.write_buffer.extend(data);
+                    self.write_buffer.borrow_mut().extend(data);
                 }
                 Err(e) => {
                     return Err(e.into());
@@ -462,7 +466,7 @@ impl crate::transports::StreamTransport for TcpTransport {
     }
 
     fn get_write_buffer_size(&self) -> usize {
-        self.write_buffer.len()
+        self.write_buffer.borrow().len()
     }
 
     fn set_write_buffer_limits(
@@ -485,7 +489,7 @@ impl crate::transports::StreamTransport for TcpTransport {
         self.write_buffer_high = high_limit;
         self.write_buffer_low = low_limit;
 
-        if high_limit > 0 && self.write_buffer.len() > self.write_buffer_high {
+        if high_limit > 0 && self.write_buffer.borrow().len() > self.write_buffer_high {
             let _ = self.protocol.call_method0(py, "pause_writing");
         }
 
@@ -548,8 +552,8 @@ impl crate::transports::StreamTransport for TcpTransport {
         let mut should_finalize = false;
         if let Some(stream) = self.stream.as_mut() {
             // Try to write as much as possible in one go
-            while !self.write_buffer.is_empty() {
-                let data = &self.write_buffer[..];
+            while !self.write_buffer.borrow().is_empty() {
+                let data = &self.write_buffer.borrow()[..];
 
                 match stream.write(data) {
                     Ok(0) => {
@@ -558,8 +562,8 @@ impl crate::transports::StreamTransport for TcpTransport {
                         ));
                     }
                     Ok(n) => {
-                        let _ = self.write_buffer.split_to(n);
-                        if self.write_buffer.is_empty() {
+                        let _ = self.write_buffer.borrow_mut().split_to(n);
+                        if self.write_buffer.borrow().is_empty() {
                             let fd = self.fd;
                             self.loop_.bind(py).borrow().remove_writer(py, fd)?;
 
@@ -689,7 +693,7 @@ impl TcpTransport {
 
             self_.state.insert(TransportState::CLOSING);
 
-            if self_.write_buffer.is_empty() {
+            if self_.write_buffer.borrow().is_empty() {
                 self_._force_close_internal(py)?;
                 protocol = Some(self_.protocol.clone_ref(py));
             } else {
@@ -766,12 +770,12 @@ impl TcpTransport {
             return Ok(());
         }
 
-        if !self_.write_buffer.is_empty() {
+        if !self_.write_buffer.borrow().is_empty() {
             // Try immediate write first
             let res = self_._write_ready(py);
 
             // If still have data, ensure writer callback is registered
-            if !self_.write_buffer.is_empty() {
+            if !self_.write_buffer.borrow().is_empty() {
                 let fd = self_.fd;
                 let loop_ = self_.loop_.clone_ref(py);
                 drop(self_); // Drop borrow before calling into loop
@@ -799,7 +803,7 @@ impl TcpTransport {
         StreamTransport::write(&mut *self_, slf.py(), bytes)?;
 
         // Register writer if needed
-        if !self_.write_buffer.is_empty() {
+        if !self_.write_buffer.borrow().is_empty() {
             let fd = self_.fd;
             let loop_ = self_.loop_.clone_ref(slf.py());
             drop(self_);
@@ -1103,7 +1107,7 @@ impl TcpTransport {
             protocol,
             loop_,
             state: TransportState::ACTIVE,
-            write_buffer: BytesMut::with_capacity(65536),
+            write_buffer: RefCell::new(BytesMut::with_capacity(65536)),
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,
             reader: None,

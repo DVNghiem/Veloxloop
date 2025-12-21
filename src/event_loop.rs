@@ -1,6 +1,7 @@
 use pyo3::types::{PyDict, PyTuple};
 use pyo3::{IntoPyObjectExt, prelude::*};
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,7 @@ pub struct VeloxLoop {
     task_factory: RefCell<Option<Py<PyAny>>>,
     async_generators: RefCell<Vec<Py<PyAny>>>,
     callback_buffer: RefCell<Vec<Callback>>,
+    pending_ios: RefCell<Vec<(RawFd, Option<Handle>, Option<Handle>, bool, bool)>>,
 }
 
 unsafe impl Send for VeloxLoop {}
@@ -148,6 +150,7 @@ impl VeloxLoop {
             task_factory: RefCell::new(None),
             async_generators: RefCell::new(Vec::new()),
             callback_buffer: RefCell::new(Vec::with_capacity(1024)),
+            pending_ios: RefCell::new(Vec::with_capacity(128)),
         })
     }
 
@@ -1361,8 +1364,8 @@ impl VeloxLoop {
 
         // Process I/O Events
         if events.len() > 0 {
-            let mut pending: Vec<(RawFd, Option<Handle>, Option<Handle>, bool, bool)> =
-                Vec::with_capacity(events.len());
+            let mut pending = self.pending_ios.borrow_mut();
+            pending.clear();
 
             {
                 let handles = self.handles.borrow();
@@ -1394,7 +1397,7 @@ impl VeloxLoop {
             }
 
             // Dispatch I/O
-            for (_, r_h, w_h, _, _) in &pending {
+            for (_, r_h, w_h, _, _) in pending.iter() {
                 if let Some(h) = r_h {
                     let res = match &h.callback {
                         IoCallback::Python(cb) => cb.call0(py).map(|_| ()),
@@ -1434,19 +1437,25 @@ impl VeloxLoop {
                     }
                 }
             }
+            let mut modified_fds: HashSet<i32> = HashSet::new();
 
             // Re-arm FDs
-            for (fd, _, _, has_r, has_w) in pending {
-                if has_r || has_w {
-                    let mut ev = if has_r {
-                        polling::Event::readable(fd as usize)
+            for (fd, _, _, has_r, has_w) in pending.iter() {
+                if *has_r || *has_w {
+                    let mut ev = if *has_r {
+                        polling::Event::readable(*fd as usize)
                     } else {
-                        polling::Event::writable(fd as usize)
+                        polling::Event::writable(*fd as usize)
                     };
-                    if has_r && has_w {
+                    if *has_r && *has_w {
                         ev.writable = true;
                     }
-                    let _ = self.poller.borrow_mut().modify(fd, ev);
+                    if !modified_fds.contains(fd) {
+                        // Check if we actually need to modify
+                        // (Implementation would track previous interests in IoHandles)
+                        let _ = self.poller.borrow_mut().modify(*fd, ev);
+                        modified_fds.insert(*fd);
+                    }
                 }
             }
         }

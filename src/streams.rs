@@ -9,15 +9,21 @@ use pyo3::IntoPyObjectExt;
 #[allow(unused)]
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use std::cell::RefCell;
 use std::io::Read;
 use std::sync::Arc;
 
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct StreamReader {
-    pub(crate) inner: Arc<Mutex<StreamReaderInner>>,
+    pub(crate) inner: RefCell<StreamReaderInner>,
     /// Maximum buffer size before pausing
     pub(crate) limit: usize,
 }
+
+// Safety: StreamReader is only used in single-threaded Python context
+// PyO3 requires Send+Sync for #[pyclass], but we never actually send across threads
+unsafe impl Send for StreamReader {}
+unsafe impl Sync for StreamReader {}
 
 pub(crate) struct StreamReaderInner {
     pub(crate) buffer: BytesMut,
@@ -49,12 +55,12 @@ impl StreamReader {
     #[pyo3(signature = (limit=None))]
     pub fn new(limit: Option<usize>) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(StreamReaderInner {
+            inner: RefCell::new(StreamReaderInner {
                 buffer: BytesMut::with_capacity(DEFAULT_LIMIT),
                 eof: false,
                 exception: None,
                 waiters: Vec::new(),
-            })),
+            }),
             limit: limit.unwrap_or(DEFAULT_LIMIT),
         }
     }
@@ -75,7 +81,7 @@ impl StreamReader {
         }
 
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.inner.borrow_mut();
             inner.feed_data(data);
         }
 
@@ -92,7 +98,7 @@ impl StreamReader {
     /// Signal EOF from Rust and wake up all waiters
     pub fn feed_eof_native(&self, py: Python<'_>) -> PyResult<()> {
         {
-            let mut inner = self.inner.lock();
+            let mut inner = self.inner.borrow_mut();
             inner.feed_eof();
         }
         self._wakeup_waiters(py)?;
@@ -101,12 +107,12 @@ impl StreamReader {
 
     /// Internal method to wake up waiting futures
     pub(crate) fn _wakeup_waiters(&self, py: Python<'_>) -> PyResult<()> {
-        // Collect satisfied futures to avoid holding the lock while calling Python code
+        // Collect satisfied futures to avoid holding the borrow while calling Python code
         let mut ready_waiters = Vec::new();
         let mut error_waiters = Vec::new();
 
         {
-            let mut inner_guard = self.inner.lock();
+            let mut inner_guard = self.inner.borrow_mut();
             let inner = &mut *inner_guard;
 
             // Check for exception first
@@ -166,7 +172,7 @@ impl StreamReader {
     }
 
     fn _try_readuntil(&self, py: Python<'_>, separator: &[u8]) -> PyResult<Option<Py<PyAny>>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.borrow_mut();
         if let Some(msg) = &inner.exception {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(msg.clone()));
         }
@@ -180,7 +186,7 @@ impl StreamReader {
     }
 
     fn _try_readexactly(&self, py: Python<'_>, n: usize) -> PyResult<Option<Py<PyAny>>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.borrow_mut();
         if let Some(msg) = &inner.exception {
             return Err(pyo3::exceptions::PyRuntimeError::new_err(msg.clone()));
         }
@@ -195,26 +201,26 @@ impl StreamReader {
 
     /// Set an exception message to be raised on next read
     pub fn set_exception(&self, message: String) -> PyResult<()> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.borrow_mut();
         inner.exception = Some(message);
         Ok(())
     }
 
     /// Get the current exception message (if any)
     pub fn exception(&self) -> Option<String> {
-        self.inner.lock().exception.clone()
+        self.inner.borrow().exception.clone()
     }
 
     /// Check if at EOF
     pub fn at_eof(&self) -> bool {
-        let inner = self.inner.lock();
+        let inner = self.inner.borrow();
         inner.eof && inner.buffer.is_empty()
     }
 
     /// Read up to n bytes
     #[pyo3(signature = (n=-1))]
     pub fn read(&self, py: Python<'_>, n: isize) -> PyResult<Py<PyAny>> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.borrow_mut();
 
         // Check for exception
         if let Some(exc_msg) = inner.exception.take() {
@@ -245,7 +251,7 @@ impl StreamReader {
                 // Create a pending future
                 let future = Py::new(py, PendingFuture::new())?;
                 self.inner
-                    .lock()
+                    .borrow_mut()
                     .waiters
                     .push((WaiterType::ReadExactly(n), future.clone_ref(py)));
                 Ok(future.into_any())
@@ -268,7 +274,7 @@ impl StreamReader {
             None => {
                 // Create a pending future
                 let future = Py::new(py, PendingFuture::new())?;
-                self.inner.lock().waiters.push((
+                self.inner.borrow_mut().waiters.push((
                     WaiterType::ReadUntil(separator.to_vec()),
                     future.clone_ref(py),
                 ));
@@ -286,7 +292,7 @@ impl StreamReader {
                 // Create a pending future
                 let future = Py::new(py, PendingFuture::new())?;
                 self.inner
-                    .lock()
+                    .borrow_mut()
                     .waiters
                     .push((WaiterType::ReadLine, future.clone_ref(py)));
                 Ok(future.into_any())
@@ -301,11 +307,11 @@ impl StreamReader {
 
     /// Get current buffer size
     pub fn buffer_size(&self) -> usize {
-        self.inner.lock().buffer.len()
+        self.inner.borrow().buffer.len()
     }
 
     fn __repr__(&self) -> String {
-        let inner = self.inner.lock();
+        let inner = self.inner.borrow();
         format!(
             "<StreamReader buffer_len={} eof={}>",
             inner.buffer.len(),
@@ -388,7 +394,7 @@ impl StreamReader {
                 }
                 Ok(n) => {
                     total_read += n;
-                    let mut inner = self.inner.lock();
+                    let mut inner = self.inner.borrow_mut();
                     inner.buffer.extend_from_slice(&temp[..n]);
                     drop(inner);
                 }
