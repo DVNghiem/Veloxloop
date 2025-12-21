@@ -217,7 +217,8 @@ impl StreamReader {
         inner.eof && inner.buffer.is_empty()
     }
 
-    /// Read up to n bytes
+    /// Read up to n bytes synchronously from buffer
+    /// Returns immediately with available data (does not wait for more data)
     #[pyo3(signature = (n=-1))]
     pub fn read(&self, py: Python<'_>, n: isize) -> PyResult<Py<PyAny>> {
         let mut inner = self.inner.borrow_mut();
@@ -374,14 +375,16 @@ impl StreamReader {
         Ok(None)
     }
 
-    // Zero-copy read from socket
+    /// Optimized zero-copy read from socket
+    /// Uses larger buffer (128KB) for better large message performance
     pub(crate) fn read_from_socket(
         &self,
         py: Python<'_>,
         stream: &mut std::net::TcpStream,
     ) -> std::io::Result<usize> {
         let mut total_read = 0;
-        let mut temp = [0u8; 65536];
+        // Use 128KB buffer - matches uvloop's internal buffer size
+        let mut temp = [0u8; 131072];
 
         loop {
             match stream.read(&mut temp) {
@@ -394,9 +397,13 @@ impl StreamReader {
                 }
                 Ok(n) => {
                     total_read += n;
-                    let mut inner = self.inner.borrow_mut();
-                    inner.buffer.extend_from_slice(&temp[..n]);
-                    drop(inner);
+                    // Extend buffer directly
+                    self.inner.borrow_mut().buffer.extend_from_slice(&temp[..n]);
+                    
+                    // Continue reading if we filled the buffer (more data likely available)
+                    if n < temp.len() {
+                        break;
+                    }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     break;

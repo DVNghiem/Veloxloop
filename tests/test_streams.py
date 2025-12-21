@@ -15,7 +15,7 @@ class TestStreamReader:
         reader = _veloxloop.StreamReader()
         assert not reader.at_eof()
         assert reader.buffer_size() == 0
-        assert reader.get_limit() == 64 * 1024  # 64 KB default
+        assert reader.get_limit() == 128 * 1024  # 128 KB default (optimized for large messages)
     
     def test_creation_custom_limit(self):
         """Test StreamReader creation with custom limit"""
@@ -236,8 +236,8 @@ class TestStreamWriter:
         writer = _veloxloop.StreamWriter()
         assert not writer.is_closing()
         assert writer.get_write_buffer_size() == 0
-        assert writer.get_high_water() == 64 * 1024  # 64 KB
-        assert writer.get_low_water() == 16 * 1024   # 16 KB
+        assert writer.get_high_water() == 128 * 1024  # 128 KB (DEFAULT_HIGH)
+        assert writer.get_low_water() == 32 * 1024    # 32 KB (DEFAULT_LOW)
     
     def test_creation_custom_limits(self):
         """Test StreamWriter creation with custom limits"""

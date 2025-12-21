@@ -3,7 +3,7 @@ use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::cell::RefCell;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
@@ -496,13 +496,17 @@ impl crate::transports::StreamTransport for TcpTransport {
         Ok(())
     }
 
+    /// Optimized read_ready handler - key performance path
+    /// Uses larger buffer and reduces Python callback overhead
     fn read_ready(&mut self, py: Python<'_>) -> PyResult<()> {
+        // Fast path: Direct to StreamReader if available (streams API)
         if let Some(reader_py) = &self.reader {
             if let Some(stream) = self.stream.as_mut() {
                 let reader = reader_py.bind(py).borrow();
                 // Read directly using StreamReader's optimized method
                 match reader.read_from_socket(py, stream) {
                     Ok(0) => {
+                        // EOF
                         let _ = reader.feed_eof_native(py);
                         reader._wakeup_waiters(py)?;
                         self.close(py)?;
@@ -518,12 +522,17 @@ impl crate::transports::StreamTransport for TcpTransport {
             return Ok(());
         }
 
+        // Protocol path: read and call data_received
         if let Some(stream) = self.stream.as_ref() {
-            let mut buf = [0u8; 65536]; // Increased from 4KB to 64KB for better large message performance
+            // Use 128KB buffer for better large message performance
+            // This matches what uvloop uses internally
+            let mut buf = [0u8; 131072];
             let mut s = stream;
+            
+            // Try to read as much data as available in one syscall
             match std::io::Read::read(&mut s, &mut buf) {
                 Ok(0) => {
-                    // EOF
+                    // EOF - notify protocol
                     if let Ok(res) = self.protocol.call_method0(py, "eof_received") {
                         if let Ok(keep_open) = res.extract::<bool>(py) {
                             if !keep_open {
@@ -537,25 +546,38 @@ impl crate::transports::StreamTransport for TcpTransport {
                     }
                 }
                 Ok(n) => {
+                    // Create Python bytes and call protocol
                     let py_data = PyBytes::new(py, &buf[..n]);
-                    self.protocol
-                        .call_method1(py, "data_received", (py_data,))?;
+                    self.protocol.call_method1(py, "data_received", (py_data,))?;
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // No data available, will be called again when ready
+                }
                 Err(e) => return Err(e.into()),
             }
         }
         Ok(())
     }
 
+    /// Optimized write_ready handler
     fn write_ready(&mut self, py: Python<'_>) -> PyResult<()> {
         let mut should_finalize = false;
         if let Some(stream) = self.stream.as_mut() {
-            // Try to write as much as possible in one go
-            while !self.write_buffer.borrow().is_empty() {
-                let data = &self.write_buffer.borrow()[..];
+            // Try to write as much as possible in one iteration
+            // Minimize RefCell borrows by doing them outside the loop when possible
+            loop {
+                let data_len = self.write_buffer.borrow().len();
+                if data_len == 0 {
+                    break;
+                }
+                
+                // Borrow the data for writing
+                let write_result = {
+                    let data = self.write_buffer.borrow();
+                    stream.write(&data[..])
+                };
 
-                match stream.write(data) {
+                match write_result {
                     Ok(0) => {
                         return Err(PyErr::new::<pyo3::exceptions::PyConnectionError, _>(
                             "Connection closed during write",
@@ -823,83 +845,137 @@ impl TcpTransport {
 
     pub(crate) fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        let mut batch = BytesMut::new();
-        let mut eof = false;
-
-        loop {
+        
+        // Fast path check - avoid borrow if already closed
+        {
             let self_ = slf.borrow();
             if self_.state.intersects(
                 TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
             ) {
-                break;
+                return Ok(());
             }
+        }
 
-            if let Some(mut stream) = self_.stream.as_ref() {
-                let mut buf = [0u8; 65536];
-                match stream.read(&mut buf) {
-                    Ok(0) => {
-                        eof = true;
-                        break;
+        // Check if we have a direct reader path (streams API) - avoid Protocol callback overhead
+        let has_reader = slf.borrow().reader.is_some();
+        
+        // Action enum to separate I/O from callback dispatch
+        enum ReadAction {
+            Data(Vec<u8>),
+            Eof,
+            WouldBlock,
+        }
+        
+        if has_reader {
+            // Optimized path: Read directly into StreamReader's buffer
+            // This avoids Python callback overhead entirely
+            loop {
+                let action = {
+                    let self_ = slf.borrow();
+                    if self_.state.intersects(
+                        TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
+                    ) {
+                        ReadAction::WouldBlock
+                    } else if let Some(stream) = self_.stream.as_ref() {
+                        let mut buf = [0u8; 131072]; // 128KB
+                        let mut s = stream;
+                        match std::io::Read::read(&mut s, &mut buf) {
+                            Ok(0) => ReadAction::Eof,
+                            Ok(n) => ReadAction::Data(buf[..n].to_vec()),
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => ReadAction::WouldBlock,
+                            Err(e) => return Err(e.into()),
+                        }
+                    } else {
+                        ReadAction::WouldBlock
                     }
-                    Ok(n) => {
-                        batch.extend_from_slice(&buf[..n]);
-                        // If we already have a lot of data, dispatch it to avoid excessive memory usage
-                        if batch.len() >= 128 * 1024 {
-                            let data = batch.split().to_vec();
-                            drop(self_); // Drop borrow before calling out
-                            Self::_dispatch_batch(slf, py, data)?;
-                        } else {
-                            // Continue reading more from socket
+                }; // self_ borrow dropped here
+                
+                match action {
+                    ReadAction::Data(data) => {
+                        // Feed data directly to reader's buffer and wake waiters
+                        let reader_clone = {
+                            let self_ = slf.borrow();
+                            self_.reader.as_ref().map(|r| r.clone_ref(py))
+                        };
+                        if let Some(reader_py) = reader_clone {
+                            // Feed data to buffer
+                            reader_py.bind(py).borrow().inner.borrow_mut().buffer.extend_from_slice(&data);
+                            // Wake waiters
+                            reader_py.bind(py).borrow()._wakeup_waiters(py)?;
+                        }
+                        // Continue reading if we got a full buffer
+                        if data.len() < 131072 {
+                            break;
                         }
                     }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e.into()),
-                }
-            } else {
-                break;
-            }
-        }
-
-        // Dispatch remaining data in batch
-        if !batch.is_empty() {
-            Self::_dispatch_batch(slf, py, batch.to_vec())?;
-        }
-
-        if eof {
-            // EOF handling: call eof_received and only close if it returns false
-            let protocol = {
-                let self_ = slf.borrow();
-                self_.protocol.clone_ref(py)
-            };
-
-            if let Ok(res) = protocol.call_method0(py, "eof_received") {
-                if let Ok(keep_open) = res.extract::<bool>(py) {
-                    if !keep_open {
+                    ReadAction::Eof => {
+                        let self_ = slf.borrow();
+                        if let Some(reader_py) = &self_.reader {
+                            let _ = reader_py.bind(py).borrow().feed_eof_native(py);
+                            reader_py.bind(py).borrow()._wakeup_waiters(py)?;
+                        }
+                        drop(self_);
                         Self::close(slf)?;
+                        break;
                     }
-                } else {
-                    Self::close(slf)?;
+                    ReadAction::WouldBlock => break,
                 }
-            } else {
-                Self::close(slf)?;
+            }
+        } else {
+            // Protocol path: read and call data_received (uses Python callback)
+            // Use same action-based pattern for clean borrow management
+            loop {
+                let action = {
+                    let self_ = slf.borrow();
+                    if self_.state.intersects(
+                        TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
+                    ) {
+                        ReadAction::WouldBlock
+                    } else if let Some(stream) = self_.stream.as_ref() {
+                        let mut buf = [0u8; 131072]; // 128KB buffer
+                        let mut s = stream;
+                        match std::io::Read::read(&mut s, &mut buf) {
+                            Ok(0) => ReadAction::Eof,
+                            Ok(n) => ReadAction::Data(buf[..n].to_vec()),
+                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => ReadAction::WouldBlock,
+                            Err(e) => return Err(e.into()),
+                        }
+                    } else {
+                        ReadAction::WouldBlock
+                    }
+                }; // self_ borrow dropped here
+                
+                match action {
+                    ReadAction::Data(data) => {
+                        let py_data = PyBytes::new(py, &data);
+                        let protocol = slf.borrow().protocol.clone_ref(py);
+                        protocol.call_method1(py, "data_received", (py_data,))?;
+                        // Continue reading if we got a full buffer
+                        if data.len() < 131072 {
+                            break;
+                        }
+                    }
+                    ReadAction::Eof => {
+                        let protocol = slf.borrow().protocol.clone_ref(py);
+                        if let Ok(res) = protocol.call_method0(py, "eof_received") {
+                            if let Ok(keep_open) = res.extract::<bool>(py) {
+                                if !keep_open {
+                                    Self::close(slf)?;
+                                }
+                            } else {
+                                Self::close(slf)?;
+                            }
+                        } else {
+                            Self::close(slf)?;
+                        }
+                        break;
+                    }
+                    ReadAction::WouldBlock => break,
+                }
             }
         }
 
         Ok(())
-    }
-
-    fn _dispatch_batch(slf: &Bound<'_, Self>, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
-        let self_ = slf.borrow();
-        if let Some(reader) = self_.reader.as_ref().map(|r| r.clone_ref(py)) {
-            drop(self_);
-            reader.bind(py).borrow().feed_data_native(py, &data)
-        } else {
-            let py_data = PyBytes::new(py, &data);
-            let protocol = self_.protocol.clone_ref(py);
-            drop(self_);
-            protocol.call_method1(py, "data_received", (py_data,))?;
-            Ok(())
-        }
     }
 
     /// Set TCP_NODELAY option on the socket

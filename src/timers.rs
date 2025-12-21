@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::constants::{PRECISION_NS, WHEEL_BITS, WHEEL_MASK, WHEEL_SIZE, WHEELS};
 
@@ -28,8 +28,8 @@ pub struct TimerEntry {
 pub struct Timers {
     /// Wheels storing list of timer IDs
     wheels: [Vec<Vec<u64>>; WHEELS],
-    /// Storage for actual timer entries
-    entries: HashMap<u64, TimerEntry>,
+    /// Storage for actual timer entries - FxHashMap for faster u64 key lookup
+    entries: FxHashMap<u64, TimerEntry>,
     /// Current time in milliseconds (relative to start_time)
     current_ms: u64,
     /// Counter for unique timer IDs
@@ -47,7 +47,7 @@ impl Timers {
 
         Self {
             wheels,
-            entries: HashMap::with_capacity(1024),
+            entries: FxHashMap::with_capacity_and_hasher(1024, Default::default()),
             current_ms: 0,
             next_id: 1,
         }
