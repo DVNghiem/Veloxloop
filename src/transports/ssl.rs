@@ -12,8 +12,9 @@ use std::sync::Arc;
 
 use crate::constants::{DEFAULT_HIGH, DEFAULT_LOW};
 use crate::event_loop::VeloxLoop;
-use crate::transports::{StreamTransport, Transport};
+use crate::transports::{StreamTransport, Transport, TransportState};
 use crate::utils::VeloxResult;
+use bytes::BytesMut;
 
 /// SSL/TLS Context for configuring secure connections
 #[pyclass(module = "veloxloop._veloxloop")]
@@ -216,9 +217,8 @@ pub struct SSLTransport {
     tls_state: Mutex<TlsState>,
     protocol: Py<PyAny>,
     loop_: Py<VeloxLoop>,
-    closing: bool,
-    reading_paused: bool,
-    write_buffer: Vec<u8>,
+    state: TransportState,
+    write_buffer: BytesMut,
     write_buffer_high: usize,
     write_buffer_low: usize,
     #[allow(dead_code)]
@@ -341,7 +341,7 @@ impl crate::transports::Transport for SSLTransport {
     }
 
     fn is_closing(&self) -> bool {
-        self.closing
+        self.state.contains(TransportState::CLOSING) || self.state.contains(TransportState::CLOSED)
     }
 
     fn get_fd(&self) -> RawFd {
@@ -352,11 +352,13 @@ impl crate::transports::Transport for SSLTransport {
 // Implement StreamTransport trait for SSLTransport
 impl crate::transports::StreamTransport for SSLTransport {
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        if self.closing {
+        if self.state.contains(TransportState::CLOSING)
+            || self.state.contains(TransportState::CLOSED)
+        {
             return Ok(());
         }
 
-        self.closing = true;
+        self.state.insert(TransportState::CLOSING);
 
         if self.write_buffer.is_empty() {
             self.force_close(py)?;
@@ -369,7 +371,9 @@ impl crate::transports::StreamTransport for SSLTransport {
     }
 
     fn write(&mut self, _py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        if self.closing {
+        if self.state.contains(TransportState::CLOSING)
+            || self.state.contains(TransportState::CLOSED)
+        {
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "Cannot write to closing transport",
             ));
@@ -488,10 +492,10 @@ impl crate::transports::StreamTransport for SSLTransport {
                 }
             }
             Ok(n) => {
-                let data = Vec::from(&buf[..n]);
+                let data = &buf[..n];
                 drop(reader);
                 drop(state);
-                let py_data = PyBytes::new(py, &data);
+                let py_data = PyBytes::new(py, data);
                 self.protocol
                     .call_method1(py, "data_received", (py_data,))?;
             }
@@ -571,8 +575,8 @@ impl SSLTransport {
         let py = slf.py();
         let mut self_ = slf.borrow_mut();
 
-        if !self_.reading_paused {
-            self_.reading_paused = true;
+        if !self_.state.contains(TransportState::READING_PAUSED) {
+            self_.state.insert(TransportState::READING_PAUSED);
             let fd = self_.fd;
             let loop_ = self_.loop_.bind(py).borrow();
             loop_.remove_reader(py, fd)?;
@@ -584,8 +588,8 @@ impl SSLTransport {
         let py = slf.py();
         let mut self_ = slf.borrow_mut();
 
-        if self_.reading_paused {
-            self_.reading_paused = false;
+        if self_.state.contains(TransportState::READING_PAUSED) {
+            self_.state.remove(TransportState::READING_PAUSED);
             let fd = self_.fd;
             drop(self_); // Drop borrow before calling into loop
 
@@ -606,11 +610,13 @@ impl SSLTransport {
 
         {
             let mut self_ = slf.borrow_mut();
-            if self_.closing {
+            if self_.state.contains(TransportState::CLOSING)
+                || self_.state.contains(TransportState::CLOSED)
+            {
                 return Ok(());
             }
 
-            self_.closing = true;
+            self_.state.insert(TransportState::CLOSING);
 
             if self_.write_buffer.is_empty() {
                 self_._force_close_internal(py)?;
@@ -652,7 +658,9 @@ impl SSLTransport {
 
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
         self._force_close_internal(py)?;
-        let _ = self.protocol.call_method1(py, "connection_lost", (py.None(),));
+        let _ = self
+            .protocol
+            .call_method1(py, "connection_lost", (py.None(),));
         Ok(())
     }
 
@@ -745,7 +753,7 @@ impl SSLTransport {
                         Ok(n) => {
                             drop(writer);
                             drop(state);
-                            self_.write_buffer.drain(0..n);
+                            let _ = self_.write_buffer.split_to(n);
                         }
                         Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                             drop(writer);
@@ -823,6 +831,15 @@ impl SSLTransport {
 
         if should_remove_writer {
             loop_ref.bind(py).borrow().remove_writer(py, fd).ok();
+
+            // Handle final close if in CLOSING state
+            let mut self_ = slf.borrow_mut();
+            if self_.state.contains(TransportState::CLOSING) {
+                self_._force_close_internal(py)?;
+                let protocol = self_.protocol.clone_ref(py);
+                drop(self_); // Drop borrow before calling out
+                let _ = protocol.call_method1(py, "connection_lost", (py.None(),));
+            }
         }
 
         Ok(())
@@ -1019,9 +1036,8 @@ impl SSLTransport {
             }),
             protocol,
             loop_,
-            closing: false,
-            reading_paused: false,
-            write_buffer: Vec::with_capacity(65536),
+            state: TransportState::ACTIVE,
+            write_buffer: BytesMut::with_capacity(65536),
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,
             server_hostname,
@@ -1067,9 +1083,8 @@ impl SSLTransport {
             }),
             protocol,
             loop_,
-            closing: false,
-            reading_paused: false,
-            write_buffer: Vec::with_capacity(65536),
+            state: TransportState::ACTIVE,
+            write_buffer: BytesMut::with_capacity(65536),
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,
             server_hostname: None,

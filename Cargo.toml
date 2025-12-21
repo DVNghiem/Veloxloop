@@ -32,6 +32,8 @@ rustls-native-certs = "0.8"
 memchr = "2.7"
 rustc-hash = "2"
 papaya = "0.2"
+bytes = "1.11.0"
+bitflags = "2.10.0"
 
 [target.'cfg(not(any(target_env = "musl", target_os = "freebsd", target_os = "openbsd", target_os = "windows")))'.dependencies]
 tikv-jemallocator = { version = "0.6.1", default-features = false, features = ["disable_initial_exec_tls"] }

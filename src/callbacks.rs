@@ -1,12 +1,10 @@
-use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyInt, PyString, PyTuple};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::event_loop::VeloxLoop;
-use crate::poller::LoopPoller;
+
 use crate::transports::future::PendingFuture;
 use crate::transports::ssl::SSLContext;
 use crate::transports::{DefaultTransportFactory, TransportFactory};
@@ -20,41 +18,29 @@ pub struct Callback {
 }
 
 pub struct CallbackQueue {
-    queue: Mutex<Vec<Callback>>,
-    poller: Arc<LoopPoller>, // Needed to wake up the loop
-    pub is_polling: AtomicBool, // True when loop is blocked in poll()
+    queue: Vec<Callback>,
 }
 
 impl CallbackQueue {
-    pub fn new(poller: Arc<LoopPoller>) -> Self {
+    pub fn new() -> Self {
         Self {
-            queue: Mutex::new(Vec::with_capacity(1024)),
-            poller,
-            is_polling: AtomicBool::new(false),
+            queue: Vec::with_capacity(1024),
         }
     }
 
-    pub fn push(&self, callback: Callback) {
-        let mut q = self.queue.lock();
-        q.push(callback);
-        drop(q);
-
-        // Only notify if the loop is actually polling
-        if self.is_polling.load(Ordering::Relaxed) {
-            let _ = self.poller.notify();
-        }
+    pub fn push(&mut self, callback: Callback) {
+        self.queue.push(callback);
     }
 
-    pub fn swap_into(&self, target: &mut Vec<Callback>) {
-        let mut q = self.queue.lock();
-        if q.is_empty() {
+    pub fn swap_into(&mut self, target: &mut Vec<Callback>) {
+        if self.queue.is_empty() {
             return;
         }
-        std::mem::swap(&mut *q, target);
+        std::mem::swap(&mut self.queue, target);
     }
 
     pub fn is_empty(&self) -> bool {
-        self.queue.lock().is_empty()
+        self.queue.is_empty()
     }
 }
 

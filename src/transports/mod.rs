@@ -4,10 +4,23 @@ pub mod stream_server;
 pub mod tcp;
 pub mod udp;
 
+use bitflags::bitflags;
 use pyo3::prelude::*;
 use std::os::fd::RawFd;
 
 use crate::event_loop::VeloxLoop;
+
+bitflags! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct TransportState: u32 {
+        const ACTIVE         = 1 << 0;
+        const CLOSING        = 1 << 1;
+        const CLOSED         = 1 << 2;
+        const READING_PAUSED = 1 << 3;
+        const WRITING_PAUSED = 1 << 4;
+        const EOF_RECEIVED   = 1 << 5;
+    }
+}
 
 /// Base trait for all transports
 /// Provides common functionality shared by both stream and datagram transports

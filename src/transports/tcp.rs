@@ -1,16 +1,17 @@
+use bytes::BytesMut;
 use parking_lot::Mutex;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
-use std::collections::VecDeque;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use super::future::{CompletedFuture, PendingFuture};
+use super::{StreamTransport, Transport, TransportFactory, TransportState};
 use crate::constants::{DEFAULT_HIGH, DEFAULT_LOW};
 use crate::event_loop::VeloxLoop;
-use crate::transports::{DefaultTransportFactory, StreamTransport, Transport, TransportFactory};
+use crate::transports::DefaultTransportFactory;
 
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct SocketWrapper {
@@ -348,10 +349,9 @@ pub struct TcpTransport {
     stream: Option<std::net::TcpStream>,
     protocol: Py<PyAny>,
     loop_: Py<VeloxLoop>,
-    closing: bool,
-    reading_paused: bool,
-    // Buffer for outgoing data - VecDeque for O(1) front removal
-    write_buffer: VecDeque<u8>,
+    state: TransportState,
+    // Buffer for outgoing data
+    write_buffer: BytesMut,
     // Write buffer limits (high water mark, low water mark)
     write_buffer_high: usize,
     write_buffer_low: usize,
@@ -403,7 +403,7 @@ impl crate::transports::Transport for TcpTransport {
     }
 
     fn is_closing(&self) -> bool {
-        self.closing
+        self.state.contains(TransportState::CLOSING) || self.state.contains(TransportState::CLOSED)
     }
 
     fn get_fd(&self) -> RawFd {
@@ -414,11 +414,12 @@ impl crate::transports::Transport for TcpTransport {
 // Implement StreamTransport trait for TcpTransport
 impl crate::transports::StreamTransport for TcpTransport {
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        if self.closing {
+        if self.state.contains(TransportState::CLOSING)
+            || self.state.contains(TransportState::CLOSED)
+        {
             return Ok(());
         }
-
-        self.closing = true;
+        self.state.insert(TransportState::CLOSING);
 
         if self.write_buffer.is_empty() {
             self.force_close(py)?;
@@ -470,8 +471,6 @@ impl crate::transports::StreamTransport for TcpTransport {
         high: Option<usize>,
         low: Option<usize>,
     ) -> PyResult<()> {
-        const DEFAULT_HIGH: usize = 64 * 1024;
-
         let high_limit = high.unwrap_or(DEFAULT_HIGH);
         let low_limit = low.unwrap_or_else(|| if high_limit == 0 { 0 } else { high_limit / 4 });
 
@@ -546,29 +545,32 @@ impl crate::transports::StreamTransport for TcpTransport {
     }
 
     fn write_ready(&mut self, py: Python<'_>) -> PyResult<()> {
-        if let Some(mut stream) = self.stream.as_ref() {
+        let mut should_finalize = false;
+        if let Some(stream) = self.stream.as_mut() {
             // Try to write as much as possible in one go
             while !self.write_buffer.is_empty() {
-                // Make buffer contiguous at the start of each iteration
-                let data = self.write_buffer.make_contiguous();
+                let data = &self.write_buffer[..];
 
                 match stream.write(data) {
                     Ok(0) => {
-                        // Connection closed
                         return Err(PyErr::new::<pyo3::exceptions::PyConnectionError, _>(
                             "Connection closed during write",
                         ));
                     }
                     Ok(n) => {
-                        self.write_buffer.drain(..n);
+                        let _ = self.write_buffer.split_to(n);
                         if self.write_buffer.is_empty() {
                             let fd = self.fd;
                             self.loop_.bind(py).borrow().remove_writer(py, fd)?;
+
+                            // If we are in CLOSING state and buffer is empty, finalize closure
+                            if self.state.contains(TransportState::CLOSING) {
+                                should_finalize = true;
+                                break;
+                            }
                         }
-                        // Continue loop to write remaining data
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Can't write more now, will retry on next write_ready
                         break;
                     }
                     Err(e) => {
@@ -577,6 +579,13 @@ impl crate::transports::StreamTransport for TcpTransport {
                 }
             }
         }
+
+        if should_finalize {
+            self._force_close_internal(py)?;
+            let protocol = self.protocol.clone_ref(py);
+            let _ = protocol.call_method1(py, "connection_lost", (py.None(),));
+        }
+
         Ok(())
     }
 }
@@ -630,8 +639,8 @@ impl TcpTransport {
         let (should_remove, fd, loop_obj) = {
             let mut self_ = slf.borrow_mut();
 
-            if !self_.reading_paused {
-                self_.reading_paused = true;
+            if !self_.state.contains(TransportState::READING_PAUSED) {
+                self_.state.insert(TransportState::READING_PAUSED);
                 let fd = self_.fd;
                 let loop_obj = self_.loop_.clone_ref(py);
                 (true, fd, loop_obj)
@@ -651,13 +660,16 @@ impl TcpTransport {
         let py = slf.py();
         let mut self_ = slf.borrow_mut();
 
-        if self_.reading_paused {
-            self_.reading_paused = false;
+        if self_.state.contains(TransportState::READING_PAUSED) {
+            self_.state.remove(TransportState::READING_PAUSED);
             let fd = self_.fd;
             let loop_obj = self_.loop_.clone_ref(py);
             drop(self_); // Drop borrow before calling into loop
 
-            loop_obj.bind(py).borrow().add_tcp_reader(fd, slf.clone().unbind())?;
+            loop_obj
+                .bind(py)
+                .borrow()
+                .add_tcp_reader(fd, slf.clone().unbind())?;
         }
         Ok(())
     }
@@ -669,11 +681,13 @@ impl TcpTransport {
 
         {
             let mut self_ = slf.borrow_mut();
-            if self_.closing {
+            if self_.state.contains(TransportState::CLOSING)
+                || self_.state.contains(TransportState::CLOSED)
+            {
                 return Ok(());
             }
 
-            self_.closing = true;
+            self_.state.insert(TransportState::CLOSING);
 
             if self_.write_buffer.is_empty() {
                 self_._force_close_internal(py)?;
@@ -714,20 +728,28 @@ impl TcpTransport {
 
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
         self._force_close_internal(py)?;
-        let _ = self.protocol.call_method1(py, "connection_lost", (py.None(),));
+        let _ = self
+            .protocol
+            .call_method1(py, "connection_lost", (py.None(),));
         Ok(())
     }
 
     fn _force_close_internal(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.state.contains(TransportState::CLOSED) {
+            return Ok(());
+        }
+
         let fd = self.fd;
+        self.state.insert(TransportState::CLOSED);
+        self.state.remove(TransportState::ACTIVE);
+        self.state.remove(TransportState::CLOSING);
 
         let loop_ = self.loop_.bind(py).borrow();
-        loop_.remove_reader(py, fd)?;
-        loop_.remove_writer(py, fd)?;
+        let _ = loop_.remove_reader(py, fd);
+        let _ = loop_.remove_writer(py, fd);
         drop(loop_);
 
         self.stream = None;
-        // Clear direct path
         self.reader = None;
         Ok(())
     }
@@ -736,8 +758,11 @@ impl TcpTransport {
     fn _trigger_write(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let mut self_ = slf.borrow_mut();
-        
-        if self_.closing || self_.stream.is_none() {
+
+        if self_.state.contains(TransportState::CLOSING)
+            || self_.state.contains(TransportState::CLOSED)
+            || self_.stream.is_none()
+        {
             return Ok(());
         }
 
@@ -750,7 +775,10 @@ impl TcpTransport {
                 let fd = self_.fd;
                 let loop_ = self_.loop_.clone_ref(py);
                 drop(self_); // Drop borrow before calling into loop
-                loop_.bind(py).borrow().add_tcp_writer(fd, slf.clone().unbind())?;
+                loop_
+                    .bind(py)
+                    .borrow()
+                    .add_tcp_writer(fd, slf.clone().unbind())?;
             }
             res
         } else {
@@ -775,7 +803,10 @@ impl TcpTransport {
             let fd = self_.fd;
             let loop_ = self_.loop_.clone_ref(slf.py());
             drop(self_);
-            loop_.bind(slf.py()).borrow().add_tcp_writer(fd, slf.clone().unbind())?;
+            loop_
+                .bind(slf.py())
+                .borrow()
+                .add_tcp_writer(fd, slf.clone().unbind())?;
         }
         Ok(())
     }
@@ -788,62 +819,83 @@ impl TcpTransport {
 
     pub(crate) fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
+        let mut batch = BytesMut::new();
+        let mut eof = false;
 
-        // Read data and prepare callbacks without holding the mutable borrow
-        enum Action {
-            Data(Vec<u8>),
-            Eof,
-            WouldBlock,
-            Error(io::Error),
+        loop {
+            let self_ = slf.borrow();
+            if self_.state.intersects(
+                TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
+            ) {
+                break;
+            }
+
+            if let Some(mut stream) = self_.stream.as_ref() {
+                let mut buf = [0u8; 65536];
+                match stream.read(&mut buf) {
+                    Ok(0) => {
+                        eof = true;
+                        break;
+                    }
+                    Ok(n) => {
+                        batch.extend_from_slice(&buf[..n]);
+                        // If we already have a lot of data, dispatch it to avoid excessive memory usage
+                        if batch.len() >= 128 * 1024 {
+                            let data = batch.split().to_vec();
+                            drop(self_); // Drop borrow before calling out
+                            Self::_dispatch_batch(slf, py, data)?;
+                        } else {
+                            // Continue reading more from socket
+                        }
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                break;
+            }
         }
 
-        // Read loop: continue reading until WouldBlock to maximize throughput
-        loop {
-            let action = {
-                let self_ = slf.borrow();
-                if let Some(stream) = self_.stream.as_ref() {
-                    // Use 64KB buffer matching the trait implementation
-                    let mut buf = [0u8; 65536];
-                    let mut s = stream;
-                    match std::io::Read::read(&mut s, &mut buf) {
-                        Ok(0) => Action::Eof,
-                        Ok(n) => Action::Data(buf[..n].to_vec()),
-                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Action::WouldBlock,
-                        Err(e) => Action::Error(e),
-                    }
-                } else {
-                    Action::WouldBlock
-                }
-            }; // Drop borrow before calling Python callbacks
+        // Dispatch remaining data in batch
+        if !batch.is_empty() {
+            Self::_dispatch_batch(slf, py, batch.to_vec())?;
+        }
 
-            match action {
-                Action::Data(data) => {
-                    let py_data = PyBytes::new(py, &data);
-                    let protocol = slf.borrow().protocol.clone_ref(py);
-                    protocol.call_method1(py, "data_received", (py_data,))?;
-                    // Continue loop to read more data if available
-                }
-                Action::Eof => {
-                    let protocol = slf.borrow().protocol.clone_ref(py);
-                    if let Ok(res) = protocol.call_method0(py, "eof_received") {
-                        if let Ok(keep_open) = res.extract::<bool>(py) {
-                            if !keep_open {
-                                Self::close(slf)?;
-                            }
-                        } else {
-                            Self::close(slf)?;
-                        }
-                    } else {
+        if eof {
+            // EOF handling: call eof_received and only close if it returns false
+            let protocol = {
+                let self_ = slf.borrow();
+                self_.protocol.clone_ref(py)
+            };
+
+            if let Ok(res) = protocol.call_method0(py, "eof_received") {
+                if let Ok(keep_open) = res.extract::<bool>(py) {
+                    if !keep_open {
                         Self::close(slf)?;
                     }
-                    break; // EOF, exit loop
+                } else {
+                    Self::close(slf)?;
                 }
-                Action::WouldBlock => break, // No more data, exit loop
-                Action::Error(e) => return Err(e.into()),
+            } else {
+                Self::close(slf)?;
             }
         }
 
         Ok(())
+    }
+
+    fn _dispatch_batch(slf: &Bound<'_, Self>, py: Python<'_>, data: Vec<u8>) -> PyResult<()> {
+        let self_ = slf.borrow();
+        if let Some(reader) = self_.reader.as_ref().map(|r| r.clone_ref(py)) {
+            drop(self_);
+            reader.bind(py).borrow().feed_data_native(py, &data)
+        } else {
+            let py_data = PyBytes::new(py, &data);
+            let protocol = self_.protocol.clone_ref(py);
+            drop(self_);
+            protocol.call_method1(py, "data_received", (py_data,))?;
+            Ok(())
+        }
     }
 
     /// Set TCP_NODELAY option on the socket
@@ -1050,9 +1102,8 @@ impl TcpTransport {
             stream: Some(stream),
             protocol,
             loop_,
-            closing: false,
-            reading_paused: false,
-            write_buffer: VecDeque::with_capacity(65536),
+            state: TransportState::ACTIVE,
+            write_buffer: BytesMut::with_capacity(65536),
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,
             reader: None,

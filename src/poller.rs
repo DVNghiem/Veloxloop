@@ -1,33 +1,33 @@
-use crate::utils::VeloxResult;
-use polling::{Event, Events, Poller};
 use std::os::fd::RawFd;
-use std::sync::Arc;
 
 pub struct LoopPoller {
-    poller: Arc<Poller>,
-    // Internal mutability for shared access via Arc in EventLoop
-    registered_fds: parking_lot::Mutex<std::collections::HashSet<RawFd>>,
+    poller: polling::Poller,
+    registered_fds: std::collections::HashSet<RawFd>,
 }
 
 impl LoopPoller {
-    pub fn new() -> VeloxResult<Self> {
+    pub fn new() -> crate::utils::VeloxResult<Self> {
         Ok(Self {
-            poller: Arc::new(Poller::new()?),
-            registered_fds: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            poller: polling::Poller::new()?,
+            registered_fds: std::collections::HashSet::new(),
         })
     }
 
     // API: register with specific interest
-    pub fn register(&self, fd: RawFd, interest: Event) -> VeloxResult<()> {
+    pub fn register(
+        &mut self,
+        fd: RawFd,
+        interest: polling::Event,
+    ) -> crate::utils::VeloxResult<()> {
         unsafe {
             let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
             self.poller.add(&borrowed, interest)?;
         }
-        self.registered_fds.lock().insert(fd);
+        self.registered_fds.insert(fd);
         Ok(())
     }
 
-    pub fn modify(&self, fd: RawFd, interest: Event) -> VeloxResult<()> {
+    pub fn modify(&mut self, fd: RawFd, interest: polling::Event) -> crate::utils::VeloxResult<()> {
         unsafe {
             let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
             self.poller.modify(&borrowed, interest)?;
@@ -35,25 +35,25 @@ impl LoopPoller {
         Ok(())
     }
 
-    pub fn delete(&self, fd: RawFd) -> VeloxResult<()> {
+    pub fn delete(&mut self, fd: RawFd) -> crate::utils::VeloxResult<()> {
         unsafe {
             let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
             self.poller.delete(&borrowed)?;
         }
-        self.registered_fds.lock().remove(&fd);
+        self.registered_fds.remove(&fd);
         Ok(())
     }
 
-    pub fn notify(&self) -> VeloxResult<()> {
+    pub fn notify(&self) -> crate::utils::VeloxResult<()> {
         self.poller.notify()?;
         Ok(())
     }
 
     pub fn poll(
-        &self,
-        events: &mut Events,
+        &mut self,
+        events: &mut polling::Events,
         timeout: Option<std::time::Duration>,
-    ) -> VeloxResult<usize> {
+    ) -> crate::utils::VeloxResult<usize> {
         events.clear();
         self.poller.wait(events, timeout)?;
         Ok(events.len())

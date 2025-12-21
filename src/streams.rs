@@ -2,26 +2,28 @@ use crate::{
     constants::{DEFAULT_HIGH, DEFAULT_LIMIT, DEFAULT_LOW},
     transports::future::PendingFuture,
 };
+use bytes::BytesMut;
 use memchr::memchr;
 use parking_lot::Mutex;
 use pyo3::IntoPyObjectExt;
 #[allow(unused)]
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
+use std::io::Read;
 use std::sync::Arc;
 
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct StreamReader {
-    inner: Arc<Mutex<StreamReaderInner>>,
+    pub(crate) inner: Arc<Mutex<StreamReaderInner>>,
     /// Maximum buffer size before pausing
-    limit: usize,
+    pub(crate) limit: usize,
 }
 
-struct StreamReaderInner {
-    buffer: Vec<u8>,
-    eof: bool,
-    exception: Option<String>,
-    waiters: Vec<(WaiterType, Py<PendingFuture>)>,
+pub(crate) struct StreamReaderInner {
+    pub(crate) buffer: BytesMut,
+    pub(crate) eof: bool,
+    pub(crate) exception: Option<String>,
+    pub(crate) waiters: Vec<(WaiterType, Py<PendingFuture>)>,
 }
 
 impl StreamReaderInner {
@@ -35,7 +37,7 @@ impl StreamReaderInner {
 }
 
 #[derive(Clone)]
-enum WaiterType {
+pub(crate) enum WaiterType {
     ReadLine,
     ReadUntil(Vec<u8>),
     ReadExactly(usize),
@@ -48,7 +50,7 @@ impl StreamReader {
     pub fn new(limit: Option<usize>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(StreamReaderInner {
-                buffer: Vec::with_capacity(DEFAULT_LIMIT),
+                buffer: BytesMut::with_capacity(DEFAULT_LIMIT),
                 eof: false,
                 exception: None,
                 waiters: Vec::new(),
@@ -221,14 +223,14 @@ impl StreamReader {
 
         if n < 0 {
             // Read all available data
-            let data = inner.buffer.drain(..).collect::<Vec<u8>>();
+            let data = inner.buffer.split().to_vec();
             let bytes = PyBytes::new(py, &data);
             return Ok(bytes.into());
         }
 
         let n = n as usize;
         let available = inner.buffer.len().min(n);
-        let data = inner.buffer.drain(..available).collect::<Vec<u8>>();
+        let data = inner.buffer.split_to(available).to_vec();
         let bytes = PyBytes::new(py, &data);
 
         Ok(bytes.into())
@@ -315,7 +317,7 @@ impl StreamReader {
 impl StreamReader {
     // Helper method for readuntil logic operating on raw buffer
     fn _try_readuntil_inner(
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         eof: bool,
         separator: &[u8],
     ) -> PyResult<Option<Vec<u8>>> {
@@ -329,7 +331,7 @@ impl StreamReader {
 
         if let Some(pos) = pos {
             let end = pos + separator.len();
-            let data = buffer.drain(..end).collect();
+            let data = buffer.split_to(end).to_vec();
             return Ok(Some(data));
         }
 
@@ -337,7 +339,7 @@ impl StreamReader {
             if buffer.is_empty() {
                 return Ok(Some(Vec::new()));
             }
-            let data = buffer.drain(..).collect();
+            let data = buffer.split().to_vec();
             return Ok(Some(data));
         }
 
@@ -346,12 +348,12 @@ impl StreamReader {
 
     // Helper for readexactly logic
     fn _try_readexactly_inner(
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         eof: bool,
         n: usize,
     ) -> PyResult<Option<Vec<u8>>> {
         if buffer.len() >= n {
-            let data = buffer.drain(..n).collect();
+            let data = buffer.split_to(n).to_vec();
             return Ok(Some(data));
         }
 
@@ -372,43 +374,42 @@ impl StreamReader {
         py: Python<'_>,
         stream: &mut std::net::TcpStream,
     ) -> std::io::Result<usize> {
-        // Reserve internal buffer and read directly
-        let mut inner = self.inner.lock();
-        let buffer = &mut inner.buffer;
+        let mut total_read = 0;
+        let mut temp = [0u8; 65536];
 
-        // Try to read into spare capacity or reserve more
-        // We want to read a reasonable chunk, e.g. 64KB
-        buffer.reserve(DEFAULT_LIMIT);
-
-        // Unsafe access to unused capacity to avoid initialization cost
-        let len = buffer.len();
-        let cap = buffer.capacity();
-        let spare =
-            unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().add(len), cap - len) };
-
-        let n = std::io::Read::read(stream, spare)?;
-
-        if n > 0 {
-            unsafe { buffer.set_len(len + n) };
+        loop {
+            match stream.read(&mut temp) {
+                Ok(0) => {
+                    // EOF
+                    if total_read == 0 {
+                        return Ok(0);
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    total_read += n;
+                    let mut inner = self.inner.lock();
+                    inner.buffer.extend_from_slice(&temp[..n]);
+                    drop(inner);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
         }
 
-        // Early return if no data read (EOF is handled differently or n=0)
-        if n == 0 {
-            return Ok(0);
+        if total_read > 0 {
+            // Try to wakeup waiters
+            if let Err(e) = self._wakeup_waiters(py) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to wakeup waiters: {}", e),
+                ));
+            }
         }
 
-        // Drop lock before waking waiters to allow them to proceed
-        drop(inner);
-
-        // Try to wakeup waiters
-        if let Err(e) = self._wakeup_waiters(py) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                e.to_string(),
-            ));
-        }
-
-        Ok(n)
+        Ok(total_read)
     }
 }
 
@@ -420,21 +421,21 @@ pub trait StreamWriterProxy: Send + Sync {
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct StreamWriter {
     /// Internal write buffer (shared with transport)
-    buffer: Arc<Mutex<Vec<u8>>>,
+    pub(crate) buffer: Arc<Mutex<BytesMut>>,
     /// Closed flag
-    closed: Arc<Mutex<bool>>,
+    pub(crate) closed: Arc<Mutex<bool>>,
     /// Closing flag
-    closing: Arc<Mutex<bool>>,
+    pub(crate) closing: Arc<Mutex<bool>>,
     /// High water mark for flow control
-    high_water: usize,
+    pub(crate) high_water: usize,
     /// Low water mark for flow control
-    low_water: usize,
+    pub(crate) low_water: usize,
     /// Drain waiters - futures waiting for buffer to drain
-    drain_waiters: Arc<Mutex<Vec<Py<PendingFuture>>>>,
+    pub(crate) drain_waiters: Arc<Mutex<Vec<Py<PendingFuture>>>>,
     /// Transport reference for triggering writes (legacy Python path)
-    transport: Arc<Mutex<Option<Py<PyAny>>>>,
+    pub(crate) transport: Arc<Mutex<Option<Py<PyAny>>>>,
     /// Native transport proxy for triggering writes (optimized path)
-    proxy: Arc<Mutex<Option<Arc<dyn StreamWriterProxy>>>>,
+    pub(crate) proxy: Arc<Mutex<Option<Arc<dyn StreamWriterProxy>>>>,
 }
 
 #[pymethods]
@@ -446,7 +447,7 @@ impl StreamWriter {
         let low = low_water.unwrap_or(DEFAULT_LOW);
 
         Self {
-            buffer: Arc::new(Mutex::new(Vec::new())),
+            buffer: Arc::new(Mutex::new(BytesMut::with_capacity(high))),
             closed: Arc::new(Mutex::new(false)),
             closing: Arc::new(Mutex::new(false)),
             high_water: high,
@@ -548,7 +549,7 @@ impl StreamWriter {
     /// Clear the buffer (simulate drain completion)
     pub fn _clear_buffer(&self) -> Vec<u8> {
         let mut buffer = self.buffer.lock();
-        buffer.drain(..).collect()
+        buffer.split().to_vec()
     }
 
     /// Check if buffer is below low water mark
@@ -600,7 +601,7 @@ impl StreamWriter {
     }
 
     /// Get the buffer Arc for sharing with transport (Rust-only method)
-    pub(crate) fn get_buffer_arc(&self) -> Arc<Mutex<Vec<u8>>> {
+    pub(crate) fn get_buffer_arc(&self) -> Arc<Mutex<BytesMut>> {
         self.buffer.clone()
     }
 }
