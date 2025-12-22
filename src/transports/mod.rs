@@ -51,7 +51,10 @@ pub trait StreamTransport: Transport {
     fn force_close(&mut self, py: Python<'_>) -> PyResult<()>;
 
     /// Write data to the transport
-    fn write(&mut self, py: Python<'_>, data: &[u8]) -> PyResult<()>;
+    fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()>;
+
+    /// Zero-copy read into a Python buffer
+    fn recv_into(&mut self, py: Python<'_>, buffer: Bound<'_, PyAny>) -> PyResult<usize>;
 
     /// Write end-of-file marker
     fn write_eof(&mut self) -> PyResult<()>;

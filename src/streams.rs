@@ -1,3 +1,4 @@
+use crate::buffer_pool::BufferPool;
 use crate::{
     constants::{DEFAULT_HIGH, DEFAULT_LIMIT, DEFAULT_LOW},
     transports::future::PendingFuture,
@@ -6,6 +7,7 @@ use bytes::BytesMut;
 use memchr::memchr;
 use parking_lot::Mutex;
 use pyo3::IntoPyObjectExt;
+use pyo3::ffi;
 #[allow(unused)]
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -42,6 +44,13 @@ impl StreamReaderInner {
     }
 }
 
+impl Drop for StreamReaderInner {
+    fn drop(&mut self) {
+        let buf = std::mem::replace(&mut self.buffer, BytesMut::new());
+        BufferPool::release(buf);
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum WaiterType {
     ReadLine,
@@ -56,7 +65,7 @@ impl StreamReader {
     pub fn new(limit: Option<usize>) -> Self {
         Self {
             inner: RefCell::new(StreamReaderInner {
-                buffer: BytesMut::with_capacity(DEFAULT_LIMIT),
+                buffer: BufferPool::acquire(),
                 eof: false,
                 exception: None,
                 waiters: Vec::new(),
@@ -603,6 +612,85 @@ impl StreamWriter {
             "<StreamWriter buffer_size={} closing={}>",
             buffer_size, is_closing
         )
+    }
+}
+
+#[pyclass(module = "veloxloop._veloxloop")]
+pub struct VeloxBuffer {
+    data: Option<BytesMut>,
+}
+
+#[pymethods]
+impl VeloxBuffer {
+    #[new]
+    fn new() -> Self {
+        Self { data: None }
+    }
+
+    fn __len__(&self) -> usize {
+        self.data.as_ref().map(|d| d.len()).unwrap_or(0)
+    }
+
+    unsafe fn __getbuffer__(
+        slf: Bound<'_, Self>,
+        view: *mut ffi::Py_buffer,
+        _flags: i32,
+    ) -> PyResult<()> {
+        let self_ = slf.borrow();
+        let data = self_.data.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyBufferError::new_err("Buffer is empty or released")
+        })?;
+
+        if view.is_null() {
+            return Err(pyo3::exceptions::PyBufferError::new_err("Null buffer view"));
+        }
+
+        let slice = &data[..];
+
+        unsafe {
+            (*view).obj = slf.as_ptr();
+            ffi::Py_XINCREF((*view).obj);
+            (*view).buf = slice.as_ptr() as *mut _;
+            (*view).len = slice.len() as ffi::Py_ssize_t;
+            (*view).readonly = 1;
+            (*view).itemsize = 1;
+            (*view).format = std::ptr::null_mut();
+            (*view).ndim = 1;
+            (*view).shape = &mut (*view).len;
+            (*view).strides = &mut (*view).itemsize;
+            (*view).suboffsets = std::ptr::null_mut();
+            (*view).internal = std::ptr::null_mut();
+        }
+
+        Ok(())
+    }
+
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        if let Some(data) = &self.data {
+            Ok(PyBytes::new(py, data))
+        } else {
+            Ok(PyBytes::new(py, &[]))
+        }
+    }
+
+    fn release(&mut self) {
+        if let Some(buf) = self.data.take() {
+            BufferPool::release(buf);
+        }
+    }
+}
+
+impl Drop for VeloxBuffer {
+    fn drop(&mut self) {
+        if let Some(buf) = self.data.take() {
+            BufferPool::release(buf);
+        }
+    }
+}
+
+impl VeloxBuffer {
+    pub fn from_bytes_mut(buf: BytesMut) -> Self {
+        Self { data: Some(buf) }
     }
 }
 

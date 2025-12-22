@@ -1,4 +1,5 @@
 use parking_lot::Mutex;
+use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -370,7 +371,14 @@ impl crate::transports::StreamTransport for SSLTransport {
         self._force_close_internal(py)
     }
 
-    fn write(&mut self, _py: Python<'_>, data: &[u8]) -> PyResult<()> {
+    fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
+        let buf = PyBuffer::<u8>::get(&data)?;
+        let slice = buf.as_slice(py).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyBufferError, _>(
+                "Could not get buffer as slice",
+            )
+        })?;
+
         if self.state.contains(TransportState::CLOSING)
             || self.state.contains(TransportState::CLOSED)
         {
@@ -379,12 +387,13 @@ impl crate::transports::StreamTransport for SSLTransport {
             ));
         }
 
-        self.write_buffer.extend_from_slice(data);
+        let data_slice: Vec<u8> = slice.iter().map(|cell| cell.get()).collect();
+        self.write_buffer.extend_from_slice(&data_slice);
 
         let mut state = self.tls_state.lock();
         let mut writer = state.connection.writer();
 
-        match writer.write_all(data) {
+        match writer.write_all(&data_slice) {
             Ok(_) => {
                 drop(writer);
                 // Split the mutable borrows by destructuring
@@ -395,6 +404,32 @@ impl crate::transports::StreamTransport for SSLTransport {
                     Err(e) => Err(e.into()),
                 }
             }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn recv_into(&mut self, py: Python<'_>, buffer: Bound<'_, PyAny>) -> PyResult<usize> {
+        let buf = PyBuffer::<u8>::get(&buffer)?;
+        let slice = buf.as_mut_slice(py).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyBufferError, _>(
+                "Could not get buffer as mutable slice",
+            )
+        })?;
+
+        let mut state = self.tls_state.lock();
+        let mut reader = state.connection.reader();
+
+        // reader.read expects &mut [u8]; PyBuffer gives &mut [Cell<u8>],
+        // so read into a temporary u8 buffer then copy into the Cell slice.
+        let mut temp_buf = vec![0u8; slice.len()];
+        match reader.read(&mut temp_buf) {
+            Ok(n) => {
+                for (i, b) in temp_buf[..n].iter().enumerate() {
+                    slice[i].set(*b);
+                }
+                Ok(n)
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
             Err(e) => Err(e.into()),
         }
     }
@@ -678,13 +713,11 @@ impl SSLTransport {
 
     fn write(slf: &Bound<'_, Self>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
         let py = slf.py();
-        let bytes = data.as_bytes();
 
-        // Add data to write buffer
-        {
-            let mut self_ = slf.borrow_mut();
-            self_.write_buffer.extend_from_slice(bytes);
-        }
+        // Delegate to trait implementation
+        let mut self_mut = slf.borrow_mut();
+        StreamTransport::write(&mut *self_mut, py, data.clone().into_any())?;
+        drop(self_mut);
 
         // Try to flush immediately
         Self::_write_ready(slf)?;

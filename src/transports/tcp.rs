@@ -1,18 +1,21 @@
 use bytes::BytesMut;
 use parking_lot::Mutex;
+use pyo3::buffer::PyBuffer;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::cell::RefCell;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use super::future::{CompletedFuture, PendingFuture};
-use super::{StreamTransport, Transport, TransportFactory, TransportState};
+use crate::buffer_pool::BufferPool;
 use crate::constants::{DEFAULT_HIGH, DEFAULT_LOW};
 use crate::event_loop::VeloxLoop;
 use crate::transports::DefaultTransportFactory;
+
+use super::future::{CompletedFuture, PendingFuture};
+use super::{StreamTransport, Transport, TransportFactory, TransportState};
 
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct SocketWrapper {
@@ -363,6 +366,13 @@ pub struct TcpTransport {
 unsafe impl Send for TcpTransport {}
 unsafe impl Sync for TcpTransport {}
 
+impl Drop for TcpTransport {
+    fn drop(&mut self) {
+        let buf = std::mem::replace(&mut *self.write_buffer.borrow_mut(), BytesMut::new());
+        BufferPool::release(buf);
+    }
+}
+
 // Implement Transport trait for TcpTransport
 impl crate::transports::Transport for TcpTransport {
     fn get_extra_info(
@@ -437,18 +447,27 @@ impl crate::transports::StreamTransport for TcpTransport {
         self._force_close_internal(py)
     }
 
-    fn write(&mut self, _py: Python<'_>, data: &[u8]) -> PyResult<()> {
+    fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
+        let buf_view = PyBuffer::<u8>::get(&data)?;
+        let slice = buf_view.as_slice(py).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyBufferError, _>("Could not get buffer as slice")
+        })?;
+
         if let Some(mut stream) = self.stream.as_ref() {
-            match stream.write(data) {
-                Ok(n) if n == data.len() => {
+            let bytes: Vec<u8> = slice.iter().map(|cell| cell.get()).collect();
+            match stream.write(&bytes) {
+                Ok(n) if n == slice.len() => {
                     // All written
                 }
                 Ok(n) => {
-                    // Partial write - use extend for VecDeque
-                    self.write_buffer.borrow_mut().extend(&data[n..]);
+                    // Partial write - convert remaining cells to bytes
+                    let remaining: Vec<u8> = slice[n..].iter().map(|cell| cell.get()).collect();
+                    self.write_buffer
+                        .borrow_mut()
+                        .extend_from_slice(&remaining);
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.write_buffer.borrow_mut().extend(data);
+                    self.write_buffer.borrow_mut().extend_from_slice(&bytes);
                 }
                 Err(e) => {
                     return Err(e.into());
@@ -508,12 +527,12 @@ impl crate::transports::StreamTransport for TcpTransport {
                     Ok(0) => {
                         // EOF
                         let _ = reader.feed_eof_native(py);
-                        reader._wakeup_waiters(py)?;
+                        let _ = reader._wakeup_waiters(py);
                         self.close(py)?;
                     }
                     Ok(_) => {
                         // Data already in buffer via read_from_socket
-                        reader._wakeup_waiters(py)?;
+                        let _ = reader._wakeup_waiters(py);
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(e.into()),
@@ -523,15 +542,16 @@ impl crate::transports::StreamTransport for TcpTransport {
         }
 
         // Protocol path: read and call data_received
-        if let Some(stream) = self.stream.as_ref() {
-            // Use 128KB buffer for better large message performance
-            // This matches what uvloop uses internally
-            let mut buf = [0u8; 131072];
-            let mut s = stream;
+        if let Some(mut stream) = self.stream.as_ref() {
+            // Use pooled buffer for reading
+            let mut buf = BufferPool::acquire();
+            buf.reserve(131072);
+            unsafe { buf.set_len(131072) };
 
             // Try to read as much data as available in one syscall
-            match std::io::Read::read(&mut s, &mut buf) {
+            match stream.read(&mut buf[..]) {
                 Ok(0) => {
+                    BufferPool::release(buf);
                     // EOF - notify protocol
                     if let Ok(res) = self.protocol.call_method0(py, "eof_received") {
                         if let Ok(keep_open) = res.extract::<bool>(py) {
@@ -546,18 +566,51 @@ impl crate::transports::StreamTransport for TcpTransport {
                     }
                 }
                 Ok(n) => {
+                    unsafe { buf.set_len(n) };
                     // Create Python bytes and call protocol
                     let py_data = PyBytes::new(py, &buf[..n]);
+                    BufferPool::release(buf);
                     self.protocol
                         .call_method1(py, "data_received", (py_data,))?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    BufferPool::release(buf);
                     // No data available, will be called again when ready
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    BufferPool::release(buf);
+                    return Err(e.into());
+                }
             }
         }
         Ok(())
+    }
+
+    /// Zero-copy read into a Python buffer (bytearray, memoryview, etc.)
+    fn recv_into(&mut self, py: Python<'_>, buffer: Bound<'_, PyAny>) -> PyResult<usize> {
+        // Use PyBuffer to obtain a mutable view.
+        let buf_view = PyBuffer::<u8>::get(&buffer)?;
+        let slice = buf_view.as_mut_slice(py).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyBufferError, _>(
+                "Could not get buffer as mutable slice",
+            )
+        })?;
+
+        if let Some(mut stream) = self.stream.as_ref() {
+            // Convert slice to mutable bytes for reading
+            let slice_mut = unsafe {
+                std::slice::from_raw_parts_mut(slice.as_ptr() as *mut u8, slice.len())
+            };
+            match stream.read(slice_mut) {
+                Ok(n) => Ok(n),
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e.into()),
+            }
+        } else {
+            Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "Socket closed",
+            ))
+        }
     }
 
     /// Optimized write_ready handler
@@ -819,11 +872,10 @@ impl TcpTransport {
     }
 
     fn write(slf: &Bound<'_, Self>, data: &Bound<'_, PyBytes>) -> PyResult<()> {
-        let bytes = data.as_bytes();
         let mut self_ = slf.borrow_mut();
 
         // Delegate to trait implementation
-        StreamTransport::write(&mut *self_, slf.py(), bytes)?;
+        StreamTransport::write(&mut *self_, slf.py(), data.clone().into_any())?;
 
         // Register writer if needed
         if !self_.write_buffer.borrow().is_empty() {

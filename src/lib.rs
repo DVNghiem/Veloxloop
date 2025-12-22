@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 
+mod buffer_pool;
 mod callbacks;
 mod constants;
 #[cfg(target_os = "linux")]
@@ -19,7 +20,7 @@ use callbacks::AsyncConnectCallback;
 use event_loop::VeloxLoop;
 use policy::VeloxLoopPolicy;
 use socket::SocketOptions;
-use streams::{StreamReader, StreamWriter};
+use streams::{StreamReader, StreamWriter, VeloxBuffer};
 use transports::future::CompletedFuture;
 use transports::ssl::{SSLContext, SSLTransport};
 use transports::stream_server::{StreamServer, StreamTransport};
@@ -41,6 +42,7 @@ fn _veloxloop(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VeloxLoopPolicy>()?;
     m.add_class::<StreamReader>()?;
     m.add_class::<StreamWriter>()?;
+    m.add_class::<VeloxBuffer>()?;
     m.add_class::<StreamServer>()?;
     m.add_class::<StreamTransport>()?;
     m.add_class::<SocketOptions>()?;
