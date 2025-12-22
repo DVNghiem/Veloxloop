@@ -2,6 +2,8 @@ use pyo3::prelude::*;
 
 mod callbacks;
 mod constants;
+#[cfg(target_os = "linux")]
+mod epoll;
 mod event_loop;
 mod executor;
 mod handles;

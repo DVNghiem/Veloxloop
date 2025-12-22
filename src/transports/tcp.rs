@@ -843,6 +843,12 @@ impl TcpTransport {
         StreamTransport::write_ready(self, py)
     }
 
+    /// Zero-copy optimized read_ready handler
+    /// Key optimizations:
+    /// 1. No Vec allocation - data stays on stack
+    /// 2. PyBytes created directly from stack slice
+    /// 3. Minimal RefCell borrows
+    #[inline(always)]
     pub(crate) fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         
@@ -856,122 +862,106 @@ impl TcpTransport {
             }
         }
 
-        // Check if we have a direct reader path (streams API) - avoid Protocol callback overhead
+        // Check if we have a direct reader path (streams API)
         let has_reader = slf.borrow().reader.is_some();
         
-        // Action enum to separate I/O from callback dispatch
-        enum ReadAction {
-            Data(Vec<u8>),
-            Eof,
-            WouldBlock,
-        }
+        // Stack-allocated read buffer - 128KB for optimal large message performance
+        let mut buf = [0u8; 131072];
         
         if has_reader {
-            // Optimized path: Read directly into StreamReader's buffer
-            // This avoids Python callback overhead entirely
+            // StreamReader path: read directly into reader's buffer, no Python callback
             loop {
-                let action = {
+                // Read data while holding only stream borrow (not self_)
+                let read_result = {
                     let self_ = slf.borrow();
                     if self_.state.intersects(
                         TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
                     ) {
-                        ReadAction::WouldBlock
-                    } else if let Some(stream) = self_.stream.as_ref() {
-                        let mut buf = [0u8; 131072]; // 128KB
+                        break;
+                    }
+                    if let Some(stream) = self_.stream.as_ref() {
                         let mut s = stream;
-                        match std::io::Read::read(&mut s, &mut buf) {
-                            Ok(0) => ReadAction::Eof,
-                            Ok(n) => ReadAction::Data(buf[..n].to_vec()),
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => ReadAction::WouldBlock,
-                            Err(e) => return Err(e.into()),
-                        }
+                        std::io::Read::read(&mut s, &mut buf)
                     } else {
-                        ReadAction::WouldBlock
+                        break;
                     }
                 }; // self_ borrow dropped here
                 
-                match action {
-                    ReadAction::Data(data) => {
-                        // Feed data directly to reader's buffer and wake waiters
-                        let reader_clone = {
-                            let self_ = slf.borrow();
-                            self_.reader.as_ref().map(|r| r.clone_ref(py))
-                        };
-                        if let Some(reader_py) = reader_clone {
-                            // Feed data to buffer
-                            reader_py.bind(py).borrow().inner.borrow_mut().buffer.extend_from_slice(&data);
-                            // Wake waiters
-                            reader_py.bind(py).borrow()._wakeup_waiters(py)?;
-                        }
-                        // Continue reading if we got a full buffer
-                        if data.len() < 131072 {
-                            break;
-                        }
-                    }
-                    ReadAction::Eof => {
+                match read_result {
+                    Ok(0) => {
+                        // EOF
                         let self_ = slf.borrow();
                         if let Some(reader_py) = &self_.reader {
-                            let _ = reader_py.bind(py).borrow().feed_eof_native(py);
-                            reader_py.bind(py).borrow()._wakeup_waiters(py)?;
+                            let reader = reader_py.bind(py).borrow();
+                            let _ = reader.feed_eof_native(py);
+                            reader._wakeup_waiters(py)?;
                         }
                         drop(self_);
                         Self::close(slf)?;
                         break;
                     }
-                    ReadAction::WouldBlock => break,
-                }
-            }
-        } else {
-            // Protocol path: read and call data_received (uses Python callback)
-            // Use same action-based pattern for clean borrow management
-            loop {
-                let action = {
-                    let self_ = slf.borrow();
-                    if self_.state.intersects(
-                        TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
-                    ) {
-                        ReadAction::WouldBlock
-                    } else if let Some(stream) = self_.stream.as_ref() {
-                        let mut buf = [0u8; 131072]; // 128KB buffer
-                        let mut s = stream;
-                        match std::io::Read::read(&mut s, &mut buf) {
-                            Ok(0) => ReadAction::Eof,
-                            Ok(n) => ReadAction::Data(buf[..n].to_vec()),
-                            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => ReadAction::WouldBlock,
-                            Err(e) => return Err(e.into()),
+                    Ok(n) => {
+                        // Feed data directly to reader's buffer (zero-copy from stack)
+                        let reader_clone = {
+                            let self_ = slf.borrow();
+                            self_.reader.as_ref().map(|r| r.clone_ref(py))
+                        };
+                        if let Some(reader_py) = reader_clone {
+                            let reader = reader_py.bind(py).borrow();
+                            reader.inner.borrow_mut().buffer.extend_from_slice(&buf[..n]);
+                            reader._wakeup_waiters(py)?;
                         }
-                    } else {
-                        ReadAction::WouldBlock
-                    }
-                }; // self_ borrow dropped here
-                
-                match action {
-                    ReadAction::Data(data) => {
-                        let py_data = PyBytes::new(py, &data);
-                        let protocol = slf.borrow().protocol.clone_ref(py);
-                        protocol.call_method1(py, "data_received", (py_data,))?;
                         // Continue reading if we got a full buffer
-                        if data.len() < 131072 {
+                        if n < 131072 {
                             break;
                         }
                     }
-                    ReadAction::Eof => {
-                        let protocol = slf.borrow().protocol.clone_ref(py);
-                        if let Ok(res) = protocol.call_method0(py, "eof_received") {
-                            if let Ok(keep_open) = res.extract::<bool>(py) {
-                                if !keep_open {
-                                    Self::close(slf)?;
-                                }
-                            } else {
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        } else {
+            // Protocol path: read and call data_received
+            // Single read per callback (protocol may pause reading)
+            let read_result = {
+                let self_ = slf.borrow();
+                if self_.state.intersects(
+                    TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
+                ) {
+                    return Ok(());
+                }
+                if let Some(stream) = self_.stream.as_ref() {
+                    let mut s = stream;
+                    std::io::Read::read(&mut s, &mut buf)
+                } else {
+                    return Ok(());
+                }
+            }; // self_ borrow dropped here
+            
+            match read_result {
+                Ok(0) => {
+                    // EOF
+                    let protocol = slf.borrow().protocol.clone_ref(py);
+                    if let Ok(res) = protocol.call_method0(py, "eof_received") {
+                        if let Ok(keep_open) = res.extract::<bool>(py) {
+                            if !keep_open {
                                 Self::close(slf)?;
                             }
                         } else {
                             Self::close(slf)?;
                         }
-                        break;
+                    } else {
+                        Self::close(slf)?;
                     }
-                    ReadAction::WouldBlock => break,
                 }
+                Ok(n) => {
+                    // Create PyBytes directly from stack slice - no Vec allocation!
+                    let py_data = PyBytes::new(py, &buf[..n]);
+                    let protocol = slf.borrow().protocol.clone_ref(py);
+                    protocol.call_method1(py, "data_received", (py_data,))?;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(e.into()),
             }
         }
 

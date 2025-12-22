@@ -1,5 +1,6 @@
 use pyo3::types::{PyDict, PyTuple};
 use pyo3::{IntoPyObjectExt, prelude::*};
+use rustc_hash::FxHashSet;
 use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,13 +36,16 @@ pub struct VeloxLoop {
     timers: RefCell<Timers>,
     state: RefCell<HotState>,
     start_time: Instant,
-    last_poll_time: RefCell<Instant>,
     executor: RefCell<Option<ThreadPoolExecutor>>,
     exception_handler: RefCell<Option<Py<PyAny>>>,
     task_factory: RefCell<Option<Py<PyAny>>>,
     async_generators: RefCell<Vec<Py<PyAny>>>,
     callback_buffer: RefCell<Vec<Callback>>,
     pending_ios: RefCell<Vec<(RawFd, Option<Handle>, Option<Handle>, bool, bool)>>,
+    /// Track FDs registered with EPOLLONESHOT that are currently disabled (fired once)
+    /// Used for sock_recv/sock_sendall optimization - rearm with MOD instead of DEL+ADD
+    #[cfg(target_os = "linux")]
+    oneshot_disabled: RefCell<FxHashSet<RawFd>>,
 }
 
 unsafe impl Send for VeloxLoop {}
@@ -73,6 +77,55 @@ impl VeloxLoop {
             self.poller.borrow_mut().modify(fd, ev)?;
         } else {
             self.poller.borrow_mut().register(fd, ev)?;
+        }
+        Ok(())
+    }
+
+    /// Add a reader with oneshot mode (Linux only optimization).
+    /// The FD will auto-disable after one event, avoiding the need for remove_reader syscall.
+    /// For subsequent reads on the same FD, this uses rearm (MOD) instead of delete+add.
+    #[cfg(target_os = "linux")]
+    pub fn add_reader_oneshot(
+        &self,
+        fd: RawFd,
+        callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>,
+    ) -> PyResult<()> {
+        let mut handles = self.handles.borrow_mut();
+        handles.add_reader(fd, IoCallback::Native(callback));
+        drop(handles);
+
+        let ev = polling::Event::readable(fd as usize);
+
+        // Check if this FD is in the disabled-oneshot set
+        let mut oneshot_disabled = self.oneshot_disabled.borrow_mut();
+        if oneshot_disabled.remove(&fd) {
+            // FD is registered but disabled - rearm with MOD (1 syscall)
+            self.poller.borrow_mut().rearm_oneshot(fd, ev)?;
+        } else {
+            // FD not registered - register with oneshot (1 syscall)
+            self.poller.borrow_mut().register_oneshot(fd, ev)?;
+        }
+        Ok(())
+    }
+
+    /// Mark a oneshot FD as disabled (called when event fires).
+    /// This avoids the remove_reader syscall - the FD stays registered but disabled.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub fn mark_oneshot_disabled(&self, fd: RawFd) {
+        // Remove from handles since callback has fired
+        self.handles.borrow_mut().remove_reader(fd);
+        // Track that this FD is still registered but disabled
+        self.oneshot_disabled.borrow_mut().insert(fd);
+    }
+
+    /// Clean up a oneshot FD completely (e.g., when socket is closed).
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub fn cleanup_oneshot(&self, fd: RawFd) -> PyResult<()> {
+        if self.oneshot_disabled.borrow_mut().remove(&fd) {
+            // FD was in disabled state - need to delete it
+            self.poller.borrow_mut().delete(fd)?;
         }
         Ok(())
     }
@@ -143,13 +196,14 @@ impl VeloxLoop {
                 is_polling: false,
             }),
             start_time: Instant::now(),
-            last_poll_time: RefCell::new(Instant::now()),
             executor: RefCell::new(None),
             exception_handler: RefCell::new(None),
             task_factory: RefCell::new(None),
             async_generators: RefCell::new(Vec::new()),
             callback_buffer: RefCell::new(Vec::with_capacity(1024)),
             pending_ios: RefCell::new(Vec::with_capacity(128)),
+            #[cfg(target_os = "linux")]
+            oneshot_disabled: RefCell::new(FxHashSet::with_capacity_and_hasher(64, Default::default())),
         })
     }
 
@@ -820,54 +874,150 @@ impl VeloxLoop {
         Ok(future.into_any())
     }
 
+    #[inline(always)]
     fn sock_recv(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
-        use crate::callbacks::SockRecvCallback;
         use pyo3::types::PyBytes;
+        use std::sync::Arc;
+        use crate::transports::future::CompletedFuture;
 
         let py = slf.py();
         let self_ = slf.borrow();
 
+        // Fast FD extraction using slot access when available
         let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
 
-        // Try to recv immediately
-        let mut buf = vec![0u8; nbytes];
-        unsafe {
-            let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
+        // Try to recv immediately using stack buffer for small reads
+        const STACK_BUF_SIZE: usize = 65536; // 64KB
+        
+        if nbytes <= STACK_BUF_SIZE {
+            let mut buf = [0u8; STACK_BUF_SIZE];
+            unsafe {
+                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
 
-            if n >= 0 {
-                buf.truncate(n as usize);
-                let bytes = PyBytes::new(py, &buf);
-                let fut = PendingFuture::new();
-                fut.set_result(py, bytes.into())?;
-                return Ok(Py::new(py, fut)?.into_any());
+                if n >= 0 {
+                    // Fast path: use CompletedFuture (no Mutex, no state tracking)
+                    let bytes = PyBytes::new(py, &buf[..n as usize]);
+                    let fut = CompletedFuture::new(bytes.into_any().unbind());
+                    return Ok(Py::new(py, fut)?.into_any());
+                }
+
+                let err = std::io::Error::last_os_error();
+                match err.kind() {
+                    std::io::ErrorKind::WouldBlock => {}
+                    _ if err.raw_os_error() == Some(libc::EAGAIN) => {}
+                    _ => {
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                            err.to_string(),
+                        ));
+                    }
+                }
             }
+        } else {
+            let mut buf = vec![0u8; nbytes];
+            unsafe {
+                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
 
-            let err = std::io::Error::last_os_error();
-            match err.kind() {
-                std::io::ErrorKind::WouldBlock => {}
-                _ if err.raw_os_error() == Some(libc::EAGAIN) => {}
-                _ => {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        err.to_string(),
-                    ));
+                if n >= 0 {
+                    buf.truncate(n as usize);
+                    // Fast path: use CompletedFuture (no Mutex, no state tracking)
+                    let bytes = PyBytes::new(py, &buf);
+                    let fut = CompletedFuture::new(bytes.into_any().unbind());
+                    return Ok(Py::new(py, fut)?.into_any());
+                }
+
+                let err = std::io::Error::last_os_error();
+                match err.kind() {
+                    std::io::ErrorKind::WouldBlock => {}
+                    _ if err.raw_os_error() == Some(libc::EAGAIN) => {}
+                    _ => {
+                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                            err.to_string(),
+                        ));
+                    }
                 }
             }
         }
 
-        // Would block - wait for readable
+        // Would block - wait for readable using native callback
         let future = self_.create_future(py)?;
         let loop_ref = slf.clone().unbind();
+        let future_clone = future.clone_ref(py);
 
-        let callback_obj = SockRecvCallback::new(loop_ref, future.clone_ref(py), fd, nbytes);
-        let callback = Py::new(py, callback_obj)?;
+        // Native callback - optimized for speed
+        #[cfg(target_os = "linux")]
+        {
+            // On Linux: Use oneshot mode - FD auto-disables after one event
+            // No need for AtomicBool since oneshot guarantees single delivery
+            let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> = Arc::new(move |py: Python<'_>| {
+                // Read data using stack buffer for small reads
+                let mut buf = [0u8; 65536];
+                let read_size = nbytes.min(65536);
+                
+                let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0) };
+                
+                // Mark FD as disabled-oneshot (no syscall needed - auto-disabled by EPOLLONESHOT)
+                loop_ref.bind(py).borrow().mark_oneshot_disabled(fd);
+                
+                if n >= 0 {
+                    let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+                    future_clone.bind(py).borrow().set_result(py, bytes.into())?;
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::WouldBlock && err.raw_os_error() != Some(libc::EAGAIN) {
+                        let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
+                        let exc_val = py_err.value(py).as_any().clone().unbind();
+                        future_clone.bind(py).borrow().set_exception(py, exc_val)?;
+                    }
+                }
+                Ok(())
+            });
 
-        self_.add_reader(py, fd, callback.into_any())?;
+            self_.add_reader_oneshot(fd, native_callback)?;
+        }
+        
+        #[cfg(not(target_os = "linux"))]
+        {
+            // On non-Linux: Use AtomicBool to ensure callback only runs once
+            let handled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let handled_clone = handled.clone();
+
+            let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> = Arc::new(move |py: Python<'_>| {
+                // Fast path: already handled
+                if handled_clone.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(());
+                }
+                
+                // Read data using stack buffer for small reads
+                let mut buf = [0u8; 65536];
+                let read_size = nbytes.min(65536);
+                
+                let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0) };
+                
+                // Remove reader to stop future callbacks
+                let _ = loop_ref.bind(py).borrow().remove_reader(py, fd);
+                
+                if n >= 0 {
+                    let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+                    future_clone.bind(py).borrow().set_result(py, bytes.into())?;
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::WouldBlock && err.raw_os_error() != Some(libc::EAGAIN) {
+                        let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
+                        let exc_val = py_err.value(py).as_any().clone().unbind();
+                        future_clone.bind(py).borrow().set_exception(py, exc_val)?;
+                    }
+                }
+                Ok(())
+            });
+
+            self_.add_reader_native(fd, native_callback)?;
+        }
 
         Ok(future.into_any())
     }
 
     fn sock_sendall(slf: &Bound<'_, Self>, sock: Py<PyAny>, data: &[u8]) -> PyResult<Py<PyAny>> {
-        use crate::callbacks::SockSendallCallback;
+        use std::sync::{Arc, Mutex};
 
         let py = slf.py();
         let self_ = slf.borrow();
@@ -904,22 +1054,59 @@ impl VeloxLoop {
         }
 
         if total_sent == data_vec.len() {
-            // All data sent
-            let fut = PendingFuture::new();
-            fut.set_result(py, py.None())?;
+            // All data sent - use CompletedFuture for fast path
+            use crate::transports::future::CompletedFuture;
+            let fut = CompletedFuture::new(py.None());
             return Ok(Py::new(py, fut)?.into_any());
         }
 
-        // Need to wait for writable
+        // Need to wait for writable - use native callback
         let future = self_.create_future(py)?;
         let loop_ref = slf.clone().unbind();
-        let remaining_data = data_vec[total_sent..].to_vec();
+        let remaining_data = Arc::new(Mutex::new(data_vec[total_sent..].to_vec()));
+        let sent_counter = Arc::new(Mutex::new(0usize));
+        let future_clone = future.clone_ref(py);
 
-        let callback_obj =
-            SockSendallCallback::new(loop_ref, future.clone_ref(py), fd, remaining_data, 0);
-        let callback = Py::new(py, callback_obj)?;
+        // Native callback for sendall - avoids Python callback overhead
+        let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> = Arc::new(move |py: Python<'_>| {
+            let mut sent = sent_counter.lock().unwrap();
+            let data = remaining_data.lock().unwrap();
+            
+            while *sent < data.len() {
+                unsafe {
+                    let n = libc::send(
+                        fd,
+                        data[*sent..].as_ptr() as *const libc::c_void,
+                        data.len() - *sent,
+                        0,
+                    );
 
-        self_.add_writer(py, fd, callback.into_any())?;
+                    if n > 0 {
+                        *sent += n as usize;
+                    } else {
+                        let err = std::io::Error::last_os_error();
+                        match err.kind() {
+                            std::io::ErrorKind::WouldBlock => return Ok(()),
+                            _ if err.raw_os_error() == Some(libc::EAGAIN) => return Ok(()),
+                            _ => {
+                                let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
+                                let exc_val = py_err.value(py).as_any().clone().unbind();
+                                future_clone.bind(py).borrow().set_exception(py, exc_val)?;
+                                loop_ref.bind(py).borrow().remove_writer(py, fd)?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // All sent
+            future_clone.bind(py).borrow().set_result(py, py.None())?;
+            loop_ref.bind(py).borrow().remove_writer(py, fd)?;
+            Ok(())
+        });
+
+        self_.add_writer_native(fd, native_callback)?;
 
         Ok(future.into_any())
     }
@@ -1322,154 +1509,58 @@ impl VeloxLoop {
     /// Optimized single iteration of the event loop
     /// Key optimizations:
     /// 1. Reduced RefCell borrows in hot path
-    /// 2. Batch re-arming of FDs to reduce syscalls  
+    /// 2. On Linux: Direct epoll with level-triggered mode (no re-arming!)
     /// 3. Inline callback dispatch
     /// 4. Skip redundant modify() calls via interest tracking
-    fn _run_once(&self, py: Python<'_>, events: &mut polling::Events) -> VeloxResult<()> {
-        let now = Instant::now();
+    #[inline(always)]
+    fn _run_once(&self, py: Python<'_>, _events: &mut polling::Events) -> VeloxResult<()> {
         let has_callbacks = !self.callbacks.borrow().is_empty();
 
-        // Skip-poll optimization: if we have callbacks and polled recently, skip poll
-        let skip_poll = {
-            let last_poll = self.last_poll_time.borrow();
-            has_callbacks && now.duration_since(*last_poll).as_nanos() < 50_000
+        // Calculate timeout
+        let timeout = if has_callbacks {
+            Some(Duration::ZERO)
+        } else {
+            let timers = self.timers.borrow();
+            if let Some(next) = timers.next_expiry() {
+                let now_ns = (self.time() * 1_000_000_000.0) as u64;
+                if next > now_ns {
+                    Some(Duration::from_nanos(next - now_ns))
+                } else {
+                    Some(Duration::ZERO)
+                }
+            } else {
+                // Default poll timeout when no timers
+                Some(Duration::from_millis(10))
+            }
         };
 
-        if !skip_poll {
-            // Calculate timeout - optimize timer check
-            let timeout = if has_callbacks {
-                Some(Duration::ZERO)
-            } else {
-                let timers = self.timers.borrow();
-                if let Some(next) = timers.next_expiry() {
-                    let now_ns = (self.time() * 1_000_000_000.0) as u64;
-                    if next > now_ns {
-                        Some(Duration::from_nanos(next - now_ns))
-                    } else {
-                        Some(Duration::ZERO)
-                    }
-                } else {
-                    // Default poll timeout when no timers
-                    Some(Duration::from_millis(10))
-                }
-            };
-
-            // Poll - minimize state mutations
-            self.state.borrow_mut().is_polling = true;
-            let res = self.poller.borrow_mut().poll(events, timeout);
+        // Poll - minimize state mutations
+        self.state.borrow_mut().is_polling = true;
+        
+        // Use native epoll on Linux for maximum performance
+        #[cfg(target_os = "linux")]
+        {
+            let events = self.poller.borrow_mut().poll_native(timeout);
             self.state.borrow_mut().is_polling = false;
-
-            match res {
-                Ok(_) => {
-                    *self.last_poll_time.borrow_mut() = Instant::now();
+            
+            match events {
+                Ok(evs) => {
+                    self._process_native_events(py, evs)?;
                 }
                 Err(e) => return Err(e),
             }
         }
-
-        // Process I/O Events - optimized path
-        let event_count = events.len();
-        if event_count > 0 {
-            let mut pending = self.pending_ios.borrow_mut();
-            pending.clear();
+        
+        #[cfg(not(target_os = "linux"))]
+        {
+            let res = self.poller.borrow_mut().poll(_events, timeout);
+            self.state.borrow_mut().is_polling = false;
             
-            // Reserve capacity if needed  
-            let capacity = pending.capacity();
-            if capacity < event_count {
-                pending.reserve(event_count - capacity);
-            }
-
-            // Collect events while holding handles borrow
-            {
-                let handles = self.handles.borrow();
-                for event in events.iter() {
-                    let fd = event.key as RawFd;
-                    if let Some((r_handle, w_handle)) = handles.get_state_owned(fd) {
-                        let reader_cb = if event.readable {
-                            r_handle.as_ref().filter(|h| !h.cancelled).cloned()
-                        } else {
-                            None
-                        };
-                        let writer_cb = if event.writable {
-                            w_handle.as_ref().filter(|h| !h.cancelled).cloned()
-                        } else {
-                            None
-                        };
-
-                        pending.push((
-                            fd,
-                            reader_cb,
-                            writer_cb,
-                            r_handle.is_some(),
-                            w_handle.is_some(),
-                        ));
-                    }
+            match res {
+                Ok(_) => {
+                    self._process_polling_events(py, _events)?;
                 }
-            }
-
-            // Dispatch I/O callbacks - inlined for performance
-            for (_, r_h, w_h, _, _) in pending.iter() {
-                // Handle read callback
-                if let Some(h) = r_h {
-                    let res = match &h.callback {
-                        IoCallback::Python(cb) => cb.call0(py).map(|_| ()),
-                        IoCallback::Native(cb) => cb(py),
-                        IoCallback::TcpRead(tcp) => {
-                            crate::transports::tcp::TcpTransport::_read_ready(tcp.bind(py))
-                        }
-                        IoCallback::TcpWrite(tcp) => {
-                            let tcp_bound = tcp.bind(py);
-                            crate::transports::tcp::TcpTransport::_write_ready(
-                                &mut *tcp_bound.borrow_mut(),
-                                py,
-                            )
-                        }
-                    };
-                    if let Err(e) = res {
-                        e.print(py);
-                    }
-                }
-                
-                // Handle write callback
-                if let Some(h) = w_h {
-                    let res = match &h.callback {
-                        IoCallback::Python(cb) => cb.call0(py).map(|_| ()),
-                        IoCallback::Native(cb) => cb(py),
-                        IoCallback::TcpRead(tcp) => {
-                            crate::transports::tcp::TcpTransport::_read_ready(tcp.bind(py))
-                        }
-                        IoCallback::TcpWrite(tcp) => {
-                            let tcp_bound = tcp.bind(py);
-                            crate::transports::tcp::TcpTransport::_write_ready(
-                                &mut *tcp_bound.borrow_mut(),
-                                py,
-                            )
-                        }
-                    };
-                    if let Err(e) = res {
-                        e.print(py);
-                    }
-                }
-            }
-
-            // Re-arm FDs - optimized to skip unchanged interests
-            // The poller now tracks interests and skips redundant modify() calls
-            {
-                let mut poller = self.poller.borrow_mut();
-                for (fd, _, _, has_r, has_w) in pending.iter() {
-                    if *has_r || *has_w {
-                        let mut ev = if *has_r {
-                            polling::Event::readable(*fd as usize)
-                        } else {
-                            polling::Event::writable(*fd as usize)
-                        };
-                        if *has_r && *has_w {
-                            ev.writable = true;
-                        }
-                        // Poller's modify() now skips if interest unchanged
-                        let _ = poller.modify(*fd, ev);
-                    }
-                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -1490,6 +1581,191 @@ impl VeloxLoop {
 
         for cb in cb_batch.drain(..) {
             let _ = cb.callback.bind(py).call(PyTuple::new(py, cb.args)?, None);
+        }
+
+        Ok(())
+    }
+
+    /// Process events from native epoll (Linux)
+    /// Level-triggered mode - NO re-arming needed!
+    #[cfg(target_os = "linux")]
+    #[inline(always)]
+    fn _process_native_events(&self, py: Python<'_>, events: Vec<crate::epoll::Event>) -> VeloxResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // For single event (common case), avoid collection overhead
+        if events.len() == 1 {
+            let event = &events[0];
+            let fd = event.fd;
+            
+            // Get callbacks to execute
+            let (read_cb, write_cb) = {
+                let handles = self.handles.borrow();
+                if let Some((r_handle, w_handle)) = handles.map.get(&fd) {
+                    let r = if event.readable {
+                        r_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                    } else {
+                        None
+                    };
+                    let w = if event.writable {
+                        w_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                    } else {
+                        None
+                    };
+                    (r, w)
+                } else {
+                    (None, None)
+                }
+            };
+            
+            // Execute callbacks (handles borrow is released)
+            if let Some(h) = read_cb {
+                if let Err(e) = h.execute(py) {
+                    e.print(py);
+                }
+            }
+            if let Some(h) = write_cb {
+                if let Err(e) = h.execute(py) {
+                    e.print(py);
+                }
+            }
+            return Ok(());
+        }
+
+        // For multiple events, use the collection approach
+        let mut pending = self.pending_ios.borrow_mut();
+        pending.clear();
+
+        // Reserve capacity if needed
+        let event_count = events.len();
+        let capacity = pending.capacity();
+        if capacity < event_count {
+            pending.reserve(event_count - capacity);
+        }
+
+        // Collect events while holding handles borrow
+        {
+            let handles = self.handles.borrow();
+            for event in events.iter() {
+                let fd = event.fd;
+                if let Some((r_handle, w_handle)) = handles.get_state_owned(fd) {
+                    let reader_cb = if event.readable {
+                        r_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                    } else {
+                        None
+                    };
+                    let writer_cb = if event.writable {
+                        w_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                    } else {
+                        None
+                    };
+
+                    pending.push((
+                        fd,
+                        reader_cb,
+                        writer_cb,
+                        r_handle.is_some(),
+                        w_handle.is_some(),
+                    ));
+                }
+            }
+        }
+
+        // Dispatch I/O callbacks
+        for (_, r_h, w_h, _, _) in pending.iter() {
+            if let Some(h) = r_h {
+                if let Err(e) = h.execute(py) {
+                    e.print(py);
+                }
+            }
+            if let Some(h) = w_h {
+                if let Err(e) = h.execute(py) {
+                    e.print(py);
+                }
+            }
+        }
+
+        // NOTE: No re-arming needed! Level-triggered epoll keeps the FD active.
+        // This eliminates syscall overhead that the polling crate has.
+
+        Ok(())
+    }
+
+    /// Process events from polling crate (non-Linux platforms)
+    #[cfg(not(target_os = "linux"))]
+    #[inline(always)]
+    fn _process_polling_events(&self, py: Python<'_>, events: &polling::Events) -> VeloxResult<()> {
+        let event_count = events.len();
+        if event_count == 0 {
+            return Ok(());
+        }
+
+        let mut pending = self.pending_ios.borrow_mut();
+        pending.clear();
+
+        let capacity = pending.capacity();
+        if capacity < event_count {
+            pending.reserve(event_count - capacity);
+        }
+
+        {
+            let handles = self.handles.borrow();
+            for event in events.iter() {
+                let fd = event.key as RawFd;
+                if let Some((r_handle, w_handle)) = handles.get_state_owned(fd) {
+                    let reader_cb = if event.readable {
+                        r_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                    } else {
+                        None
+                    };
+                    let writer_cb = if event.writable {
+                        w_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                    } else {
+                        None
+                    };
+
+                    pending.push((
+                        fd,
+                        reader_cb,
+                        writer_cb,
+                        r_handle.is_some(),
+                        w_handle.is_some(),
+                    ));
+                }
+            }
+        }
+
+        for (_, r_h, w_h, _, _) in pending.iter() {
+            if let Some(h) = r_h {
+                if let Err(e) = h.execute(py) {
+                    e.print(py);
+                }
+            }
+            if let Some(h) = w_h {
+                if let Err(e) = h.execute(py) {
+                    e.print(py);
+                }
+            }
+        }
+
+        // Re-arm FDs for oneshot polling mode (non-Linux only)
+        {
+            let mut poller = self.poller.borrow_mut();
+            for (fd, _, _, has_r, has_w) in pending.iter() {
+                if *has_r || *has_w {
+                    let mut ev = if *has_r {
+                        polling::Event::readable(*fd as usize)
+                    } else {
+                        polling::Event::writable(*fd as usize)
+                    };
+                    if *has_r && *has_w {
+                        ev.writable = true;
+                    }
+                    let _ = poller.modify(*fd, ev);
+                }
+            }
         }
 
         Ok(())

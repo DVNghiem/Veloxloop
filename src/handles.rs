@@ -29,7 +29,7 @@ pub struct Handle {
 
 impl Handle {
     /// Execute the callback - inlined for performance
-    #[inline]
+    #[inline(always)]
     pub fn execute(&self, py: Python<'_>) -> PyResult<()> {
         if self.cancelled {
             return Ok(());

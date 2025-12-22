@@ -345,7 +345,7 @@ impl SockAcceptCallback {
     }
 }
 
-/// Callback for sock_recv
+/// Callback for sock_recv - optimized to minimize allocations
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct SockRecvCallback {
     future: Py<PendingFuture>,
@@ -356,30 +356,65 @@ pub struct SockRecvCallback {
 
 #[pymethods]
 impl SockRecvCallback {
+    #[inline(always)]
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
-        let mut buf = vec![0u8; self.nbytes];
-        unsafe {
-            let n = libc::recv(
-                self.fd,
-                buf.as_mut_ptr() as *mut libc::c_void,
-                self.nbytes,
-                0,
-            );
+        // Use stack buffer for small reads (most common case in benchmarks)
+        // For larger reads, fall back to heap allocation
+        const STACK_BUF_SIZE: usize = 65536; // 64KB stack buffer
+        
+        if self.nbytes <= STACK_BUF_SIZE {
+            let mut buf = [0u8; STACK_BUF_SIZE];
+            unsafe {
+                let n = libc::recv(
+                    self.fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    self.nbytes,
+                    0,
+                );
 
-            if n >= 0 {
-                buf.truncate(n as usize);
-                let bytes = PyBytes::new(py, &buf);
-                self.future.bind(py).borrow().set_result(py, bytes.into())?;
-                self.loop_.bind(py).borrow().remove_reader(py, self.fd)?;
-            } else {
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::WouldBlock
-                    && err.raw_os_error() != Some(libc::EAGAIN)
-                {
-                    let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
-                    let exc_val = py_err.value(py).as_any().clone().unbind();
-                    self.future.bind(py).borrow().set_exception(py, exc_val)?;
+                if n >= 0 {
+                    // Create PyBytes directly from stack slice - no heap allocation!
+                    let bytes = PyBytes::new(py, &buf[..n as usize]);
+                    self.future.bind(py).borrow().set_result(py, bytes.into())?;
                     self.loop_.bind(py).borrow().remove_reader(py, self.fd)?;
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::WouldBlock
+                        && err.raw_os_error() != Some(libc::EAGAIN)
+                    {
+                        let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
+                        let exc_val = py_err.value(py).as_any().clone().unbind();
+                        self.future.bind(py).borrow().set_exception(py, exc_val)?;
+                        self.loop_.bind(py).borrow().remove_reader(py, self.fd)?;
+                    }
+                }
+            }
+        } else {
+            // Large buffer - heap allocate
+            let mut buf = vec![0u8; self.nbytes];
+            unsafe {
+                let n = libc::recv(
+                    self.fd,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    self.nbytes,
+                    0,
+                );
+
+                if n >= 0 {
+                    buf.truncate(n as usize);
+                    let bytes = PyBytes::new(py, &buf);
+                    self.future.bind(py).borrow().set_result(py, bytes.into())?;
+                    self.loop_.bind(py).borrow().remove_reader(py, self.fd)?;
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::WouldBlock
+                        && err.raw_os_error() != Some(libc::EAGAIN)
+                    {
+                        let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
+                        let exc_val = py_err.value(py).as_any().clone().unbind();
+                        self.future.bind(py).borrow().set_exception(py, exc_val)?;
+                        self.loop_.bind(py).borrow().remove_reader(py, self.fd)?;
+                    }
                 }
             }
         }
