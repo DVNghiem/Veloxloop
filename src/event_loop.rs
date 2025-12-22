@@ -582,10 +582,11 @@ impl VeloxLoop {
     }
 
     fn call_exception_handler(&self, py: Python<'_>, context: Py<PyDict>) -> PyResult<()> {
-        let handler = {
-            let eh = self.exception_handler.borrow();
-            eh.as_ref().map(|h| h.clone_ref(py))
-        };
+        let handler = self
+            .exception_handler
+            .borrow()
+            .as_ref()
+            .map(|h| h.clone_ref(py));
 
         if let Some(handler) = handler {
             // Call handler with (loop, context) as per asyncio API
@@ -594,8 +595,8 @@ impl VeloxLoop {
                 Ok(_) => {}
                 Err(e) => {
                     // If custom handler fails, fall back to default
-                    eprintln!("Error in custom exception handler: {:?}", e);
-                    e.print(py);
+                    eprintln!("Error in custom exception handler:");
+                    e.print_and_set_sys_last_vars(py);
                     // Fall through to default handler
                     let message = context.bind(py).get_item("message")?;
                     if let Some(msg) = message {
@@ -604,14 +605,23 @@ impl VeloxLoop {
                 }
             }
         } else {
-            // Default exception handler - just print to stderr
+            // Default exception handler - print full traceback to stderr
             let message = context.bind(py).get_item("message")?;
             if let Some(msg) = message {
-                eprintln!("Exception in event loop: {}", msg);
+                eprintln!("{}", msg);
             }
             let exception = context.bind(py).get_item("exception")?;
             if let Some(exc) = exception {
-                eprintln!("Exception: {:?}", exc);
+                // Print full traceback like asyncio does
+                if let Ok(traceback_module) = py.import("traceback") {
+                    if let Ok(print_exception) = traceback_module.getattr("print_exception") {
+                        let _ = print_exception.call1((exc,));
+                    }
+                } else {
+                    // Fallback: use PyErr's print method
+                    let py_err = PyErr::from_value(exc.unbind().clone_ref(py).into_bound(py));
+                    py_err.print_and_set_sys_last_vars(py);
+                }
             }
         }
         Ok(())
@@ -874,147 +884,161 @@ impl VeloxLoop {
     }
 
     #[inline(always)]
-    fn sock_recv(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
-        use pyo3::types::PyBytes;
-        use std::sync::Arc;
-        use crate::transports::future::CompletedFuture;
+fn sock_recv(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
+    use pyo3::types::PyBytes;
+    use std::sync::Arc;
+    use crate::transports::future::CompletedFuture;
 
-        let py = slf.py();
-        let self_ = slf.borrow();
+    let py = slf.py();
+    let self_ = slf.borrow();
 
-        // Fast FD extraction using slot access when available
-        let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
-
-        // Try to recv immediately using stack buffer for small reads
-        const STACK_BUF_SIZE: usize = 65536; // 64KB
-        
-        if nbytes <= STACK_BUF_SIZE {
-            let mut buf = [0u8; STACK_BUF_SIZE];
-            unsafe {
-                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
-
-                if n >= 0 {
-                    // Fast path: use CompletedFuture (no Mutex, no state tracking)
-                    let bytes = PyBytes::new(py, &buf[..n as usize]);
-                    let fut = CompletedFuture::new(bytes.into_any().unbind());
-                    return Ok(Py::new(py, fut)?.into_any());
-                }
-
-                let err = std::io::Error::last_os_error();
-                match err.kind() {
-                    std::io::ErrorKind::WouldBlock => {}
-                    _ if err.raw_os_error() == Some(libc::EAGAIN) => {}
-                    _ => {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            err.to_string(),
-                        ));
-                    }
-                }
-            }
-        } else {
-            let mut buf = vec![0u8; nbytes];
-            unsafe {
-                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
-
-                if n >= 0 {
-                    buf.truncate(n as usize);
-                    // Fast path: use CompletedFuture (no Mutex, no state tracking)
-                    let bytes = PyBytes::new(py, &buf);
-                    let fut = CompletedFuture::new(bytes.into_any().unbind());
-                    return Ok(Py::new(py, fut)?.into_any());
-                }
-
-                let err = std::io::Error::last_os_error();
-                match err.kind() {
-                    std::io::ErrorKind::WouldBlock => {}
-                    _ if err.raw_os_error() == Some(libc::EAGAIN) => {}
-                    _ => {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                            err.to_string(),
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Would block - wait for readable using native callback
-        let future = self_.create_future(py)?;
-        let loop_ref = slf.clone().unbind();
-        let future_clone = future.clone_ref(py);
-
-        // Native callback - optimized for speed
-        #[cfg(target_os = "linux")]
-        {
-            // On Linux: Use oneshot mode - FD auto-disables after one event
-            // No need for AtomicBool since oneshot guarantees single delivery
-            let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> = Arc::new(move |py: Python<'_>| {
-                // Read data using stack buffer for small reads
-                let mut buf = [0u8; 65536];
-                let read_size = nbytes.min(65536);
-                
-                let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0) };
-                
-                // Mark FD as disabled-oneshot (no syscall needed - auto-disabled by EPOLLONESHOT)
-                loop_ref.bind(py).borrow().mark_oneshot_disabled(fd);
-                
-                if n >= 0 {
-                    let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
-                    future_clone.bind(py).borrow().set_result(py, bytes.into())?;
-                } else {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() != std::io::ErrorKind::WouldBlock && err.raw_os_error() != Some(libc::EAGAIN) {
-                        let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
-                        let exc_val = py_err.value(py).as_any().clone().unbind();
-                        future_clone.bind(py).borrow().set_exception(py, exc_val)?;
-                    }
-                }
-                Ok(())
-            });
-
-            self_.add_reader_oneshot(fd, native_callback)?;
-        }
-        
-        #[cfg(not(target_os = "linux"))]
-        {
-            // On non-Linux: Use AtomicBool to ensure callback only runs once
-            let handled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let handled_clone = handled.clone();
-
-            let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> = Arc::new(move |py: Python<'_>| {
-                // Fast path: already handled
-                if handled_clone.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    return Ok(());
-                }
-                
-                // Read data using stack buffer for small reads
-                let mut buf = [0u8; 65536];
-                let read_size = nbytes.min(65536);
-                
-                let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0) };
-                
-                // Remove reader to stop future callbacks
-                let _ = loop_ref.bind(py).borrow().remove_reader(py, fd);
-                
-                if n >= 0 {
-                    let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
-                    future_clone.bind(py).borrow().set_result(py, bytes.into())?;
-                } else {
-                    let err = std::io::Error::last_os_error();
-                    if err.kind() != std::io::ErrorKind::WouldBlock && err.raw_os_error() != Some(libc::EAGAIN) {
-                        let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
-                        let exc_val = py_err.value(py).as_any().clone().unbind();
-                        future_clone.bind(py).borrow().set_exception(py, exc_val)?;
-                    }
-                }
-                Ok(())
-            });
-
-            self_.add_reader_native(fd, native_callback)?;
-        }
-
-        Ok(future.into_any())
+    let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
+    
+    if fd < 0 {
+        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+            "Invalid file descriptor"
+        ));
     }
 
+    // Try immediate recv
+    const STACK_BUF_SIZE: usize = 65536;
+    
+    if nbytes <= STACK_BUF_SIZE {
+        let mut buf = [0u8; STACK_BUF_SIZE];
+        unsafe {
+            let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
+
+            if n > 0 {
+                let bytes = PyBytes::new(py, &buf[..n as usize]);
+                let fut = CompletedFuture::new(bytes.into_any().unbind());
+                return Ok(Py::new(py, fut)?.into_any());
+            } else if n == 0 {
+                // Socket closed by peer - return empty bytes
+                let bytes = PyBytes::new(py, &[]);
+                let fut = CompletedFuture::new(bytes.into_any().unbind());
+                return Ok(Py::new(py, fut)?.into_any());
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock && err.raw_os_error() != Some(libc::EAGAIN) {
+                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                    err.to_string(),
+                ));
+            }
+        }
+    } else {
+        let mut buf = vec![0u8; nbytes];
+        unsafe {
+            let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
+
+            if n > 0 {
+                buf.truncate(n as usize);
+                let bytes = PyBytes::new(py, &buf);
+                let fut = CompletedFuture::new(bytes.into_any().unbind());
+                return Ok(Py::new(py, fut)?.into_any());
+            } else if n == 0 {
+                // Socket closed by peer - return empty bytes
+                let bytes = PyBytes::new(py, &[]);
+                let fut = CompletedFuture::new(bytes.into_any().unbind());
+                return Ok(Py::new(py, fut)?.into_any());
+            }
+
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::WouldBlock && err.raw_os_error() != Some(libc::EAGAIN) {
+                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                    err.to_string(),
+                ));
+            }
+        }
+    }
+
+    let future = self_.create_future(py)?;
+    let loop_ref = slf.clone().unbind();
+    let future_clone = future.clone_ref(py);
+
+    #[cfg(target_os = "linux")]
+    {
+        let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> = 
+            Arc::new(move |py: Python<'_>| {
+            // Mark oneshot as disabled FIRST, before any other operations
+            loop_ref.bind(py).borrow().mark_oneshot_disabled(fd);
+            
+            // Now attempt to read
+            let mut buf = [0u8; 65536];
+            let read_size = nbytes.min(65536);
+            
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0) };
+            
+            if n > 0 {
+                let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+                let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+            } else if n == 0 {
+                // EOF - socket closed by peer
+                let bytes = pyo3::types::PyBytes::new(py, &[]);
+                let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+            } else {
+                let err = std::io::Error::last_os_error();
+                
+                // Only set exception for real errors, not EAGAIN
+                if err.kind() != std::io::ErrorKind::WouldBlock 
+                    && err.raw_os_error() != Some(libc::EAGAIN)
+                    && err.raw_os_error() != Some(libc::EBADF) {
+                    let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
+                    let exc_val = py_err.value(py).as_any().clone().unbind();
+                    let _ = future_clone.bind(py).borrow().set_exception(py, exc_val);
+                } else if err.raw_os_error() == Some(libc::EBADF) {
+                    // Socket was closed - return empty
+                    let bytes = pyo3::types::PyBytes::new(py, &[]);
+                    let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                }
+            }
+            Ok(())
+        });
+
+        self_.add_reader_oneshot(fd, native_callback)?;
+    }
+    
+    #[cfg(not(target_os = "linux"))]
+    {
+        let handled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handled_clone = handled.clone();
+
+        let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> = 
+            Arc::new(move |py: Python<'_>| {
+            if handled_clone.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                return Ok(());
+            }
+            
+            let mut buf = [0u8; 65536];
+            let read_size = nbytes.min(65536);
+            
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0) };
+            
+            let _ = loop_ref.bind(py).borrow().remove_reader(py, fd);
+            
+            if n > 0 {
+                let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+                let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+            } else if n == 0 {
+                let bytes = pyo3::types::PyBytes::new(py, &[]);
+                let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+            } else {
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::WouldBlock 
+                    && err.raw_os_error() != Some(libc::EAGAIN) {
+                    let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
+                    let exc_val = py_err.value(py).as_any().clone().unbind();
+                    let _ = future_clone.bind(py).borrow().set_exception(py, exc_val);
+                }
+            }
+            Ok(())
+        });
+
+        self_.add_reader_native(fd, native_callback)?;
+    }
+
+    Ok(future.into_any())
+}
     fn sock_sendall(slf: &Bound<'_, Self>, sock: Py<PyAny>, data: &[u8]) -> PyResult<Py<PyAny>> {
         use std::sync::{Arc, Mutex};
 
