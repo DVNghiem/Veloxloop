@@ -11,3 +11,5 @@ pub const WHEEL_MASK: u32 = (WHEEL_SIZE as u32) - 1;
 
 pub const WHEELS: usize = 4;
 pub const PRECISION_NS: u64 = 1_000_000; // 1ms - keep for timer precision
+
+pub const STACK_BUF_SIZE: usize = 65536;
