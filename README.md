@@ -39,13 +39,10 @@ The following asyncio features are **not yet implemented** and are planned for f
 ### Network & Transport Layer
 - [ ] **Unix domain sockets** - Support for `AF_UNIX` sockets
 - [ ] **Unix pipes** - `connect_read_pipe()` and `connect_write_pipe()`
-- [ ] **sendfile() support** - Zero-copy file transmission
 
 ### Subprocess Management
 - [ ] **`subprocess_exec()`** - Execute shell commands asynchronously
 - [ ] **`subprocess_shell()`** - Shell command execution
-- [ ] **Process protocol** - Full subprocess protocol implementation
-- [ ] **Process streams** - stdin/stdout/stderr handling
 
 ### Signal Handling
 - [ ] **`add_signal_handler()`** - Register signal callbacks (Unix)

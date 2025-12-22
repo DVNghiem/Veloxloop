@@ -19,12 +19,20 @@ pub struct Interest {
 impl Interest {
     #[inline(always)]
     pub fn new(readable: bool, writable: bool) -> Self {
-        Self { readable, writable, oneshot: false }
+        Self {
+            readable,
+            writable,
+            oneshot: false,
+        }
     }
-    
+
     #[inline(always)]
     pub fn oneshot(readable: bool, writable: bool) -> Self {
-        Self { readable, writable, oneshot: true }
+        Self {
+            readable,
+            writable,
+            oneshot: true,
+        }
     }
 
     #[inline(always)]
@@ -99,10 +107,7 @@ impl Epoll {
         Ok(Self {
             epfd,
             interests: FxHashMap::with_capacity_and_hasher(256, Default::default()),
-            raw_events: vec![
-                libc::epoll_event { events: 0, u64: 0 };
-                1024
-            ],
+            raw_events: vec![libc::epoll_event { events: 0, u64: 0 }; 1024],
             wake_read,
             wake_write,
         })

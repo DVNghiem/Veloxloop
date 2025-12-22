@@ -528,7 +528,7 @@ impl crate::transports::StreamTransport for TcpTransport {
             // This matches what uvloop uses internally
             let mut buf = [0u8; 131072];
             let mut s = stream;
-            
+
             // Try to read as much data as available in one syscall
             match std::io::Read::read(&mut s, &mut buf) {
                 Ok(0) => {
@@ -548,7 +548,8 @@ impl crate::transports::StreamTransport for TcpTransport {
                 Ok(n) => {
                     // Create Python bytes and call protocol
                     let py_data = PyBytes::new(py, &buf[..n]);
-                    self.protocol.call_method1(py, "data_received", (py_data,))?;
+                    self.protocol
+                        .call_method1(py, "data_received", (py_data,))?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     // No data available, will be called again when ready
@@ -570,7 +571,7 @@ impl crate::transports::StreamTransport for TcpTransport {
                 if data_len == 0 {
                     break;
                 }
-                
+
                 // Borrow the data for writing
                 let write_result = {
                     let data = self.write_buffer.borrow();
@@ -851,7 +852,7 @@ impl TcpTransport {
     #[inline(always)]
     pub(crate) fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        
+
         // Fast path check - avoid borrow if already closed
         {
             let self_ = slf.borrow();
@@ -864,10 +865,10 @@ impl TcpTransport {
 
         // Check if we have a direct reader path (streams API)
         let has_reader = slf.borrow().reader.is_some();
-        
+
         // Stack-allocated read buffer - 128KB for optimal large message performance
         let mut buf = [0u8; 131072];
-        
+
         if has_reader {
             // StreamReader path: read directly into reader's buffer, no Python callback
             loop {
@@ -875,7 +876,9 @@ impl TcpTransport {
                 let read_result = {
                     let self_ = slf.borrow();
                     if self_.state.intersects(
-                        TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
+                        TransportState::CLOSING
+                            | TransportState::CLOSED
+                            | TransportState::READING_PAUSED,
                     ) {
                         break;
                     }
@@ -886,7 +889,7 @@ impl TcpTransport {
                         break;
                     }
                 }; // self_ borrow dropped here
-                
+
                 match read_result {
                     Ok(0) => {
                         // EOF
@@ -908,7 +911,11 @@ impl TcpTransport {
                         };
                         if let Some(reader_py) = reader_clone {
                             let reader = reader_py.bind(py).borrow();
-                            reader.inner.borrow_mut().buffer.extend_from_slice(&buf[..n]);
+                            reader
+                                .inner
+                                .borrow_mut()
+                                .buffer
+                                .extend_from_slice(&buf[..n]);
                             reader._wakeup_waiters(py)?;
                         }
                         // Continue reading if we got a full buffer
@@ -926,7 +933,9 @@ impl TcpTransport {
             let read_result = {
                 let self_ = slf.borrow();
                 if self_.state.intersects(
-                    TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
+                    TransportState::CLOSING
+                        | TransportState::CLOSED
+                        | TransportState::READING_PAUSED,
                 ) {
                     return Ok(());
                 }
@@ -937,7 +946,7 @@ impl TcpTransport {
                     return Ok(());
                 }
             }; // self_ borrow dropped here
-            
+
             match read_result {
                 Ok(0) => {
                     // EOF

@@ -399,7 +399,7 @@ impl StreamReader {
                     total_read += n;
                     // Extend buffer directly
                     self.inner.borrow_mut().buffer.extend_from_slice(&temp[..n]);
-                    
+
                     // Continue reading if we filled the buffer (more data likely available)
                     if n < temp.len() {
                         break;

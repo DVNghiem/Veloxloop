@@ -5,7 +5,9 @@ use std::cell::RefCell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::callbacks::{Callback, CallbackQueue, RemoveWriterCallback, SockConnectCallback};
+use crate::callbacks::{
+    Callback, CallbackQueue, RemoveWriterCallback, SendfileCallback, SockConnectCallback,
+};
 use crate::constants::{NI_MAXHOST, NI_MAXSERV};
 use crate::executor::ThreadPoolExecutor;
 use crate::handles::{Handle, IoCallback, IoHandles};
@@ -98,7 +100,7 @@ impl VeloxLoop {
 
         // Check if this FD is in the disabled-oneshot set
         let in_oneshot_set = self.oneshot_disabled.borrow_mut().remove(&fd);
-        
+
         let mut poller = self.poller.borrow_mut();
         if in_oneshot_set {
             // FD is registered but disabled - rearm with MOD (1 syscall)
@@ -214,7 +216,10 @@ impl VeloxLoop {
             callback_buffer: RefCell::new(Vec::with_capacity(1024)),
             pending_ios: RefCell::new(Vec::with_capacity(128)),
             #[cfg(target_os = "linux")]
-            oneshot_disabled: RefCell::new(FxHashSet::with_capacity_and_hasher(64, Default::default())),
+            oneshot_disabled: RefCell::new(FxHashSet::with_capacity_and_hasher(
+                64,
+                Default::default(),
+            )),
         })
     }
 
@@ -270,7 +275,7 @@ impl VeloxLoop {
             // Always clear from oneshot_disabled if removed
             #[cfg(target_os = "linux")]
             self.oneshot_disabled.borrow_mut().remove(&fd);
-            
+
             Ok(true)
         } else {
             Ok(false)
@@ -903,161 +908,278 @@ impl VeloxLoop {
     }
 
     #[inline(always)]
-fn sock_recv(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
-    use pyo3::types::PyBytes;
-    use std::sync::Arc;
-    use crate::transports::future::CompletedFuture;
+    fn sock_recv(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
+        use crate::transports::future::CompletedFuture;
+        use pyo3::types::PyBytes;
+        use std::sync::Arc;
 
-    let py = slf.py();
-    let self_ = slf.borrow();
+        let py = slf.py();
+        let self_ = slf.borrow();
 
-    let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
-    
-    if fd < 0 {
-        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-            "Invalid file descriptor"
-        ));
-    }
+        let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
 
-    // Try immediate recv
-    const STACK_BUF_SIZE: usize = 65536;
-    
-    if nbytes <= STACK_BUF_SIZE {
-        let mut buf = [0u8; STACK_BUF_SIZE];
-        unsafe {
-            let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
-
-            if n > 0 {
-                let bytes = PyBytes::new(py, &buf[..n as usize]);
-                let fut = CompletedFuture::new(bytes.into_any().unbind());
-                return Ok(Py::new(py, fut)?.into_any());
-            } else if n == 0 {
-                // Socket closed by peer - return empty bytes
-                let bytes = PyBytes::new(py, &[]);
-                let fut = CompletedFuture::new(bytes.into_any().unbind());
-                return Ok(Py::new(py, fut)?.into_any());
-            }
-
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock && err.raw_os_error() != Some(libc::EAGAIN) {
-                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                    err.to_string(),
-                ));
-            }
+        if fd < 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                "Invalid file descriptor",
+            ));
         }
-    } else {
-        let mut buf = vec![0u8; nbytes];
-        unsafe {
-            let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
 
-            if n > 0 {
-                buf.truncate(n as usize);
-                let bytes = PyBytes::new(py, &buf);
-                let fut = CompletedFuture::new(bytes.into_any().unbind());
-                return Ok(Py::new(py, fut)?.into_any());
-            } else if n == 0 {
-                // Socket closed by peer - return empty bytes
-                let bytes = PyBytes::new(py, &[]);
-                let fut = CompletedFuture::new(bytes.into_any().unbind());
-                return Ok(Py::new(py, fut)?.into_any());
-            }
+        // Try immediate recv
+        const STACK_BUF_SIZE: usize = 65536;
 
-            let err = std::io::Error::last_os_error();
-            if err.kind() != std::io::ErrorKind::WouldBlock && err.raw_os_error() != Some(libc::EAGAIN) {
-                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                    err.to_string(),
-                ));
-            }
-        }
-    }
+        if nbytes <= STACK_BUF_SIZE {
+            let mut buf = [0u8; STACK_BUF_SIZE];
+            unsafe {
+                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
 
-    let future = self_.create_future(py)?;
-    let loop_ref = slf.clone().unbind();
-    let future_clone = future.clone_ref(py);
+                if n > 0 {
+                    let bytes = PyBytes::new(py, &buf[..n as usize]);
+                    let fut = CompletedFuture::new(bytes.into_any().unbind());
+                    return Ok(Py::new(py, fut)?.into_any());
+                } else if n == 0 {
+                    // Socket closed by peer - return empty bytes
+                    let bytes = PyBytes::new(py, &[]);
+                    let fut = CompletedFuture::new(bytes.into_any().unbind());
+                    return Ok(Py::new(py, fut)?.into_any());
+                }
 
-    #[cfg(target_os = "linux")]
-    {
-        let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> = 
-            Arc::new(move |py: Python<'_>| {
-            // Mark oneshot as disabled FIRST, before any other operations
-            loop_ref.bind(py).borrow().mark_oneshot_disabled(fd);
-            
-            // Now attempt to read
-            let mut buf = [0u8; 65536];
-            let read_size = nbytes.min(65536);
-            
-            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0) };
-            
-            if n > 0 {
-                let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
-                let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
-            } else if n == 0 {
-                // EOF - socket closed by peer
-                let bytes = pyo3::types::PyBytes::new(py, &[]);
-                let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
-            } else {
                 let err = std::io::Error::last_os_error();
-                
-                // Only set exception for real errors, not EAGAIN
-                if err.kind() != std::io::ErrorKind::WouldBlock 
+                if err.kind() != std::io::ErrorKind::WouldBlock
                     && err.raw_os_error() != Some(libc::EAGAIN)
-                    && err.raw_os_error() != Some(libc::EBADF) {
-                    let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
-                    let exc_val = py_err.value(py).as_any().clone().unbind();
-                    let _ = future_clone.bind(py).borrow().set_exception(py, exc_val);
-                } else if err.raw_os_error() == Some(libc::EBADF) {
-                    // Socket was closed - return empty
-                    let bytes = pyo3::types::PyBytes::new(py, &[]);
-                    let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        err.to_string(),
+                    ));
                 }
             }
-            Ok(())
-        });
+        } else {
+            let mut buf = vec![0u8; nbytes];
+            unsafe {
+                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
 
-        self_.add_reader_oneshot(fd, native_callback)?;
-    }
-    
-    #[cfg(not(target_os = "linux"))]
-    {
-        let handled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let handled_clone = handled.clone();
+                if n > 0 {
+                    buf.truncate(n as usize);
+                    let bytes = PyBytes::new(py, &buf);
+                    let fut = CompletedFuture::new(bytes.into_any().unbind());
+                    return Ok(Py::new(py, fut)?.into_any());
+                } else if n == 0 {
+                    // Socket closed by peer - return empty bytes
+                    let bytes = PyBytes::new(py, &[]);
+                    let fut = CompletedFuture::new(bytes.into_any().unbind());
+                    return Ok(Py::new(py, fut)?.into_any());
+                }
 
-        let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> = 
-            Arc::new(move |py: Python<'_>| {
-            if handled_clone.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                return Ok(());
+                let err = std::io::Error::last_os_error();
+                if err.kind() != std::io::ErrorKind::WouldBlock
+                    && err.raw_os_error() != Some(libc::EAGAIN)
+                {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        err.to_string(),
+                    ));
+                }
             }
-            
-            let mut buf = [0u8; 65536];
-            let read_size = nbytes.min(65536);
-            
-            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0) };
-            
-            let _ = loop_ref.bind(py).borrow().remove_reader(py, fd);
-            
+        }
+
+        let future = self_.create_future(py)?;
+        let loop_ref = slf.clone().unbind();
+        let future_clone = future.clone_ref(py);
+
+        #[cfg(target_os = "linux")]
+        {
+            let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> =
+                Arc::new(move |py: Python<'_>| {
+                    // Mark oneshot as disabled FIRST, before any other operations
+                    loop_ref.bind(py).borrow().mark_oneshot_disabled(fd);
+
+                    // Now attempt to read
+                    let mut buf = [0u8; 65536];
+                    let read_size = nbytes.min(65536);
+
+                    let n = unsafe {
+                        libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0)
+                    };
+
+                    if n > 0 {
+                        let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+                        let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                    } else if n == 0 {
+                        // EOF - socket closed by peer
+                        let bytes = pyo3::types::PyBytes::new(py, &[]);
+                        let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                    } else {
+                        let err = std::io::Error::last_os_error();
+
+                        // Only set exception for real errors, not EAGAIN
+                        if err.kind() != std::io::ErrorKind::WouldBlock
+                            && err.raw_os_error() != Some(libc::EAGAIN)
+                            && err.raw_os_error() != Some(libc::EBADF)
+                        {
+                            let py_err =
+                                PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
+                            let exc_val = py_err.value(py).as_any().clone().unbind();
+                            let _ = future_clone.bind(py).borrow().set_exception(py, exc_val);
+                        } else if err.raw_os_error() == Some(libc::EBADF) {
+                            // Socket was closed - return empty
+                            let bytes = pyo3::types::PyBytes::new(py, &[]);
+                            let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                        }
+                    }
+                    Ok(())
+                });
+
+            self_.add_reader_oneshot(fd, native_callback)?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let handled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let handled_clone = handled.clone();
+
+            let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> =
+                Arc::new(move |py: Python<'_>| {
+                    if handled_clone.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        return Ok(());
+                    }
+
+                    let mut buf = [0u8; 65536];
+                    let read_size = nbytes.min(65536);
+
+                    let n = unsafe {
+                        libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0)
+                    };
+
+                    let _ = loop_ref.bind(py).borrow().remove_reader(py, fd);
+
+                    if n > 0 {
+                        let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
+                        let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                    } else if n == 0 {
+                        let bytes = pyo3::types::PyBytes::new(py, &[]);
+                        let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                    } else {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() != std::io::ErrorKind::WouldBlock
+                            && err.raw_os_error() != Some(libc::EAGAIN)
+                        {
+                            let py_err =
+                                PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
+                            let exc_val = py_err.value(py).as_any().clone().unbind();
+                            let _ = future_clone.bind(py).borrow().set_exception(py, exc_val);
+                        }
+                    }
+                    Ok(())
+                });
+
+            self_.add_reader_native(fd, native_callback)?;
+        }
+
+        Ok(future.into_any())
+    }
+    #[pyo3(signature = (transport, file, offset=0, count=None, *, _fallback=true))]
+    fn sendfile(
+        slf: &Bound<'_, Self>,
+        transport: Py<PyAny>,
+        file: Py<PyAny>,
+        offset: i64,
+        count: Option<usize>,
+        _fallback: bool,
+    ) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let self_ = slf.borrow();
+
+        // Get out_fd from transport or socket
+        let out_fd: RawFd = if let Ok(fd) = transport
+            .getattr(py, "fileno")?
+            .call0(py)?
+            .extract::<RawFd>(py)
+        {
+            fd
+        } else {
+            return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                "transport must have a fileno() method",
+            ));
+        };
+
+        // Get in_fd from file
+        let in_fd: RawFd =
+            if let Ok(fd) = file.getattr(py, "fileno")?.call0(py)?.extract::<RawFd>(py) {
+                fd
+            } else {
+                return Err(PyErr::new::<pyo3::exceptions::PyTypeError, _>(
+                    "file must have a fileno() method",
+                ));
+            };
+
+        // Determine total count
+        let total_count = match count {
+            Some(c) => c,
+            None => unsafe {
+                let mut stat: libc::stat = std::mem::zeroed();
+                if libc::fstat(in_fd, &mut stat) == 0 {
+                    (stat.st_size as i64 - offset).max(0) as usize
+                } else {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        "failed to get file size",
+                    ));
+                }
+            },
+        };
+
+        if total_count == 0 {
+            let fut = PendingFuture::new();
+            fut.set_result(py, py.None())?;
+            return Ok(Py::new(py, fut)?.into_any());
+        }
+
+        // Try immediate sendfile
+        let mut current_sent = 0;
+        unsafe {
+            let mut off = offset as libc::off_t;
+            let n = libc::sendfile(out_fd, in_fd, &mut off, total_count);
             if n > 0 {
-                let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
-                let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                current_sent = n as usize;
+                if current_sent >= total_count {
+                    let fut = PendingFuture::new();
+                    fut.set_result(py, py.None())?;
+                    return Ok(Py::new(py, fut)?.into_any());
+                }
             } else if n == 0 {
-                let bytes = pyo3::types::PyBytes::new(py, &[]);
-                let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                // EOF or something else
+                let fut = PendingFuture::new();
+                fut.set_result(py, py.None())?;
+                return Ok(Py::new(py, fut)?.into_any());
             } else {
                 let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::WouldBlock 
-                    && err.raw_os_error() != Some(libc::EAGAIN) {
-                    let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
-                    let exc_val = py_err.value(py).as_any().clone().unbind();
-                    let _ = future_clone.bind(py).borrow().set_exception(py, exc_val);
+                if err.kind() != std::io::ErrorKind::WouldBlock
+                    && err.raw_os_error() != Some(libc::EAGAIN)
+                {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                        err.to_string(),
+                    ));
                 }
             }
-            Ok(())
-        });
+        }
 
-        self_.add_reader_native(fd, native_callback)?;
+        // Asynchronous sendfile
+        let future = self_.create_future(py)?;
+        let loop_ref = slf.clone().unbind();
+
+        let callback = SendfileCallback::new(
+            loop_ref,
+            future.clone_ref(py),
+            out_fd,
+            in_fd,
+            Some(offset),
+            total_count,
+            current_sent,
+        );
+
+        let callback_py = Py::new(py, callback)?;
+        self_.add_writer(py, out_fd, callback_py.into_any())?;
+
+        Ok(future.into_any())
     }
 
-    Ok(future.into_any())
-}
     fn sock_sendall(slf: &Bound<'_, Self>, sock: Py<PyAny>, data: &[u8]) -> PyResult<Py<PyAny>> {
         use std::sync::{Arc, Mutex};
 
@@ -1110,43 +1232,46 @@ fn sock_recv(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<
         let future_clone = future.clone_ref(py);
 
         // Native callback for sendall - avoids Python callback overhead
-        let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> = Arc::new(move |py: Python<'_>| {
-            let mut sent = sent_counter.lock().unwrap();
-            let data = remaining_data.lock().unwrap();
-            
-            while *sent < data.len() {
-                unsafe {
-                    let n = libc::send(
-                        fd,
-                        data[*sent..].as_ptr() as *const libc::c_void,
-                        data.len() - *sent,
-                        0,
-                    );
+        let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> =
+            Arc::new(move |py: Python<'_>| {
+                let mut sent = sent_counter.lock().unwrap();
+                let data = remaining_data.lock().unwrap();
 
-                    if n > 0 {
-                        *sent += n as usize;
-                    } else {
-                        let err = std::io::Error::last_os_error();
-                        match err.kind() {
-                            std::io::ErrorKind::WouldBlock => return Ok(()),
-                            _ if err.raw_os_error() == Some(libc::EAGAIN) => return Ok(()),
-                            _ => {
-                                let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
-                                let exc_val = py_err.value(py).as_any().clone().unbind();
-                                future_clone.bind(py).borrow().set_exception(py, exc_val)?;
-                                loop_ref.bind(py).borrow().remove_writer(py, fd)?;
-                                return Ok(());
+                while *sent < data.len() {
+                    unsafe {
+                        let n = libc::send(
+                            fd,
+                            data[*sent..].as_ptr() as *const libc::c_void,
+                            data.len() - *sent,
+                            0,
+                        );
+
+                        if n > 0 {
+                            *sent += n as usize;
+                        } else {
+                            let err = std::io::Error::last_os_error();
+                            match err.kind() {
+                                std::io::ErrorKind::WouldBlock => return Ok(()),
+                                _ if err.raw_os_error() == Some(libc::EAGAIN) => return Ok(()),
+                                _ => {
+                                    let py_err = PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                                        err.to_string(),
+                                    );
+                                    let exc_val = py_err.value(py).as_any().clone().unbind();
+                                    future_clone.bind(py).borrow().set_exception(py, exc_val)?;
+                                    loop_ref.bind(py).borrow().remove_writer(py, fd)?;
+                                    return Ok(());
+                                }
                             }
                         }
                     }
                 }
-            }
 
-            // All sent
-            future_clone.bind(py).borrow().set_result(py, py.None())?;
-            loop_ref.bind(py).borrow().remove_writer(py, fd)?;
-            Ok(())
-        });
+                // All sent
+                future_clone.bind(py).borrow().set_result(py, py.None())?;
+                loop_ref.bind(py).borrow().remove_writer(py, fd)?;
+                Ok(())
+            });
 
         self_.add_writer_native(fd, native_callback)?;
 
@@ -1578,13 +1703,13 @@ impl VeloxLoop {
 
         // Poll - minimize state mutations
         self.state.borrow_mut().is_polling = true;
-        
+
         // Use native epoll on Linux for maximum performance
         #[cfg(target_os = "linux")]
         {
             let events = self.poller.borrow_mut().poll_native(timeout);
             self.state.borrow_mut().is_polling = false;
-            
+
             match events {
                 Ok(evs) => {
                     self._process_native_events(py, evs)?;
@@ -1592,12 +1717,12 @@ impl VeloxLoop {
                 Err(e) => return Err(e),
             }
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         {
             let res = self.poller.borrow_mut().poll(_events, timeout);
             self.state.borrow_mut().is_polling = false;
-            
+
             match res {
                 Ok(_) => {
                     self._process_polling_events(py, _events)?;
@@ -1632,7 +1757,11 @@ impl VeloxLoop {
     /// Level-triggered mode - NO re-arming needed!
     #[cfg(target_os = "linux")]
     #[inline(always)]
-    fn _process_native_events(&self, py: Python<'_>, events: Vec<crate::epoll::Event>) -> VeloxResult<()> {
+    fn _process_native_events(
+        &self,
+        py: Python<'_>,
+        events: Vec<crate::epoll::Event>,
+    ) -> VeloxResult<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -1641,7 +1770,7 @@ impl VeloxLoop {
         if events.len() == 1 {
             let event = &events[0];
             let fd = event.fd;
-            
+
             // Get callbacks to execute
             let (read_cb, write_cb) = {
                 let handles = self.handles.borrow();
@@ -1661,7 +1790,7 @@ impl VeloxLoop {
                     (None, None)
                 }
             };
-            
+
             // Execute callbacks (handles borrow is released)
             if let Some(h) = read_cb {
                 if let Err(e) = h.execute(py) {

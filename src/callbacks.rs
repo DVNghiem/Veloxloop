@@ -361,7 +361,7 @@ impl SockRecvCallback {
         // Use stack buffer for small reads (most common case in benchmarks)
         // For larger reads, fall back to heap allocation
         const STACK_BUF_SIZE: usize = 65536; // 64KB stack buffer
-        
+
         if self.nbytes <= STACK_BUF_SIZE {
             let mut buf = [0u8; STACK_BUF_SIZE];
             unsafe {
@@ -539,5 +539,95 @@ impl RemoveWriterCallback {
         // Remove writer through the event loop's remove_writer method
         self.loop_.bind(py).borrow().remove_writer(py, self.fd)?;
         Ok(())
+    }
+}
+
+/// Callback for sendfile
+#[pyclass(module = "veloxloop._veloxloop")]
+pub struct SendfileCallback {
+    future: Py<PendingFuture>,
+    loop_: Py<VeloxLoop>,
+    out_fd: RawFd,
+    in_fd: RawFd,
+    offset: Option<i64>,
+    count: usize,
+    sent: usize,
+}
+
+#[pymethods]
+impl SendfileCallback {
+    fn __call__(&mut self, py: Python<'_>) -> PyResult<()> {
+        loop {
+            unsafe {
+                let mut off = self.offset.map(|o| o + self.sent as i64);
+                let off_ptr = match off.as_mut() {
+                    Some(o) => o as *mut i64 as *mut libc::off_t,
+                    None => std::ptr::null_mut(),
+                };
+
+                let remaining = self.count - self.sent;
+                let n = libc::sendfile(self.out_fd, self.in_fd, off_ptr, remaining);
+
+                if n > 0 {
+                    self.sent += n as usize;
+                    if self.sent >= self.count {
+                        // All sent
+                        self.future.bind(py).borrow().set_result(py, py.None())?;
+                        self.loop_
+                            .bind(py)
+                            .borrow()
+                            .remove_writer(py, self.out_fd)?;
+                        return Ok(());
+                    }
+                } else if n == 0 {
+                    // EOF on in_fd or 0 count
+                    self.future.bind(py).borrow().set_result(py, py.None())?;
+                    self.loop_
+                        .bind(py)
+                        .borrow()
+                        .remove_writer(py, self.out_fd)?;
+                    return Ok(());
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    match err.kind() {
+                        std::io::ErrorKind::WouldBlock => return Ok(()),
+                        _ if err.raw_os_error() == Some(libc::EAGAIN) => return Ok(()),
+                        _ => {
+                            let py_err =
+                                PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string());
+                            let exc_val = py_err.value(py).as_any().clone().unbind();
+                            self.future.bind(py).borrow().set_exception(py, exc_val)?;
+                            self.loop_
+                                .bind(py)
+                                .borrow()
+                                .remove_writer(py, self.out_fd)?;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl SendfileCallback {
+    pub fn new(
+        loop_: Py<VeloxLoop>,
+        future: Py<PendingFuture>,
+        out_fd: RawFd,
+        in_fd: RawFd,
+        offset: Option<i64>,
+        count: usize,
+        sent: usize,
+    ) -> Self {
+        Self {
+            future,
+            loop_,
+            out_fd,
+            in_fd,
+            offset,
+            count,
+            sent,
+        }
     }
 }

@@ -39,7 +39,7 @@ pub struct PlatformEvent {
 pub struct LoopPoller {
     #[cfg(target_os = "linux")]
     epoll: crate::epoll::Epoll,
-    
+
     #[cfg(not(target_os = "linux"))]
     poller: polling::Poller,
     #[cfg(not(target_os = "linux"))]
@@ -54,7 +54,7 @@ impl LoopPoller {
                 epoll: crate::epoll::Epoll::new()?,
             })
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         {
             Ok(Self {
@@ -76,7 +76,7 @@ impl LoopPoller {
             let interest = crate::epoll::Interest::new(interest.readable, interest.writable);
             self.epoll.add(fd, interest)?;
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         {
             let fd_interest = FdInterest::new(interest.readable, interest.writable);
@@ -103,7 +103,7 @@ impl LoopPoller {
             let interest = crate::epoll::Interest::oneshot(interest.readable, interest.writable);
             self.epoll.add(fd, interest)?;
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         {
             // Non-Linux: just use regular register (polling crate is oneshot by default)
@@ -131,12 +131,14 @@ impl LoopPoller {
                 u64: fd as u64,
             };
 
-            if unsafe { libc::epoll_ctl(self.epoll.epfd(), libc::EPOLL_CTL_MOD, fd, &mut event) } < 0 {
+            if unsafe { libc::epoll_ctl(self.epoll.epfd(), libc::EPOLL_CTL_MOD, fd, &mut event) }
+                < 0
+            {
                 return Err(std::io::Error::last_os_error().into());
             }
             Ok(())
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         {
             self.modify(fd, interest)
@@ -153,7 +155,7 @@ impl LoopPoller {
             let interest = crate::epoll::Interest::new(interest.readable, interest.writable);
             self.epoll.modify(fd, interest)?;
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         {
             let new_interest = FdInterest::new(interest.readable, interest.writable);
@@ -172,7 +174,7 @@ impl LoopPoller {
         {
             self.epoll.delete(fd)?;
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         {
             unsafe {
@@ -190,7 +192,7 @@ impl LoopPoller {
         {
             self.epoll.notify()?;
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         {
             self.poller.notify()?;
@@ -216,7 +218,7 @@ impl LoopPoller {
         {
             self.epoll.is_registered(fd)
         }
-        
+
         #[cfg(not(target_os = "linux"))]
         {
             self.fd_interests.contains_key(&fd)
