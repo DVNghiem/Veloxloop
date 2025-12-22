@@ -1,8 +1,6 @@
-//! Optimized poller implementation
 //! Uses direct epoll on Linux for maximum performance (level-triggered mode)
 //! Falls back to the `polling` crate on other platforms
 
-use rustc_hash::FxHashMap;
 use std::os::fd::RawFd;
 
 /// Cached event state to avoid unnecessary modify() calls
@@ -13,11 +11,6 @@ pub struct FdInterest {
 }
 
 impl FdInterest {
-    #[inline]
-    pub fn new(readable: bool, writable: bool) -> Self {
-        Self { readable, writable }
-    }
-
     #[inline]
     #[allow(dead_code)]
     pub fn to_event(&self, fd: RawFd) -> polling::Event {
@@ -213,31 +206,6 @@ impl LoopPoller {
         timeout: Option<std::time::Duration>,
     ) -> crate::utils::VeloxResult<Vec<PlatformEvent>> {
         Ok(self.epoll.wait(timeout)?)
-    }
-
-    /// Poll for events - fallback for polling crate compatibility
-    #[inline]
-    pub fn poll(
-        &mut self,
-        events: &mut polling::Events,
-        timeout: Option<std::time::Duration>,
-    ) -> crate::utils::VeloxResult<usize> {
-        #[cfg(target_os = "linux")]
-        {
-            // For compatibility, convert to polling::Events
-            events.clear();
-            let native_events = self.epoll.wait(timeout)?;
-            // Note: This path is only used for compatibility
-            // The optimized path uses poll_native directly
-            Ok(native_events.len())
-        }
-        
-        #[cfg(not(target_os = "linux"))]
-        {
-            events.clear();
-            self.poller.wait(events, timeout)?;
-            Ok(events.len())
-        }
     }
 
     /// Check if FD is registered

@@ -57,8 +57,6 @@ pub struct Epoll {
     epfd: RawFd,
     /// Track registered FDs and their interests
     interests: FxHashMap<RawFd, Interest>,
-    /// Track FDs that are registered but disabled (oneshot fired, waiting for re-arm)
-    disabled_oneshot: FxHashMap<RawFd, Interest>,
     /// Pre-allocated event buffer for epoll_wait
     raw_events: Vec<libc::epoll_event>,
     /// Event pipe for waking up the poller
@@ -101,7 +99,6 @@ impl Epoll {
         Ok(Self {
             epfd,
             interests: FxHashMap::with_capacity_and_hasher(256, Default::default()),
-            disabled_oneshot: FxHashMap::with_capacity_and_hasher(64, Default::default()),
             raw_events: vec![
                 libc::epoll_event { events: 0, u64: 0 };
                 1024

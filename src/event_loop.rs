@@ -582,11 +582,10 @@ impl VeloxLoop {
     }
 
     fn call_exception_handler(&self, py: Python<'_>, context: Py<PyDict>) -> PyResult<()> {
-        let handler = self
-            .exception_handler
-            .borrow()
-            .as_ref()
-            .map(|h| h.clone_ref(py));
+        let handler = {
+            let eh = self.exception_handler.borrow();
+            eh.as_ref().map(|h| h.clone_ref(py))
+        };
 
         if let Some(handler) = handler {
             // Call handler with (loop, context) as per asyncio API
