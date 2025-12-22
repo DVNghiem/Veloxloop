@@ -97,13 +97,24 @@ impl VeloxLoop {
         let ev = polling::Event::readable(fd as usize);
 
         // Check if this FD is in the disabled-oneshot set
-        let mut oneshot_disabled = self.oneshot_disabled.borrow_mut();
-        if oneshot_disabled.remove(&fd) {
+        let in_oneshot_set = self.oneshot_disabled.borrow_mut().remove(&fd);
+        
+        let mut poller = self.poller.borrow_mut();
+        if in_oneshot_set {
             // FD is registered but disabled - rearm with MOD (1 syscall)
-            self.poller.borrow_mut().rearm_oneshot(fd, ev)?;
+            if let Err(e) = poller.rearm_oneshot(fd, ev) {
+                // If rearm fails with ENOENT, it means the FD was removed from epoll
+                // (e.g. socket was closed). Fall back to register.
+                let err_msg = e.to_string();
+                if err_msg.contains("No such file or directory") || err_msg.contains("os error 2") {
+                    poller.register_oneshot(fd, ev)?;
+                } else {
+                    return Err(e.into());
+                }
+            }
         } else {
             // FD not registered - register with oneshot (1 syscall)
-            self.poller.borrow_mut().register_oneshot(fd, ev)?;
+            poller.register_oneshot(fd, ev)?;
         }
         Ok(())
     }
@@ -256,6 +267,10 @@ impl VeloxLoop {
                 // Remove
                 self.poller.borrow_mut().delete(fd)?;
             }
+            // Always clear from oneshot_disabled if removed
+            #[cfg(target_os = "linux")]
+            self.oneshot_disabled.borrow_mut().remove(&fd);
+            
             Ok(true)
         } else {
             Ok(false)
@@ -279,6 +294,10 @@ impl VeloxLoop {
                 // Remove
                 self.poller.borrow_mut().delete(fd)?;
             }
+            // Always clear from oneshot_disabled if removed
+            #[cfg(target_os = "linux")]
+            self.oneshot_disabled.borrow_mut().remove(&fd);
+
             Ok(true)
         } else {
             Ok(false)
