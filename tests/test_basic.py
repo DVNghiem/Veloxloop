@@ -3,9 +3,13 @@ import veloxloop
 import pytest
 import time
 
-# Install VeloxLoop Policy!
-veloxloop.install()
 
+def setup_module():
+    """Install VeloxLoop policy at module setup"""
+    veloxloop.install()
+
+
+@pytest.mark.asyncio
 async def test_lifecycle():
     print("Running test_lifecycle")
     loop = asyncio.get_running_loop()
@@ -22,6 +26,8 @@ async def test_lifecycle():
     print(f"Slept {end - start:.4f}s (expected ~0.1s)")
     assert 0.09 <= (end - start) <= 0.2
 
+
+@pytest.mark.asyncio
 async def test_tcp_echo():
     print("Running test_tcp_echo")
     
@@ -48,6 +54,8 @@ async def test_tcp_echo():
         writer.close()
         await writer.wait_closed()
 
+
+@pytest.mark.asyncio
 async def test_concurrency():
     print("Running test_concurrency")
     async def fast_task(i):
@@ -59,6 +67,8 @@ async def test_concurrency():
     assert len(results) == 100
     assert sum(results) == 4950
 
+
+@pytest.mark.asyncio
 async def test_cancellation():
     print("Running test_cancellation")
     async def forever():
@@ -74,6 +84,8 @@ async def test_cancellation():
     with pytest.raises(asyncio.CancelledError):
         await task
 
+
+@pytest.mark.asyncio
 async def test_large_payload():
     print("Running test_large_payload")
     size = 1024 * 1024 # 1MB
@@ -100,6 +112,8 @@ async def test_large_payload():
         writer.close()
         await writer.wait_closed()
 
+
+@pytest.mark.asyncio
 async def test_call_soon_threadsafe():
     print("Running test_call_soon_threadsafe")
     loop = asyncio.get_running_loop()

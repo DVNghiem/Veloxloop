@@ -3,11 +3,13 @@ use pyo3::prelude::*;
 mod buffer_pool;
 mod callbacks;
 mod constants;
+// epoll module kept for potential fallback, but io-uring is primary on Linux
 #[cfg(target_os = "linux")]
 mod epoll;
 mod event_loop;
 mod executor;
 mod handles;
+mod io_backend;
 mod policy;
 mod poller;
 mod socket;

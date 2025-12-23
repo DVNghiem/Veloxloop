@@ -1,5 +1,6 @@
 use crate::event_loop::VeloxLoop;
 use crate::handles::IoCallback;
+use crate::poller::PollerEvent;
 use pyo3::prelude::*;
 use std::os::fd::RawFd;
 use std::sync::Arc;
@@ -20,7 +21,7 @@ impl VeloxLoop {
         // Add or modify
         handles.add_reader(fd, callback);
 
-        let mut ev = polling::Event::readable(fd as usize);
+        let mut ev = PollerEvent::readable(fd as usize);
         if writer_exists {
             ev.writable = true;
         }
@@ -44,7 +45,7 @@ impl VeloxLoop {
         handles.add_reader(fd, IoCallback::Native(callback));
         drop(handles);
 
-        let ev = polling::Event::readable(fd as usize);
+        let ev = PollerEvent::readable(fd as usize);
 
         // Check if this FD is in the disabled-oneshot set
         let in_oneshot_set = self.oneshot_disabled.borrow_mut().remove(&fd);
@@ -101,7 +102,7 @@ impl VeloxLoop {
         // Add or modify
         handles.add_writer(fd, callback);
 
-        let mut ev = polling::Event::writable(fd as usize);
+        let mut ev = PollerEvent::writable(fd as usize);
         if reader_exists {
             ev.readable = true;
         }
@@ -143,7 +144,7 @@ impl VeloxLoop {
 
             if writer_exists {
                 // Downgrade to W only
-                let ev = polling::Event::writable(fd as usize);
+                let ev = PollerEvent::writable(fd as usize);
                 self.poller.borrow_mut().modify(fd, ev)?;
             } else {
                 // Remove
@@ -169,7 +170,7 @@ impl VeloxLoop {
 
             if reader_exists {
                 // Downgrade to R only
-                let ev = polling::Event::readable(fd as usize);
+                let ev = PollerEvent::readable(fd as usize);
                 self.poller.borrow_mut().modify(fd, ev)?;
             } else {
                 // Remove

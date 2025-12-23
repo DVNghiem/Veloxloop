@@ -107,7 +107,7 @@ impl VeloxLoop {
 
     #[pyo3(name = "_run_once")]
     pub fn py_run_once(&self, py: Python<'_>) -> PyResult<()> {
-        let mut events = polling::Events::new();
+        let mut events = poll::PlatformEvents::new();
         self._run_once(py, &mut events).map_err(|e| e.into())
     }
 

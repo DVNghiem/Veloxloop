@@ -1,8 +1,18 @@
 use crate::event_loop::VeloxLoop;
+use crate::poller::{PlatformEvent, PollerEvent};
 use crate::utils::VeloxResult;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use std::time::Duration;
+
+/// Platform events - on all platforms we use native events
+pub(crate) struct PlatformEvents;
+
+impl PlatformEvents {
+    pub fn new() -> Self {
+        Self
+    }
+}
 
 impl VeloxLoop {
     /// single iteration of the event loop
@@ -10,7 +20,7 @@ impl VeloxLoop {
     pub(crate) fn _run_once(
         &self,
         py: Python<'_>,
-        _events: &mut polling::Events,
+        _events: &mut PlatformEvents,
     ) -> VeloxResult<()> {
         let has_callbacks = !self.callbacks.borrow().is_empty();
 
@@ -35,31 +45,15 @@ impl VeloxLoop {
         // Poll - minimize state mutations
         self.state.borrow_mut().is_polling = true;
 
-        // Use native epoll on Linux for maximum performance
-        #[cfg(target_os = "linux")]
-        {
-            let events = self.poller.borrow_mut().poll_native(timeout);
-            self.state.borrow_mut().is_polling = false;
+        // Use io-uring based polling on Linux
+        let events = self.poller.borrow_mut().poll_native(timeout);
+        self.state.borrow_mut().is_polling = false;
 
-            match events {
-                Ok(evs) => {
-                    self._process_native_events(py, evs)?;
-                }
-                Err(e) => return Err(e),
+        match events {
+            Ok(evs) => {
+                self._process_native_events(py, evs)?;
             }
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            let res = self.poller.borrow_mut().poll(_events, timeout);
-            self.state.borrow_mut().is_polling = false;
-
-            match res {
-                Ok(_) => {
-                    self._process_polling_events(py, _events)?;
-                }
-                Err(e) => return Err(e),
-            }
+            Err(e) => return Err(e),
         }
 
         // Process Timers
@@ -84,12 +78,12 @@ impl VeloxLoop {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
+    /// Process io-uring completion events
     #[inline(always)]
     fn _process_native_events(
         &self,
         py: Python<'_>,
-        events: Vec<crate::epoll::Event>,
+        events: Vec<PlatformEvent>,
     ) -> VeloxResult<()> {
         if events.is_empty() {
             return Ok(());
@@ -99,7 +93,7 @@ impl VeloxLoop {
             let event = &events[0];
             let fd = event.fd;
 
-            let (read_cb, write_cb) = {
+            let (read_cb, write_cb, has_reader, has_writer) = {
                 let handles = self.handles.borrow();
                 if let Some((r_handle, w_handle)) = handles.map.get(&fd) {
                     let r = if event.readable {
@@ -112,9 +106,9 @@ impl VeloxLoop {
                     } else {
                         None
                     };
-                    (r, w)
+                    (r, w, r_handle.is_some(), w_handle.is_some())
                 } else {
-                    (None, None)
+                    (None, None, false, false)
                 }
             };
 
@@ -128,6 +122,18 @@ impl VeloxLoop {
                     e.print(py);
                 }
             }
+
+            // Re-arm the FD for io-uring (poll_add is oneshot)
+            // Only re-arm if there are still active handlers
+            if has_reader || has_writer {
+                let ev = PollerEvent {
+                    key: fd as usize,
+                    readable: has_reader,
+                    writable: has_writer,
+                };
+                let _ = self.poller.borrow_mut().rearm_oneshot(fd, ev);
+            }
+
             return Ok(());
         }
 
@@ -167,7 +173,7 @@ impl VeloxLoop {
             }
         }
 
-        for (_, r_h, w_h, _, _) in pending.iter() {
+        for (fd, r_h, w_h, has_r, has_w) in pending.iter() {
             if let Some(h) = r_h {
                 if let Err(e) = h.execute(py) {
                     e.print(py);
@@ -178,81 +184,16 @@ impl VeloxLoop {
                     e.print(py);
                 }
             }
-        }
 
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[inline(always)]
-    fn _process_polling_events(&self, py: Python<'_>, events: &polling::Events) -> VeloxResult<()> {
-        let event_count = events.len();
-        if event_count == 0 {
-            return Ok(());
-        }
-
-        let mut pending = self.pending_ios.borrow_mut();
-        pending.clear();
-
-        let capacity = pending.capacity();
-        if capacity < event_count {
-            pending.reserve(event_count - capacity);
-        }
-
-        {
-            let handles = self.handles.borrow();
-            for event in events.iter() {
-                let fd = event.key as std::os::fd::RawFd;
-                if let Some((r_handle, w_handle)) = handles.get_state_owned(fd) {
-                    let reader_cb = if event.readable {
-                        r_handle.as_ref().filter(|h| !h.cancelled).cloned()
-                    } else {
-                        None
-                    };
-                    let writer_cb = if event.writable {
-                        w_handle.as_ref().filter(|h| !h.cancelled).cloned()
-                    } else {
-                        None
-                    };
-
-                    pending.push((
-                        fd,
-                        reader_cb,
-                        writer_cb,
-                        r_handle.is_some(),
-                        w_handle.is_some(),
-                    ));
-                }
-            }
-        }
-
-        for (_, r_h, w_h, _, _) in pending.iter() {
-            if let Some(h) = r_h {
-                if let Err(e) = h.execute(py) {
-                    e.print(py);
-                }
-            }
-            if let Some(h) = w_h {
-                if let Err(e) = h.execute(py) {
-                    e.print(py);
-                }
-            }
-        }
-
-        {
-            let mut poller = self.poller.borrow_mut();
-            for (fd, _, _, has_r, has_w) in pending.iter() {
-                if *has_r || *has_w {
-                    let mut ev = if *has_r {
-                        polling::Event::readable(*fd as usize)
-                    } else {
-                        polling::Event::writable(*fd as usize)
-                    };
-                    if *has_r && *has_w {
-                        ev.writable = true;
-                    }
-                    let _ = poller.modify(*fd, ev);
-                }
+            // Re-arm the FD for io-uring (poll_add is oneshot)
+            // Only re-arm if there are still active handlers
+            if *has_r || *has_w {
+                let ev = PollerEvent {
+                    key: *fd as usize,
+                    readable: *has_r,
+                    writable: *has_w,
+                };
+                let _ = self.poller.borrow_mut().rearm_oneshot(*fd, ev);
             }
         }
 

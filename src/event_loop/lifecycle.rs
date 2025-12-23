@@ -1,4 +1,5 @@
 use crate::event_loop::VeloxLoop;
+use crate::event_loop::poll::PlatformEvents;
 use crate::utils::{VeloxError, VeloxResult};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
@@ -11,7 +12,7 @@ impl VeloxLoop {
             state.stopped = false;
         }
 
-        let mut events = polling::Events::new();
+        let mut events = PlatformEvents::new();
 
         while self.state.borrow().running && !self.state.borrow().stopped {
             self._run_once(py, &mut events)?;

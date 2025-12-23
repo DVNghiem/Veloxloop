@@ -1,9 +1,24 @@
-//! Uses direct epoll on Linux for maximum performance (level-triggered mode)
-//! Falls back to the `polling` crate on other platforms
+//! High-performance poller using io-uring on Linux
+//! 
+//! This module provides the core event loop polling mechanism.
+//! On Linux: Uses io-uring for completion-based async IO (REQUIRED)
+//! Non-Linux: Stub for future Tokio integration
 
 use std::os::fd::RawFd;
 
-/// Cached event state to avoid unnecessary modify() calls
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(target_os = "linux")]
+use io_uring::{opcode, types, IoUring, Probe};
+
+#[cfg(target_os = "linux")]
+use rustc_hash::FxHashMap;
+
+#[cfg(not(target_os = "linux"))]
+use rustc_hash::FxHashMap;
+
+/// Cached event state
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FdInterest {
     pub readable: bool,
@@ -12,18 +27,66 @@ pub struct FdInterest {
 
 impl FdInterest {
     #[inline]
-    #[allow(dead_code)]
-    pub fn to_event(&self, fd: RawFd) -> polling::Event {
-        let mut ev = polling::Event::none(fd as usize);
-        ev.readable = self.readable;
-        ev.writable = self.writable;
-        ev
+    pub fn new(readable: bool, writable: bool) -> Self {
+        Self { readable, writable }
     }
 }
 
-/// Platform-specific event type
+/// Event type that works across platforms
+#[derive(Clone, Copy)]
+pub struct PollerEvent {
+    pub key: usize,
+    pub readable: bool,
+    pub writable: bool,
+}
+
+impl PollerEvent {
+    #[inline]
+    pub fn none(key: usize) -> Self {
+        Self {
+            key,
+            readable: false,
+            writable: false,
+        }
+    }
+
+    #[inline]
+    pub fn readable(key: usize) -> Self {
+        Self {
+            key,
+            readable: true,
+            writable: false,
+        }
+    }
+
+    #[inline]
+    pub fn writable(key: usize) -> Self {
+        Self {
+            key,
+            readable: false,
+            writable: true,
+        }
+    }
+
+    #[inline]
+    pub fn all(key: usize) -> Self {
+        Self {
+            key,
+            readable: true,
+            writable: true,
+        }
+    }
+}
+
+/// Platform-specific event type representing a completed IO operation
 #[cfg(target_os = "linux")]
-pub type PlatformEvent = crate::epoll::Event;
+#[derive(Clone, Copy, Debug)]
+pub struct PlatformEvent {
+    pub fd: RawFd,
+    pub readable: bool,
+    pub writable: bool,
+    pub error: bool,
+}
 
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy)]
@@ -33,35 +96,154 @@ pub struct PlatformEvent {
     pub writable: bool,
 }
 
-/// High-performance poller
-/// On Linux: Uses direct epoll with level-triggered mode (no re-arming needed)
-/// On other platforms: Uses the polling crate
-pub struct LoopPoller {
-    #[cfg(target_os = "linux")]
-    epoll: crate::epoll::Epoll,
+/// io-uring operation token for tracking pending operations
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IoToken(pub u64);
 
-    #[cfg(not(target_os = "linux"))]
-    poller: polling::Poller,
-    #[cfg(not(target_os = "linux"))]
-    fd_interests: FxHashMap<RawFd, FdInterest>,
+/// Pending poll operation tracking
+#[cfg(target_os = "linux")]
+struct PendingPoll {
+    fd: RawFd,
+    #[allow(dead_code)]
+    readable: bool,
+    #[allow(dead_code)]
+    writable: bool,
 }
 
+// ============================================================================
+// Linux: io-uring based poller (REQUIRED - no epoll fallback)
+// ============================================================================
+
+#[cfg(target_os = "linux")]
+const SQ_SIZE: u32 = 256;
+#[cfg(target_os = "linux")]
+const CQ_SIZE: u32 = 512;
+
+/// High-performance poller using io-uring
+/// 
+/// This implementation uses io-uring's poll_add operation for readiness
+/// notifications, which is more efficient than traditional epoll:
+/// - Batched submissions reduce syscalls
+/// - Completion-based model integrates with other io-uring operations
+/// - Can transition to true async IO operations later
+#[cfg(target_os = "linux")]
+pub struct LoopPoller {
+    /// The io-uring instance
+    ring: IoUring,
+    /// Token counter for operations
+    token_counter: AtomicU64,
+    /// Track registered FDs and their poll tokens
+    fd_tokens: FxHashMap<RawFd, IoToken>,
+    /// Track pending poll operations
+    pending_polls: FxHashMap<u64, PendingPoll>,
+    /// Eventfd for waking up the ring
+    eventfd: RawFd,
+    /// Token for eventfd poll
+    eventfd_token: u64,
+    /// Probe for checking supported operations
+    #[allow(dead_code)]
+    probe: Probe,
+}
+
+#[cfg(target_os = "linux")]
 impl LoopPoller {
     pub fn new() -> crate::utils::VeloxResult<Self> {
-        #[cfg(target_os = "linux")]
-        {
-            Ok(Self {
-                epoll: crate::epoll::Epoll::new()?,
-            })
+        let ring = IoUring::builder()
+            .setup_cqsize(CQ_SIZE)
+            .build(SQ_SIZE)
+            .map_err(crate::utils::VeloxError::Io)?;
+
+        // Probe for supported operations
+        let mut probe = Probe::new();
+        ring.submitter()
+            .register_probe(&mut probe)
+            .map_err(crate::utils::VeloxError::Io)?;
+
+        // Create eventfd for waking
+        let eventfd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if eventfd < 0 {
+            return Err(std::io::Error::last_os_error().into());
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            Ok(Self {
-                poller: polling::Poller::new()?,
-                fd_interests: FxHashMap::with_capacity_and_hasher(256, Default::default()),
-            })
+        let mut poller = Self {
+            ring,
+            token_counter: AtomicU64::new(1),
+            fd_tokens: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+            pending_polls: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+            eventfd,
+            eventfd_token: 0,
+            probe,
+        };
+
+        // Register eventfd for notifications
+        poller.eventfd_token = poller.next_token();
+        poller.submit_poll_add(eventfd, true, false, poller.eventfd_token)?;
+
+        Ok(poller)
+    }
+
+    #[inline]
+    fn next_token(&self) -> u64 {
+        self.token_counter.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Submit a poll_add operation to io-uring
+    fn submit_poll_add(
+        &mut self,
+        fd: RawFd,
+        readable: bool,
+        writable: bool,
+        token: u64,
+    ) -> crate::utils::VeloxResult<()> {
+        let mut flags: u32 = 0;
+        if readable {
+            flags |= libc::POLLIN as u32;
         }
+        if writable {
+            flags |= libc::POLLOUT as u32;
+        }
+
+        let poll_e = opcode::PollAdd::new(types::Fd(fd), flags)
+            .build()
+            .user_data(token);
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&poll_e)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+        }
+
+        self.pending_polls.insert(
+            token,
+            PendingPoll {
+                fd,
+                readable,
+                writable,
+            },
+        );
+
+        // Submit immediately for responsiveness
+        self.ring
+            .submit()
+            .map_err(crate::utils::VeloxError::Io)?;
+
+        Ok(())
+    }
+
+    /// Cancel a pending poll operation
+    fn submit_poll_remove(&mut self, token: u64) -> crate::utils::VeloxResult<()> {
+        let cancel_e = opcode::PollRemove::new(token)
+            .build()
+            .user_data(0); // We don't track cancellation completions
+
+        unsafe {
+            let _ = self.ring.submission().push(&cancel_e);
+        }
+
+        self.pending_polls.remove(&token);
+        Ok(())
     }
 
     /// Register FD with specific interest
@@ -69,159 +251,292 @@ impl LoopPoller {
     pub fn register(
         &mut self,
         fd: RawFd,
-        interest: polling::Event,
+        interest: PollerEvent,
     ) -> crate::utils::VeloxResult<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let interest = crate::epoll::Interest::new(interest.readable, interest.writable);
-            self.epoll.add(fd, interest)?;
+        // Remove existing poll if any
+        if let Some(&IoToken(old_token)) = self.fd_tokens.get(&fd) {
+            self.submit_poll_remove(old_token)?;
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            let fd_interest = FdInterest::new(interest.readable, interest.writable);
-            unsafe {
-                let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
-                self.poller.add(&borrowed, interest)?;
-            }
-            self.fd_interests.insert(fd, fd_interest);
-        }
+        let token = self.next_token();
+        self.fd_tokens.insert(fd, IoToken(token));
+        self.submit_poll_add(fd, interest.readable, interest.writable, token)?;
+
         Ok(())
     }
 
-    /// Register FD with oneshot mode (Linux: EPOLLONESHOT, auto-disarms after one event)
-    /// This is optimized for sock_recv/sock_sendall where we expect one event per call.
-    /// Re-arming is done via rearm_oneshot() instead of delete+add.
+    /// Register FD with oneshot mode
+    /// io-uring poll_add is inherently oneshot - completes once and needs re-arming
     #[inline]
     pub fn register_oneshot(
         &mut self,
         fd: RawFd,
-        interest: polling::Event,
+        interest: PollerEvent,
     ) -> crate::utils::VeloxResult<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let interest = crate::epoll::Interest::oneshot(interest.readable, interest.writable);
-            self.epoll.add(fd, interest)?;
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            // Non-Linux: just use regular register (polling crate is oneshot by default)
-            self.register(fd, interest)?;
-        }
-        Ok(())
+        // io-uring poll_add is already oneshot
+        self.register(fd, interest)
     }
 
-    /// Re-arm a oneshot FD. This is cheaper than delete + add.
-    /// On Linux: Uses EPOLL_CTL_MOD to re-enable the FD
-    /// On other platforms: Uses modify()
+    /// Re-arm a oneshot FD
     #[inline]
     pub fn rearm_oneshot(
         &mut self,
         fd: RawFd,
-        interest: polling::Event,
+        interest: PollerEvent,
     ) -> crate::utils::VeloxResult<()> {
-        #[cfg(target_os = "linux")]
-        {
-            // For oneshot, we always need to re-arm even if interest is the same
-            let int = crate::epoll::Interest::oneshot(interest.readable, interest.writable);
-            let events = int.to_epoll_events();
-            let mut event = libc::epoll_event {
-                events,
-                u64: fd as u64,
-            };
-
-            if unsafe { libc::epoll_ctl(self.epoll.epfd(), libc::EPOLL_CTL_MOD, fd, &mut event) }
-                < 0
-            {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(())
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            self.modify(fd, interest)
-        }
+        let token = self.next_token();
+        self.fd_tokens.insert(fd, IoToken(token));
+        self.submit_poll_add(fd, interest.readable, interest.writable, token)?;
+        Ok(())
     }
 
     /// Modify FD interest
-    /// On Linux: Only issues syscall if interest actually changed (level-triggered)
-    /// On other platforms: Always re-arms (oneshot mode)
     #[inline]
-    pub fn modify(&mut self, fd: RawFd, interest: polling::Event) -> crate::utils::VeloxResult<()> {
-        #[cfg(target_os = "linux")]
-        {
-            let interest = crate::epoll::Interest::new(interest.readable, interest.writable);
-            self.epoll.modify(fd, interest)?;
+    pub fn modify(&mut self, fd: RawFd, interest: PollerEvent) -> crate::utils::VeloxResult<()> {
+        // Cancel existing poll and submit new one
+        if let Some(&IoToken(old_token)) = self.fd_tokens.get(&fd) {
+            self.submit_poll_remove(old_token)?;
         }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            let new_interest = FdInterest::new(interest.readable, interest.writable);
-            unsafe {
-                let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
-                self.poller.modify(&borrowed, interest)?;
-            }
-            self.fd_interests.insert(fd, new_interest);
-        }
+        let token = self.next_token();
+        self.fd_tokens.insert(fd, IoToken(token));
+        self.submit_poll_add(fd, interest.readable, interest.writable, token)?;
+
         Ok(())
     }
 
+    /// Delete FD from monitoring
     #[inline]
     pub fn delete(&mut self, fd: RawFd) -> crate::utils::VeloxResult<()> {
-        #[cfg(target_os = "linux")]
-        {
-            self.epoll.delete(fd)?;
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            unsafe {
-                let borrowed = std::os::fd::BorrowedFd::borrow_raw(fd);
-                self.poller.delete(&borrowed)?;
-            }
-            self.fd_interests.remove(&fd);
+        if let Some(IoToken(token)) = self.fd_tokens.remove(&fd) {
+            self.submit_poll_remove(token)?;
         }
         Ok(())
     }
 
+    /// Wake up the poller from another thread
     #[inline]
     pub fn notify(&self) -> crate::utils::VeloxResult<()> {
-        #[cfg(target_os = "linux")]
-        {
-            self.epoll.notify()?;
-        }
-
-        #[cfg(not(target_os = "linux"))]
-        {
-            self.poller.notify()?;
+        let val: u64 = 1;
+        unsafe {
+            if libc::write(self.eventfd, &val as *const _ as *const _, 8) < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
         }
         Ok(())
     }
 
-    /// Poll for events - Linux-optimized path
-    #[cfg(target_os = "linux")]
+    /// Poll for events using io-uring
     #[inline]
     pub fn poll_native(
         &mut self,
         timeout: Option<std::time::Duration>,
     ) -> crate::utils::VeloxResult<Vec<PlatformEvent>> {
-        Ok(self.epoll.wait(timeout)?)
+        // Submit any pending operations and wait for completions
+        let want = if timeout == Some(std::time::Duration::ZERO) {
+            0
+        } else {
+            1
+        };
+
+        // Use submit_and_wait with timeout
+        if let Some(dur) = timeout {
+            if dur > std::time::Duration::ZERO {
+                // Submit a timeout operation
+                let ts = types::Timespec::new()
+                    .sec(dur.as_secs() as u64)
+                    .nsec(dur.subsec_nanos() as u32);
+
+                let timeout_e = opcode::Timeout::new(&ts)
+                    .build()
+                    .user_data(0); // Special token for timeout
+
+                unsafe {
+                    let _ = self.ring.submission().push(&timeout_e);
+                }
+            }
+        }
+
+        if want > 0 {
+            let _ = self.ring.submit_and_wait(want);
+        } else {
+            let _ = self.ring.submit();
+        }
+
+        // Collect completions first to avoid borrow issues
+        let completions: Vec<(u64, i32)> = {
+            let cq = self.ring.completion();
+            cq.map(|cqe| (cqe.user_data(), cqe.result())).collect()
+        };
+
+        let mut events = Vec::with_capacity(completions.len());
+        let mut need_rearm_eventfd = false;
+        
+        // Process collected completions
+        for (token, result) in completions {
+            // Skip timeout completions and cancellation completions
+            if token == 0 {
+                continue;
+            }
+
+            // Handle eventfd wakeup
+            if token == self.eventfd_token {
+                // Drain the eventfd
+                let mut buf: u64 = 0;
+                unsafe {
+                    let _ = libc::read(self.eventfd, &mut buf as *mut _ as *mut _, 8);
+                }
+                need_rearm_eventfd = true;
+                continue;
+            }
+
+            // Get the pending poll info
+            if let Some(pending) = self.pending_polls.remove(&token) {
+                if result >= 0 {
+                    let poll_events = result as u32;
+                    events.push(PlatformEvent {
+                        fd: pending.fd,
+                        readable: (poll_events & libc::POLLIN as u32) != 0
+                            || (poll_events & libc::POLLHUP as u32) != 0,
+                        writable: (poll_events & libc::POLLOUT as u32) != 0,
+                        error: (poll_events & libc::POLLERR as u32) != 0,
+                    });
+
+                    // Remove the fd -> token mapping since poll completed
+                    self.fd_tokens.remove(&pending.fd);
+                } else if result == -libc::ECANCELED {
+                    // Poll was cancelled, ignore
+                } else {
+                    // Error on the FD
+                    events.push(PlatformEvent {
+                        fd: pending.fd,
+                        readable: false,
+                        writable: false,
+                        error: true,
+                    });
+                    self.fd_tokens.remove(&pending.fd);
+                }
+            }
+        }
+
+        // Re-arm eventfd poll after processing completions
+        if need_rearm_eventfd {
+            self.eventfd_token = self.next_token();
+            let _ = self.submit_poll_add(self.eventfd, true, false, self.eventfd_token);
+        }
+
+        Ok(events)
     }
 
     /// Check if FD is registered
     #[inline]
     #[allow(dead_code)]
     pub fn is_registered(&self, fd: RawFd) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            self.epoll.is_registered(fd)
-        }
+        self.fd_tokens.contains_key(&fd)
+    }
 
-        #[cfg(not(target_os = "linux"))]
-        {
-            self.fd_interests.contains_key(&fd)
+    /// Get access to the io-uring ring for advanced operations
+    #[inline]
+    #[allow(dead_code)]
+    pub fn ring(&mut self) -> &mut IoUring {
+        &mut self.ring
+    }
+
+    /// Submit a raw io-uring operation (for advanced use)
+    #[inline]
+    #[allow(dead_code)]
+    pub fn submit_raw(&mut self) -> crate::utils::VeloxResult<usize> {
+        self.ring
+            .submit()
+            .map_err(crate::utils::VeloxError::Io)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LoopPoller {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.eventfd);
         }
+    }
+}
+
+// ============================================================================
+// Non-Linux: Stub implementation (future Tokio integration)
+// ============================================================================
+
+#[cfg(not(target_os = "linux"))]
+pub struct LoopPoller {
+    fd_interests: FxHashMap<RawFd, FdInterest>,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl LoopPoller {
+    pub fn new() -> crate::utils::VeloxResult<Self> {
+        Ok(Self {
+            fd_interests: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+        })
+    }
+
+    #[inline]
+    pub fn register(
+        &mut self,
+        fd: RawFd,
+        interest: PollerEvent,
+    ) -> crate::utils::VeloxResult<()> {
+        let fd_interest = FdInterest::new(interest.readable, interest.writable);
+        self.fd_interests.insert(fd, fd_interest);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn register_oneshot(
+        &mut self,
+        fd: RawFd,
+        interest: PollerEvent,
+    ) -> crate::utils::VeloxResult<()> {
+        self.register(fd, interest)
+    }
+
+    #[inline]
+    pub fn rearm_oneshot(
+        &mut self,
+        fd: RawFd,
+        interest: PollerEvent,
+    ) -> crate::utils::VeloxResult<()> {
+        self.modify(fd, interest)
+    }
+
+    #[inline]
+    pub fn modify(&mut self, fd: RawFd, interest: PollerEvent) -> crate::utils::VeloxResult<()> {
+        let new_interest = FdInterest::new(interest.readable, interest.writable);
+        self.fd_interests.insert(fd, new_interest);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn delete(&mut self, fd: RawFd) -> crate::utils::VeloxResult<()> {
+        self.fd_interests.remove(&fd);
+        Ok(())
+    }
+
+    #[inline]
+    pub fn notify(&self) -> crate::utils::VeloxResult<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub fn poll_native(
+        &mut self,
+        _timeout: Option<std::time::Duration>,
+    ) -> crate::utils::VeloxResult<Vec<PlatformEvent>> {
+        // TODO: Implement via Tokio for non-Linux platforms
+        Ok(Vec::new())
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    pub fn is_registered(&self, fd: RawFd) -> bool {
+        self.fd_interests.contains_key(&fd)
     }
 }

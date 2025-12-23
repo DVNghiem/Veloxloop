@@ -15,7 +15,6 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.27.2", features = ["extension-module", "generate-import-lib", "experimental-async"] }
 mimalloc = { version = "0.1.48", optional = true }
-polling = "3"
 slab = "0.4"
 once_cell = "1.19"
 thiserror = "2.0.17"
@@ -34,6 +33,10 @@ papaya = "0.2"
 bytes = "1.11.0"
 bitflags = "2.10.0"
 
+# io-uring for Linux (replaces polling crate for best performance)
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+
 [target.'cfg(not(any(target_env = "musl", target_os = "freebsd", target_os = "openbsd", target_os = "windows")))'.dependencies]
 tikv-jemallocator = { version = "0.6.1", default-features = false, features = ["disable_initial_exec_tls"] }
 
@@ -41,6 +44,7 @@ tikv-jemallocator = { version = "0.6.1", default-features = false, features = ["
 pyo3-build-config = "0.27.2"
 
 [features]
+default = []
 mimalloc = ["dep:mimalloc"]
 
 [profile.release]
