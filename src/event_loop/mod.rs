@@ -408,4 +408,24 @@ impl VeloxLoop {
     pub fn py_shutdown_asyncgens(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         self.shutdown_asyncgens(py)
     }
+
+    /// Get the number of active tasks in the executor
+    #[pyo3(name = "get_executor_active_tasks")]
+    pub fn py_get_executor_active_tasks(&self) -> usize {
+        if let Some(executor) = self.executor.borrow().as_ref() {
+            executor.active_tasks()
+        } else {
+            0
+        }
+    }
+
+    /// Get the number of worker threads in the executor
+    #[pyo3(name = "get_executor_num_workers")]
+    pub fn py_get_executor_num_workers(&self) -> usize {
+        if let Some(executor) = self.executor.borrow().as_ref() {
+            executor.num_workers()
+        } else {
+            0
+        }
+    }
 }

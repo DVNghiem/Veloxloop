@@ -15,7 +15,6 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.27.2", features = ["extension-module", "generate-import-lib", "experimental-async"] }
 mimalloc = { version = "0.1.48", optional = true }
-polling = "3"
 thiserror = "2.0.17"
 parking_lot = "0.12"
 socket2 = "0.6.1"
@@ -29,6 +28,19 @@ memchr = "2.7"
 rustc-hash = "2"
 bytes = "1.11.0"
 bitflags = "2.10.0"
+
+# Work-stealing scheduler and lock-free data structures
+crossbeam = "0.8"
+crossbeam-deque = "0.8"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
+
+# Lock-free concurrent data structures
+dashmap = "6"
+
+# High-precision timing for hierarchical timing wheel
+quanta = "0.12"
+slab = "0.4"
 
 # io-uring for Linux (replaces polling crate for best performance)
 [target.'cfg(target_os = "linux")'.dependencies]

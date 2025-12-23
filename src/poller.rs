@@ -19,6 +19,7 @@ use rustc_hash::FxHashMap;
 use rustc_hash::FxHashMap;
 
 /// Cached event state
+/// Used by non-io_uring backends for tracking FD state
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FdInterest {
     pub readable: bool,
@@ -35,12 +36,20 @@ impl FdInterest {
 /// Event type that works across platforms
 #[derive(Clone, Copy)]
 pub struct PollerEvent {
+    /// Key for identifying the event source (may be unused with io-uring)
     pub key: usize,
     pub readable: bool,
     pub writable: bool,
 }
 
 impl PollerEvent {
+    /// Create a new poller event with specified interest
+    #[inline]
+    pub fn new(key: usize, readable: bool, writable: bool) -> Self {
+        Self { key, readable, writable }
+    }
+
+    /// Create an event with no interest (used for deregistration)
     #[inline]
     pub fn none(key: usize) -> Self {
         Self {
@@ -50,6 +59,7 @@ impl PollerEvent {
         }
     }
 
+    /// Create an event for readable interest only
     #[inline]
     pub fn readable(key: usize) -> Self {
         Self {
@@ -59,6 +69,7 @@ impl PollerEvent {
         }
     }
 
+    /// Create an event for writable interest only
     #[inline]
     pub fn writable(key: usize) -> Self {
         Self {
@@ -68,6 +79,7 @@ impl PollerEvent {
         }
     }
 
+    /// Create an event for both readable and writable interest
     #[inline]
     pub fn all(key: usize) -> Self {
         Self {
@@ -75,6 +87,12 @@ impl PollerEvent {
             readable: true,
             writable: true,
         }
+    }
+    
+    /// Check if this event has any interest
+    #[inline]
+    pub fn has_interest(&self) -> bool {
+        self.readable || self.writable
     }
 }
 
@@ -105,9 +123,7 @@ pub struct IoToken(pub u64);
 #[cfg(target_os = "linux")]
 struct PendingPoll {
     fd: RawFd,
-    #[allow(dead_code)]
     readable: bool,
-    #[allow(dead_code)]
     writable: bool,
 }
 
@@ -142,7 +158,6 @@ pub struct LoopPoller {
     /// Token for eventfd poll
     eventfd_token: u64,
     /// Probe for checking supported operations
-    #[allow(dead_code)]
     probe: Probe,
 }
 
@@ -188,7 +203,7 @@ impl LoopPoller {
         self.token_counter.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Submit a poll_add operation to io-uring
+    /// Submit a poll_add operation to io-uring (queues for batch submission)
     fn submit_poll_add(
         &mut self,
         fd: RawFd,
@@ -224,11 +239,17 @@ impl LoopPoller {
             },
         );
 
-        // Submit immediately for responsiveness
-        self.ring
-            .submit()
-            .map_err(crate::utils::VeloxError::Io)?;
+        // Don't submit immediately - batch submissions for better throughput
+        // Submissions happen in poll_native or when SQ gets full
+        Ok(())
+    }
 
+    /// Flush any pending submissions
+    #[inline]
+    fn flush_submissions(&mut self) -> crate::utils::VeloxResult<()> {
+        if !self.ring.submission().is_empty() {
+            self.ring.submit().map_err(crate::utils::VeloxError::Io)?;
+        }
         Ok(())
     }
 
@@ -430,21 +451,18 @@ impl LoopPoller {
 
     /// Check if FD is registered
     #[inline]
-    #[allow(dead_code)]
     pub fn is_registered(&self, fd: RawFd) -> bool {
         self.fd_tokens.contains_key(&fd)
     }
 
     /// Get access to the io-uring ring for advanced operations
     #[inline]
-    #[allow(dead_code)]
     pub fn ring(&mut self) -> &mut IoUring {
         &mut self.ring
     }
 
     /// Submit a raw io-uring operation (for advanced use)
     #[inline]
-    #[allow(dead_code)]
     pub fn submit_raw(&mut self) -> crate::utils::VeloxResult<usize> {
         self.ring
             .submit()
@@ -535,7 +553,6 @@ impl LoopPoller {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub fn is_registered(&self, fd: RawFd) -> bool {
         self.fd_interests.contains_key(&fd)
     }

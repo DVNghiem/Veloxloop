@@ -92,8 +92,19 @@ impl VeloxLoop {
         if events.len() == 1 {
             let event = &events[0];
             let fd = event.fd;
+            
+            // Handle error events - unregister the FD if there's an error
+            #[cfg(target_os = "linux")]
+            if event.error {
+                // On error, remove both reader and writer
+                let mut handles = self.handles.borrow_mut();
+                handles.remove_reader(fd);
+                handles.remove_writer(fd);
+                let _ = self.poller.borrow_mut().delete(fd);
+                return Ok(());
+            }
 
-            let (read_cb, write_cb, has_reader, has_writer) = {
+            let (read_cb, write_cb) = {
                 let handles = self.handles.borrow();
                 if let Some((r_handle, w_handle)) = handles.map.get(&fd) {
                     let r = if event.readable {
@@ -106,9 +117,9 @@ impl VeloxLoop {
                     } else {
                         None
                     };
-                    (r, w, r_handle.is_some(), w_handle.is_some())
+                    (r, w)
                 } else {
-                    (None, None, false, false)
+                    (None, None)
                 }
             };
 
@@ -124,13 +135,15 @@ impl VeloxLoop {
             }
 
             // Re-arm the FD for io-uring (poll_add is oneshot)
-            // Only re-arm if there are still active handlers
-            if has_reader || has_writer {
-                let ev = PollerEvent {
-                    key: fd as usize,
-                    readable: has_reader,
-                    writable: has_writer,
-                };
+            // CRITICAL: Re-check handles state AFTER callback execution since callbacks
+            // may have removed themselves (e.g., oneshot sock_recv callbacks)
+            let (still_has_reader, still_has_writer) = {
+                let handles = self.handles.borrow();
+                handles.get_states(fd)
+            };
+            
+            if still_has_reader || still_has_writer {
+                let ev = PollerEvent::new(fd as usize, still_has_reader, still_has_writer);
                 let _ = self.poller.borrow_mut().rearm_oneshot(fd, ev);
             }
 
@@ -173,7 +186,7 @@ impl VeloxLoop {
             }
         }
 
-        for (fd, r_h, w_h, has_r, has_w) in pending.iter() {
+        for (fd, r_h, w_h, _has_r, _has_w) in pending.iter() {
             if let Some(h) = r_h {
                 if let Err(e) = h.execute(py) {
                     e.print(py);
@@ -186,13 +199,15 @@ impl VeloxLoop {
             }
 
             // Re-arm the FD for io-uring (poll_add is oneshot)
-            // Only re-arm if there are still active handlers
-            if *has_r || *has_w {
-                let ev = PollerEvent {
-                    key: *fd as usize,
-                    readable: *has_r,
-                    writable: *has_w,
-                };
+            // CRITICAL: Re-check handles state AFTER callback execution since callbacks
+            // may have removed themselves (e.g., oneshot sock_recv callbacks)
+            let (still_has_reader, still_has_writer) = {
+                let handles = self.handles.borrow();
+                handles.get_states(*fd)
+            };
+            
+            if still_has_reader || still_has_writer {
+                let ev = PollerEvent::new(*fd as usize, still_has_reader, still_has_writer);
                 let _ = self.poller.borrow_mut().rearm_oneshot(*fd, ev);
             }
         }

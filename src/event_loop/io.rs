@@ -21,10 +21,8 @@ impl VeloxLoop {
         // Add or modify
         handles.add_reader(fd, callback);
 
-        let mut ev = PollerEvent::readable(fd as usize);
-        if writer_exists {
-            ev.writable = true;
-        }
+        // Use PollerEvent::new for combined readable + writable interest
+        let ev = PollerEvent::new(fd as usize, true, writer_exists);
 
         if reader_exists || writer_exists {
             self.poller.borrow_mut().modify(fd, ev)?;
@@ -102,10 +100,8 @@ impl VeloxLoop {
         // Add or modify
         handles.add_writer(fd, callback);
 
-        let mut ev = PollerEvent::writable(fd as usize);
-        if reader_exists {
-            ev.readable = true;
-        }
+        // Use PollerEvent::new for combined readable + writable interest
+        let ev = PollerEvent::new(fd as usize, reader_exists, true);
 
         if reader_exists || writer_exists {
             self.poller.borrow_mut().modify(fd, ev)?;

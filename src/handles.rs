@@ -2,6 +2,8 @@ use pyo3::prelude::*;
 use rustc_hash::FxHashMap;
 use std::os::fd::RawFd;
 
+pub use crate::concurrent::{ConcurrentIntMap, ConcurrentCallbackQueue, AtomicCounter, AtomicFlag};
+
 pub enum IoCallback {
     Python(Py<PyAny>),
     Native(std::sync::Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>),

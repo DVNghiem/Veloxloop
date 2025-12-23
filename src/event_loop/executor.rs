@@ -29,7 +29,8 @@ impl VeloxLoop {
         let func_clone = func.clone_ref(py);
         let args_clone: Py<PyTuple> = args.clone().unbind();
 
-        executor_ref.spawn_blocking(move || {
+        // Use spawn for fire-and-forget task execution
+        executor_ref.spawn(move || {
             let _ = Python::attach(move |py| {
                 let result = func_clone.call1(py, args_clone.bind(py));
 
@@ -46,6 +47,26 @@ impl VeloxLoop {
         });
 
         Ok(future.into_any())
+    }
+    
+    /// Run a blocking function synchronously in the executor and wait for result
+    /// This uses TaskHandle::join() to wait for completion
+    pub fn run_in_executor_sync<F, R>(&self, func: F) -> PyResult<Option<R>>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        if self.executor.borrow().is_none() {
+            *self.executor.borrow_mut() = Some(ThreadPoolExecutor::new()?);
+        }
+        let executor_bind = self.executor.borrow();
+        let executor_ref = executor_bind.as_ref().unwrap();
+        
+        // Use spawn_blocking which returns TaskHandle
+        let handle = executor_ref.spawn_blocking(func);
+        
+        // Use TaskHandle::join() to wait for result
+        Ok(handle.join())
     }
 
     pub fn set_default_executor(&self, _executor: Option<Py<PyAny>>) -> PyResult<()> {

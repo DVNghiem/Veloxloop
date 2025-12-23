@@ -1,6 +1,9 @@
 //! Direct epoll implementation for maximum performance on Linux.
 //! Uses level-triggered mode to avoid re-arming FDs after each event.
 //! This eliminates the syscall overhead of the `polling` crate's oneshot mode.
+//! 
+//! NOTE: This module serves as a fallback when io-uring operations are not suitable.
+//! Many items may appear unused when io-uring is the primary backend.
 
 use rustc_hash::FxHashMap;
 use std::os::fd::RawFd;
@@ -257,7 +260,6 @@ impl Epoll {
 
     /// Get current interest for an FD
     #[inline]
-    #[allow(dead_code)]
     pub fn get_interest(&self, fd: RawFd) -> Option<Interest> {
         self.interests.get(&fd).copied()
     }

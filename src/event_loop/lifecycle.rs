@@ -14,13 +14,23 @@ impl VeloxLoop {
 
         let mut events = PlatformEvents::new();
 
-        while self.state.borrow().running && !self.state.borrow().stopped {
+        loop {
+            // Check state once at start of iteration
+            {
+                let state = self.state.borrow();
+                if !state.running || state.stopped {
+                    break;
+                }
+            }
+
             self._run_once(py, &mut events)?;
 
+            // Check stopped after run_once (callbacks may have called stop())
             if self.state.borrow().stopped {
                 break;
             }
 
+            // Check Python signals (Ctrl+C)
             if let Err(e) = py.check_signals() {
                 return Err(VeloxError::Python(e));
             }

@@ -10,11 +10,9 @@
 //! readiness-based (epoll, kqueue) models through a unified async interface.
 
 // Allow dead code until full integration is complete
-#![allow(dead_code)]
 
 mod ops;
 mod traits;
-mod unified;
 
 #[cfg(target_os = "linux")]
 mod uring;
@@ -24,7 +22,6 @@ mod poll_backend;
 
 pub use ops::*;
 pub use traits::*;
-pub use unified::UnifiedPoller;
 
 #[cfg(target_os = "linux")]
 pub use uring::IoUringBackend;
