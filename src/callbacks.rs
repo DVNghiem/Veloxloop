@@ -4,6 +4,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use crate::event_loop::VeloxLoop;
+use crate::concurrent::ConcurrentCallbackQueue;
 
 use crate::transports::future::PendingFuture;
 use crate::transports::ssl::SSLContext;
@@ -17,30 +18,46 @@ pub struct Callback {
     pub context: Option<Py<PyAny>>,
 }
 
+/// High-performance lock-free callback queue using crossbeam channels.
+/// 
+/// This replaces the previous Vec-based CallbackQueue with a concurrent
+/// MPMC queue for better scalability in multi-threaded scenarios.
+/// Uses crossbeam-channel internally for efficient lock-free operations.
 pub struct CallbackQueue {
-    queue: Vec<Callback>,
+    /// Lock-free concurrent queue using crossbeam channels
+    inner: ConcurrentCallbackQueue<Callback>,
 }
 
 impl CallbackQueue {
     pub fn new() -> Self {
         Self {
-            queue: Vec::with_capacity(1024),
+            inner: ConcurrentCallbackQueue::new(),
         }
     }
 
-    pub fn push(&mut self, callback: Callback) {
-        self.queue.push(callback);
+    /// Push a callback to the queue (lock-free, thread-safe)
+    #[inline]
+    pub fn push(&self, callback: Callback) {
+        self.inner.push(callback);
     }
 
-    pub fn swap_into(&mut self, target: &mut Vec<Callback>) {
-        if self.queue.is_empty() {
-            return;
-        }
-        std::mem::swap(&mut self.queue, target);
+    /// Drain all callbacks into a target vector (lock-free)
+    /// This is more efficient than swap for concurrent access
+    #[inline]
+    pub fn swap_into(&self, target: &mut Vec<Callback>) {
+        self.inner.drain_into(target);
     }
 
+    /// Check if the queue is empty (approximate, lock-free)
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.inner.is_empty()
+    }
+    
+    /// Get approximate length (lock-free)
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 }
 

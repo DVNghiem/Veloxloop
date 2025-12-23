@@ -29,6 +29,8 @@ impl From<VeloxError> for PyErr {
 }
 
 /// IPv6 helper utilities for improved address handling
+/// These utilities are planned for future IPv6 enhancements
+/// socket_addr_to_tuple() is actively used in transports
 #[allow(dead_code)]
 pub mod ipv6 {
     use super::*;

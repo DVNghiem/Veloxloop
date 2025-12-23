@@ -3,8 +3,17 @@
 //! This module provides the core event loop polling mechanism.
 //! On Linux: Uses io-uring for completion-based async IO (REQUIRED)
 //! Non-Linux: Stub for future Tokio integration
+//!
+//! Performance features:
+//! - io-uring for zero-copy, batched I/O operations
+//! - Completion-based model with submit_read/submit_write for true async I/O
+//! - Integrated with IoUringBackend from io_backend module
+//! - Lock-free data structures via dashmap/crossbeam
 
 use std::os::fd::RawFd;
+
+#[cfg(target_os = "linux")]
+use std::net::SocketAddr;
 
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,6 +26,10 @@ use rustc_hash::FxHashMap;
 
 #[cfg(not(target_os = "linux"))]
 use rustc_hash::FxHashMap;
+
+// Re-export completion-based backend types for use in event loop
+#[cfg(target_os = "linux")]
+pub use crate::io_backend::{OpToken, OpCompletion, OpResult, IoOp};
 
 /// Cached event state
 /// Used by non-io_uring backends for tracking FD state
@@ -467,6 +480,304 @@ impl LoopPoller {
         self.ring
             .submit()
             .map_err(crate::utils::VeloxError::Io)
+    }
+
+    // ==================== Completion-Based I/O Operations ====================
+    // These methods provide true async I/O via io-uring's completion model
+    // for maximum performance (zero-copy, kernel-side operations)
+
+    /// Submit an async read operation via io-uring
+    /// Returns a token to track completion
+    #[inline]
+    pub fn submit_read(
+        &mut self,
+        fd: RawFd,
+        buf: &mut [u8],
+        offset: Option<u64>,
+    ) -> crate::utils::VeloxResult<IoToken> {
+        let token = self.next_token();
+        let off = offset.unwrap_or(u64::MAX); // -1 for current position
+
+        let read_e = opcode::Read::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
+            .offset(off)
+            .build()
+            .user_data(token);
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&read_e)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+        }
+
+        self.pending_polls.insert(
+            token,
+            PendingPoll {
+                fd,
+                readable: true,
+                writable: false,
+            },
+        );
+
+        let _ = self.ring.submit();
+        Ok(IoToken(token))
+    }
+
+    /// Submit an async write operation via io-uring
+    #[inline]
+    pub fn submit_write(
+        &mut self,
+        fd: RawFd,
+        buf: &[u8],
+        offset: Option<u64>,
+    ) -> crate::utils::VeloxResult<IoToken> {
+        let token = self.next_token();
+        let off = offset.unwrap_or(u64::MAX);
+
+        let write_e = opcode::Write::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32)
+            .offset(off)
+            .build()
+            .user_data(token);
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&write_e)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+        }
+
+        self.pending_polls.insert(
+            token,
+            PendingPoll {
+                fd,
+                readable: false,
+                writable: true,
+            },
+        );
+
+        let _ = self.ring.submit();
+        Ok(IoToken(token))
+    }
+
+    /// Submit an async recv operation via io-uring
+    #[inline]
+    pub fn submit_recv(
+        &mut self,
+        fd: RawFd,
+        buf: &mut [u8],
+        flags: i32,
+    ) -> crate::utils::VeloxResult<IoToken> {
+        let token = self.next_token();
+
+        let recv_e = opcode::Recv::new(types::Fd(fd), buf.as_mut_ptr(), buf.len() as u32)
+            .flags(flags)
+            .build()
+            .user_data(token);
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&recv_e)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+        }
+
+        self.pending_polls.insert(
+            token,
+            PendingPoll {
+                fd,
+                readable: true,
+                writable: false,
+            },
+        );
+
+        let _ = self.ring.submit();
+        Ok(IoToken(token))
+    }
+
+    /// Submit an async send operation via io-uring
+    #[inline]
+    pub fn submit_send(
+        &mut self,
+        fd: RawFd,
+        buf: &[u8],
+        flags: i32,
+    ) -> crate::utils::VeloxResult<IoToken> {
+        let token = self.next_token();
+
+        let send_e = opcode::Send::new(types::Fd(fd), buf.as_ptr(), buf.len() as u32)
+            .flags(flags)
+            .build()
+            .user_data(token);
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&send_e)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+        }
+
+        self.pending_polls.insert(
+            token,
+            PendingPoll {
+                fd,
+                readable: false,
+                writable: true,
+            },
+        );
+
+        let _ = self.ring.submit();
+        Ok(IoToken(token))
+    }
+
+    /// Submit an async accept operation via io-uring
+    #[inline]
+    pub fn submit_accept(&mut self, fd: RawFd) -> crate::utils::VeloxResult<IoToken> {
+        let token = self.next_token();
+
+        let accept_e = opcode::Accept::new(types::Fd(fd), std::ptr::null_mut(), std::ptr::null_mut())
+            .build()
+            .user_data(token);
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&accept_e)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+        }
+
+        self.pending_polls.insert(
+            token,
+            PendingPoll {
+                fd,
+                readable: true,
+                writable: false,
+            },
+        );
+
+        let _ = self.ring.submit();
+        Ok(IoToken(token))
+    }
+
+    /// Submit an async connect operation via io-uring
+    #[inline]
+    pub fn submit_connect(
+        &mut self,
+        fd: RawFd,
+        addr: SocketAddr,
+    ) -> crate::utils::VeloxResult<IoToken> {
+        let token = self.next_token();
+        let sock_addr: socket2::SockAddr = addr.into();
+
+        let connect_e = opcode::Connect::new(
+            types::Fd(fd),
+            sock_addr.as_ptr() as *const _,
+            sock_addr.len(),
+        )
+        .build()
+        .user_data(token);
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&connect_e)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+        }
+
+        self.pending_polls.insert(
+            token,
+            PendingPoll {
+                fd,
+                readable: false,
+                writable: true,
+            },
+        );
+
+        let _ = self.ring.submit();
+        Ok(IoToken(token))
+    }
+
+    /// Submit an async close operation via io-uring
+    #[inline]
+    pub fn submit_close(&mut self, fd: RawFd) -> crate::utils::VeloxResult<IoToken> {
+        let token = self.next_token();
+
+        let close_e = opcode::Close::new(types::Fd(fd))
+            .build()
+            .user_data(token);
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&close_e)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+        }
+
+        let _ = self.ring.submit();
+        Ok(IoToken(token))
+    }
+
+    /// Submit an async sendfile/splice operation via io-uring
+    /// Uses splice for optimal zero-copy file transfer
+    #[inline]
+    pub fn submit_sendfile(
+        &mut self,
+        out_fd: RawFd,
+        in_fd: RawFd,
+        offset: u64,
+        count: usize,
+    ) -> crate::utils::VeloxResult<IoToken> {
+        let token = self.next_token();
+
+        let splice_e = opcode::Splice::new(
+            types::Fd(in_fd),
+            offset as i64,
+            types::Fd(out_fd),
+            -1, // Current position for output
+            count as u32,
+        )
+        .build()
+        .user_data(token);
+
+        unsafe {
+            self.ring
+                .submission()
+                .push(&splice_e)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "SQ full"))?;
+        }
+
+        self.pending_polls.insert(
+            token,
+            PendingPoll {
+                fd: out_fd,
+                readable: false,
+                writable: true,
+            },
+        );
+
+        let _ = self.ring.submit();
+        Ok(IoToken(token))
+    }
+
+    /// Cancel an in-flight io-uring operation
+    #[inline]
+    pub fn cancel_operation(&mut self, target_token: IoToken) -> crate::utils::VeloxResult<()> {
+        let cancel_e = opcode::AsyncCancel::new(target_token.0)
+            .build()
+            .user_data(0); // Don't track cancellation completion
+
+        unsafe {
+            let _ = self.ring.submission().push(&cancel_e);
+        }
+
+        self.pending_polls.remove(&target_token.0);
+        let _ = self.ring.submit();
+        Ok(())
+    }
+
+    /// Submit multiple operations as a batch for reduced syscall overhead
+    #[inline]
+    pub fn submit_batch(&mut self) -> crate::utils::VeloxResult<usize> {
+        self.ring.submit().map_err(crate::utils::VeloxError::Io)
     }
 }
 

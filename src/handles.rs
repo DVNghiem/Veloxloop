@@ -1,12 +1,12 @@
 use pyo3::prelude::*;
-use rustc_hash::FxHashMap;
 use std::os::fd::RawFd;
+use std::sync::Arc;
 
 pub use crate::concurrent::{ConcurrentIntMap, ConcurrentCallbackQueue, AtomicCounter, AtomicFlag};
 
 pub enum IoCallback {
     Python(Py<PyAny>),
-    Native(std::sync::Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>),
+    Native(Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync>),
     // Specialized handlers for common transports - direct dispatch without dynamic dispatch
     TcpRead(Py<crate::transports::tcp::TcpTransport>),
     TcpWrite(Py<crate::transports::tcp::TcpTransport>),
@@ -53,24 +53,24 @@ impl Handle {
     }
 }
 
-/// Optimized I/O handle storage using FxHashMap for better cache performance
-/// FxHashMap uses a faster hash function than std::HashMap for integer keys
+/// Lock-free I/O handle storage using DashMap for true concurrent access
+/// Uses ConcurrentIntMap (wrapping DashMap) for zero-lock contention in multi-threaded scenarios
 pub struct IoHandles {
-    // Maps FD to (Reader, Writer) - FxHashMap is faster for integer keys
-    pub(crate) map: FxHashMap<RawFd, (Option<Handle>, Option<Handle>)>,
+    // Maps FD to (Reader, Writer) - lock-free concurrent map
+    pub(crate) map: ConcurrentIntMap<(Option<Handle>, Option<Handle>)>,
 }
 
 impl IoHandles {
     pub fn new() -> Self {
         Self {
-            map: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+            map: ConcurrentIntMap::with_capacity(256),
         }
     }
 
     #[inline]
     pub fn get_states(&self, fd: RawFd) -> (bool, bool) {
-        if let Some((r, w)) = self.map.get(&fd) {
-            (r.is_some(), w.is_some())
+        if let Some(pair) = self.map.get(&fd) {
+            (pair.0.is_some(), pair.1.is_some())
         } else {
             (false, false)
         }
@@ -78,24 +78,36 @@ impl IoHandles {
 
     #[inline]
     pub fn get_state_owned(&self, fd: RawFd) -> Option<(Option<Handle>, Option<Handle>)> {
-        self.map.get(&fd).map(|(r, w)| (r.clone(), w.clone()))
+        self.map.get(&fd).map(|pair| (pair.0.clone(), pair.1.clone()))
     }
 
     #[inline]
     pub fn add_reader(&mut self, fd: RawFd, callback: IoCallback) {
-        let pair = self.map.entry(fd).or_insert((None, None));
-        pair.0 = Some(Handle {
-            callback,
-            cancelled: false,
-        });
+        use dashmap::mapref::entry::Entry;
+        match self.map.entry(fd) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().0 = Some(Handle {
+                    callback,
+                    cancelled: false,
+                });
+            }
+            Entry::Vacant(entry) => {
+                entry.insert((Some(Handle {
+                    callback,
+                    cancelled: false,
+                }), None));
+            }
+        }
     }
 
     #[inline]
     pub fn remove_reader(&mut self, fd: RawFd) -> bool {
-        if let Some(pair) = self.map.get_mut(&fd) {
+        if let Some(mut pair) = self.map.get_mut(&fd) {
             if pair.0.is_some() {
                 pair.0 = None;
-                if pair.1.is_none() {
+                let should_remove = pair.1.is_none();
+                drop(pair); // Release lock before remove
+                if should_remove {
                     self.map.remove(&fd);
                 }
                 return true;
@@ -106,19 +118,31 @@ impl IoHandles {
 
     #[inline]
     pub fn add_writer(&mut self, fd: RawFd, callback: IoCallback) {
-        let pair = self.map.entry(fd).or_insert((None, None));
-        pair.1 = Some(Handle {
-            callback,
-            cancelled: false,
-        });
+        use dashmap::mapref::entry::Entry;
+        match self.map.entry(fd) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().1 = Some(Handle {
+                    callback,
+                    cancelled: false,
+                });
+            }
+            Entry::Vacant(entry) => {
+                entry.insert((None, Some(Handle {
+                    callback,
+                    cancelled: false,
+                })));
+            }
+        }
     }
 
     #[inline]
     pub fn remove_writer(&mut self, fd: RawFd) -> bool {
-        if let Some(pair) = self.map.get_mut(&fd) {
+        if let Some(mut pair) = self.map.get_mut(&fd) {
             if pair.1.is_some() {
                 pair.1 = None;
-                if pair.0.is_none() {
+                let should_remove = pair.0.is_none();
+                drop(pair); // Release lock before remove
+                if should_remove {
                     self.map.remove(&fd);
                 }
                 return true;
@@ -128,12 +152,12 @@ impl IoHandles {
     }
 
     #[inline]
-    pub fn get_reader(&self, fd: RawFd) -> Option<&Handle> {
-        self.map.get(&fd).and_then(|v| v.0.as_ref())
+    pub fn get_reader(&self, fd: RawFd) -> Option<Handle> {
+        self.map.get(&fd).and_then(|v| v.0.clone())
     }
 
     #[inline]
-    pub fn get_writer(&self, fd: RawFd) -> Option<&Handle> {
-        self.map.get(&fd).and_then(|v| v.1.as_ref())
+    pub fn get_writer(&self, fd: RawFd) -> Option<Handle> {
+        self.map.get(&fd).and_then(|v| v.1.clone())
     }
 }

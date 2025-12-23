@@ -4,26 +4,32 @@ use crate::transports::future::PendingFuture;
 use pyo3::prelude::*;
 
 impl VeloxLoop {
+    /// Schedule a callback to be called on the next iteration (lock-free).
+    /// Uses crossbeam-channel internally for efficient MPMC queue operations.
     pub fn call_soon(&self, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) {
-        self.callbacks.borrow_mut().push(Callback {
+        self.callbacks.borrow().push(Callback {
             callback,
             args,
             context,
         });
     }
 
+    /// Schedule a callback from another thread (lock-free, thread-safe).
+    /// Uses crossbeam-channel internally - safe to call from any thread.
     pub fn call_soon_threadsafe(
         &self,
         callback: Py<PyAny>,
         args: Vec<Py<PyAny>>,
         context: Option<Py<PyAny>>,
     ) {
-        self.callbacks.borrow_mut().push(Callback {
+        // Lock-free push via crossbeam channel
+        self.callbacks.borrow().push(Callback {
             callback,
             args,
             context,
         });
-        if self.state.borrow().is_polling {
+        // Use atomic state for lock-free polling check
+        if self.atomic_state.is_polling() {
             let _ = self.poller.borrow().notify();
         }
     }

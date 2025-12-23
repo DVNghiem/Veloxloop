@@ -42,12 +42,12 @@ impl VeloxLoop {
             }
         };
 
-        // Poll - minimize state mutations
-        self.state.borrow_mut().is_polling = true;
+        // Poll - use atomic state for lock-free polling flag
+        self.atomic_state.set_polling(true);
 
         // Use io-uring based polling on Linux
         let events = self.poller.borrow_mut().poll_native(timeout);
-        self.state.borrow_mut().is_polling = false;
+        self.atomic_state.set_polling(false);
 
         match events {
             Ok(evs) => {
@@ -66,10 +66,10 @@ impl VeloxLoop {
                 .call(PyTuple::new(py, entry.args)?, None);
         }
 
-        // Process Callbacks (call_soon)
+        // Process Callbacks (call_soon) - lock-free drain via crossbeam
         let mut cb_batch = self.callback_buffer.borrow_mut();
         cb_batch.clear();
-        self.callbacks.borrow_mut().swap_into(&mut *cb_batch);
+        self.callbacks.borrow().swap_into(&mut *cb_batch);
 
         for cb in cb_batch.drain(..) {
             let _ = cb.callback.bind(py).call(PyTuple::new(py, cb.args)?, None);
@@ -106,14 +106,14 @@ impl VeloxLoop {
 
             let (read_cb, write_cb) = {
                 let handles = self.handles.borrow();
-                if let Some((r_handle, w_handle)) = handles.map.get(&fd) {
+                if let Some((r_handle, w_handle)) = handles.get_state_owned(fd) {
                     let r = if event.readable {
-                        r_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                        r_handle.filter(|h| !h.cancelled)
                     } else {
                         None
                     };
                     let w = if event.writable {
-                        w_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                        w_handle.filter(|h| !h.cancelled)
                     } else {
                         None
                     };

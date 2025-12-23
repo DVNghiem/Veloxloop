@@ -20,7 +20,69 @@ mod lifecycle;
 mod network;
 mod poll;
 
-/// Fast-path state for the event loop, cache-aligned to 64 bytes
+/// Atomic state flags for lock-free state checking in hot paths.
+/// These replace the RefCell<HotState> booleans for frequently checked state.
+/// Using atomics eliminates RefCell borrow overhead in the critical event loop.
+/// Now uses AtomicFlag from the concurrent module for lock-free operations.
+pub struct AtomicState {
+    pub running: crate::concurrent::AtomicFlag,
+    pub stopped: crate::concurrent::AtomicFlag,
+    pub closed: crate::concurrent::AtomicFlag,
+    pub is_polling: crate::concurrent::AtomicFlag,
+}
+
+impl AtomicState {
+    pub fn new() -> Self {
+        Self {
+            running: crate::concurrent::AtomicFlag::new(false),
+            stopped: crate::concurrent::AtomicFlag::new(false),
+            closed: crate::concurrent::AtomicFlag::new(false),
+            is_polling: crate::concurrent::AtomicFlag::new(false),
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_running(&self) -> bool {
+        self.running.is_set()
+    }
+
+    #[inline(always)]
+    pub fn set_running(&self, val: bool) {
+        if val { self.running.set(); } else { self.running.clear(); }
+    }
+
+    #[inline(always)]
+    pub fn is_stopped(&self) -> bool {
+        self.stopped.is_set()
+    }
+
+    #[inline(always)]
+    pub fn set_stopped(&self, val: bool) {
+        if val { self.stopped.set(); } else { self.stopped.clear(); }
+    }
+
+    #[inline(always)]
+    pub fn is_closed(&self) -> bool {
+        self.closed.is_set()
+    }
+
+    #[inline(always)]
+    pub fn set_closed(&self, val: bool) {
+        if val { self.closed.set(); } else { self.closed.clear(); }
+    }
+
+    #[inline(always)]
+    pub fn is_polling(&self) -> bool {
+        self.is_polling.is_set()
+    }
+
+    #[inline(always)]
+    pub fn set_polling(&self, val: bool) {
+        if val { self.is_polling.set(); } else { self.is_polling.clear(); }
+    }
+}
+
+/// Fast-path state for the event loop (non-atomic, RefCell-protected)
 #[repr(C)]
 #[derive(Clone)]
 pub struct HotState {
@@ -38,6 +100,8 @@ pub struct VeloxLoop {
     pub(crate) callbacks: RefCell<CallbackQueue>,
     pub(crate) timers: RefCell<Timers>,
     pub(crate) state: RefCell<HotState>,
+    /// Atomic state for lock-free hot path checks (duplicates key state vars)
+    pub(crate) atomic_state: AtomicState,
     pub(crate) start_time: Instant,
     pub(crate) executor: RefCell<Option<ThreadPoolExecutor>>,
     pub(crate) exception_handler: RefCell<Option<Py<PyAny>>>,
@@ -48,6 +112,8 @@ pub struct VeloxLoop {
     /// Track FDs registered with EPOLLONESHOT that are currently disabled (fired once)
     #[cfg(target_os = "linux")]
     pub(crate) oneshot_disabled: RefCell<FxHashSet<RawFd>>,
+    /// Atomic counter for tracking I/O operations (lock-free)
+    pub(crate) io_op_counter: crate::concurrent::AtomicCounter,
 }
 
 unsafe impl Send for VeloxLoop {}
@@ -57,8 +123,18 @@ impl VeloxLoop {
     pub fn time(&self) -> f64 {
         self.start_time.elapsed().as_secs_f64()
     }
-}
 
+    /// Get the current I/O operation count (lock-free)
+    pub fn io_operations(&self) -> u64 {
+        self.io_op_counter.get()
+    }
+
+    /// Increment I/O operation counter (lock-free)
+    #[inline]
+    pub(crate) fn track_io_operation(&self) -> u64 {
+        self.io_op_counter.increment()
+    }
+}
 #[pymethods]
 impl VeloxLoop {
     #[new]
@@ -79,6 +155,7 @@ impl VeloxLoop {
                 debug: debug_val,
                 is_polling: false,
             }),
+            atomic_state: AtomicState::new(),
             start_time: Instant::now(),
             executor: RefCell::new(None),
             exception_handler: RefCell::new(None),
@@ -91,6 +168,7 @@ impl VeloxLoop {
                 64,
                 Default::default(),
             )),
+            io_op_counter: crate::concurrent::AtomicCounter::new(0),
         })
     }
 

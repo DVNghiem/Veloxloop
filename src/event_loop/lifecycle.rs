@@ -6,27 +6,28 @@ use pyo3::types::{PyDict, PyTuple};
 
 impl VeloxLoop {
     pub fn run_forever(&self, py: Python<'_>) -> VeloxResult<()> {
+        // Set state using both RefCell (for compatibility) and atomic (for hot paths)
         {
             let mut state = self.state.borrow_mut();
             state.running = true;
             state.stopped = false;
         }
+        self.atomic_state.set_running(true);
+        self.atomic_state.set_stopped(false);
 
         let mut events = PlatformEvents::new();
 
         loop {
-            // Check state once at start of iteration
-            {
-                let state = self.state.borrow();
-                if !state.running || state.stopped {
-                    break;
-                }
+            // Use atomic state for hot path check (lock-free)
+            if !self.atomic_state.is_running() || self.atomic_state.is_stopped() {
+                break;
             }
 
             self._run_once(py, &mut events)?;
 
             // Check stopped after run_once (callbacks may have called stop())
-            if self.state.borrow().stopped {
+            // Use atomic for lock-free check
+            if self.atomic_state.is_stopped() {
                 break;
             }
 
@@ -37,6 +38,7 @@ impl VeloxLoop {
         }
 
         self.state.borrow_mut().running = false;
+        self.atomic_state.set_running(false);
         Ok(())
     }
 
@@ -44,14 +46,19 @@ impl VeloxLoop {
         let mut state = self.state.borrow_mut();
         state.stopped = true;
         state.running = false;
+        // Update atomic state for lock-free access
+        self.atomic_state.set_stopped(true);
+        self.atomic_state.set_running(false);
     }
 
     pub fn is_running(&self) -> bool {
-        self.state.borrow().running
+        // Use atomic for lock-free check
+        self.atomic_state.is_running()
     }
 
     pub fn is_closed(&self) -> bool {
-        self.state.borrow().closed
+        // Use atomic for lock-free check
+        self.atomic_state.is_closed()
     }
 
     pub fn get_debug(&self) -> bool {
@@ -66,6 +73,9 @@ impl VeloxLoop {
         let mut state = self.state.borrow_mut();
         state.closed = true;
         state.running = false;
+        // Update atomic state
+        self.atomic_state.set_closed(true);
+        self.atomic_state.set_running(false);
     }
 
     // Exception handler methods
