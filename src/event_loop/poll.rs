@@ -1,8 +1,10 @@
 use crate::event_loop::VeloxLoop;
+use crate::handles::Handle;
 use crate::poller::{PlatformEvent, PollerEvent};
 use crate::utils::VeloxResult;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
+use std::os::fd::RawFd;
 use std::time::Duration;
 
 /// Platform events - on all platforms we use native events
@@ -104,36 +106,17 @@ impl VeloxLoop {
                 return Ok(());
             }
 
-            let (read_cb, write_cb) = {
+            // Clone callbacks to avoid borrow issues
+            let callbacks: Vec<(RawFd, Option<Handle>, Option<Handle>)> = {
                 let handles = self.handles.borrow();
-                if let Some((r_handle, w_handle)) = handles.get_state_owned(fd) {
-                    let r = if event.readable {
-                        r_handle.filter(|h| !h.cancelled)
-                    } else {
-                        None
-                    };
-                    let w = if event.writable {
-                        w_handle.filter(|h| !h.cancelled)
-                    } else {
-                        None
-                    };
-                    (r, w)
-                } else {
-                    (None, None)
-                }
+                events.iter().map(|ev| {
+                    (ev.fd, handles.get_reader(ev.fd), handles.get_writer(ev.fd))
+                }).collect()
             };
-
-            if let Some(h) = read_cb {
-                if let Err(e) = h.execute(py) {
-                    e.print(py);
-                }
+            for (_, r_cb, w_cb) in callbacks {
+                if let Some(cb) = r_cb { cb.execute(py)?; }
+                if let Some(cb) = w_cb { cb.execute(py)?; }
             }
-            if let Some(h) = write_cb {
-                if let Err(e) = h.execute(py) {
-                    e.print(py);
-                }
-            }
-
             // Re-arm the FD for io-uring (poll_add is oneshot)
             // CRITICAL: Re-check handles state AFTER callback execution since callbacks
             // may have removed themselves (e.g., oneshot sock_recv callbacks)
@@ -144,7 +127,15 @@ impl VeloxLoop {
             
             if still_has_reader || still_has_writer {
                 let ev = PollerEvent::new(fd as usize, still_has_reader, still_has_writer);
-                let _ = self.poller.borrow_mut().rearm_oneshot(fd, ev);
+                let mut poller = self.poller.borrow_mut();
+                
+                // Check FD state: is it already registered or not
+                if self.oneshot_disabled.borrow().contains(&fd) {
+                    poller.rearm_oneshot(fd, ev)?;
+                } else {
+                    // FD is new or has been removed → needs to be registered again
+                    poller.register_oneshot(fd, ev)?;
+                }
             }
 
             return Ok(());
