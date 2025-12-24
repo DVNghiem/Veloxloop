@@ -30,7 +30,7 @@ impl VeloxLoop {
         let timeout = if has_callbacks {
             Some(Duration::ZERO)
         } else {
-            let timers = self.timers.borrow();
+            let mut timers = self.timers.borrow_mut();
             if let Some(next) = timers.next_expiry() {
                 let now_ns = (self.time() * 1_000_000_000.0) as u64;
                 if next > now_ns {

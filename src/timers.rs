@@ -120,8 +120,23 @@ impl Timers {
         false
     }
 
-    pub fn next_expiry(&self) -> Option<u64> {
+    pub fn next_expiry(&mut self) -> Option<u64> {
+        if self.min_expiry_cache.is_none() {
+            self.recompute_min_expiry();
+        }
         self.min_expiry_cache
+    }
+
+    fn recompute_min_expiry(&mut self) {
+        let mut min: Option<u64> = None;
+        for entry in self.entries.iter() {
+            match min {
+                None => min = Some(entry.1.expires_at),
+                Some(current) if entry.1.expires_at < current => min = Some(entry.1.expires_at),
+                _ => {}
+            }
+        }
+        self.min_expiry_cache = min;
     }
 
     /// Pop all expired timers up to current_ns
