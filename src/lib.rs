@@ -7,7 +7,6 @@ mod constants;
 mod event_loop;
 mod executor;
 mod handles;
-mod io_backend;
 mod policy;
 mod poller;
 mod socket;

@@ -219,6 +219,12 @@ impl VeloxLoop {
         self.set_debug(enabled)
     }
 
+    /// Get the number of I/O operations tracked by this event loop
+    #[pyo3(name = "io_operations")]
+    pub fn py_io_operations(&self) -> u64 {
+        self.io_operations()
+    }
+
     // I/O methods
     #[pyo3(name = "add_reader", signature = (fd, callback))]
     pub fn py_add_reader(&self, py: Python<'_>, fd: RawFd, callback: Py<PyAny>) -> PyResult<()> {

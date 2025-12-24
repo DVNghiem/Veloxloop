@@ -4,9 +4,8 @@
 //! using the `dashmap` and `crossbeam` crates for improved scalability.
 
 use dashmap::DashMap;
-use crossbeam_channel::{bounded, unbounded, Sender, Receiver, TrySendError};
+use crossbeam_channel::{unbounded, Sender, Receiver, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 
 /// A lock-free MPMC (Multi-Producer Multi-Consumer) queue for callbacks
 /// 
@@ -21,16 +20,6 @@ impl<T> ConcurrentCallbackQueue<T> {
     /// Create a new unbounded concurrent queue
     pub fn new() -> Self {
         let (sender, receiver) = unbounded();
-        Self {
-            sender,
-            receiver,
-            len: AtomicUsize::new(0),
-        }
-    }
-
-    /// Create a new bounded concurrent queue with capacity
-    pub fn with_capacity(cap: usize) -> Self {
-        let (sender, receiver) = bounded(cap);
         Self {
             sender,
             receiver,
@@ -73,16 +62,10 @@ impl<T> ConcurrentCallbackQueue<T> {
         }
     }
 
-    /// Get approximate length
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len.load(Ordering::Relaxed)
-    }
-
     /// Check if empty
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len.load(Ordering::Relaxed) == 0
     }
 }
 
@@ -114,12 +97,6 @@ impl<V> ConcurrentIntMap<V> {
         }
     }
 
-    /// Insert a value
-    #[inline]
-    pub fn insert(&self, key: i32, value: V) -> Option<V> {
-        self.inner.insert(key, value)
-    }
-
     /// Get a value
     #[inline]
     pub fn get(&self, key: &i32) -> Option<dashmap::mapref::one::Ref<'_, i32, V>> {
@@ -136,24 +113,6 @@ impl<V> ConcurrentIntMap<V> {
     #[inline]
     pub fn remove(&self, key: &i32) -> Option<(i32, V)> {
         self.inner.remove(key)
-    }
-
-    /// Check if key exists
-    #[inline]
-    pub fn contains_key(&self, key: &i32) -> bool {
-        self.inner.contains_key(key)
-    }
-
-    /// Get length
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    /// Check if empty
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
     }
 
     /// Entry API for conditional insertion/update
@@ -187,23 +146,8 @@ impl AtomicCounter {
     }
 
     #[inline]
-    pub fn decrement(&self) -> u64 {
-        self.value.fetch_sub(1, Ordering::Relaxed)
-    }
-
-    #[inline]
     pub fn get(&self) -> u64 {
         self.value.load(Ordering::Relaxed)
-    }
-
-    #[inline]
-    pub fn set(&self, value: u64) {
-        self.value.store(value, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn fetch_add(&self, val: u64) -> u64 {
-        self.value.fetch_add(val, Ordering::Relaxed)
     }
 }
 
@@ -239,29 +183,10 @@ impl AtomicFlag {
     pub fn is_set(&self) -> bool {
         self.value.load(Ordering::Acquire)
     }
-
-    #[inline]
-    pub fn swap(&self, val: bool) -> bool {
-        self.value.swap(val, Ordering::AcqRel)
-    }
-
-    /// Compare and swap - returns true if the swap happened
-    #[inline]
-    pub fn compare_exchange(&self, current: bool, new: bool) -> bool {
-        self.value.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire).is_ok()
-    }
 }
 
 impl Default for AtomicFlag {
     fn default() -> Self {
         Self::new(false)
     }
-}
-
-/// Thread-safe reference-counted wrapper for shared state
-pub type SharedState<T> = Arc<T>;
-
-/// Create a new shared state
-pub fn shared<T>(value: T) -> SharedState<T> {
-    Arc::new(value)
 }

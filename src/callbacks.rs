@@ -53,12 +53,6 @@ impl CallbackQueue {
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
-    
-    /// Get approximate length (lock-free)
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
 }
 
 /// Callback for async TCP connection establishment

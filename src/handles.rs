@@ -2,7 +2,7 @@ use pyo3::prelude::*;
 use std::os::fd::RawFd;
 use std::sync::Arc;
 
-pub use crate::concurrent::{ConcurrentIntMap, ConcurrentCallbackQueue, AtomicCounter, AtomicFlag};
+pub use crate::concurrent::ConcurrentIntMap;
 
 pub enum IoCallback {
     Python(Py<PyAny>),

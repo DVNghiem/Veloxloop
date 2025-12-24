@@ -43,7 +43,6 @@ pub trait Transport {
 /// Trait for stream-based transports (TCP, SSL)
 pub trait StreamTransport: Transport {
     /// Close the transport gracefully
-    /// Waits for buffered data to be written before closing
     fn close(&mut self, py: Python<'_>) -> PyResult<()>;
 
     /// Force close the transport immediately
@@ -74,22 +73,6 @@ pub trait StreamTransport: Transport {
 
     /// Internal callback called when the socket is writable
     fn write_ready(&mut self, py: Python<'_>) -> PyResult<()>;
-}
-
-/// Trait for datagram-based transports (UDP)
-#[allow(dead_code)]
-pub trait DatagramTransport: Transport {
-    /// Close the transport
-    fn close(&mut self, py: Python<'_>) -> PyResult<()>;
-
-    /// Send data to a specific address (or to connected peer if addr is None)
-    fn sendto(&self, py: Python<'_>, data: &[u8], addr: Option<(String, u16)>) -> PyResult<()>;
-
-    /// Abort the transport immediately
-    fn abort(&mut self, py: Python<'_>) -> PyResult<()>;
-
-    /// Internal callback called when data is available to read
-    fn read_ready(&self, py: Python<'_>) -> PyResult<()>;
 }
 
 /// Factory trait for creating different types of transports

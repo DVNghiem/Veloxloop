@@ -9,8 +9,6 @@
 //! The abstraction is designed to support completion-based (io-uring, IOCP) and
 //! readiness-based (epoll, kqueue) models through a unified async interface.
 
-// Allow dead code until full integration is complete
-
 mod ops;
 mod traits;
 

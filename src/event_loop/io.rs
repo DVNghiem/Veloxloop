@@ -18,6 +18,9 @@ impl VeloxLoop {
     }
 
     pub(crate) fn add_reader_internal(&self, fd: RawFd, callback: IoCallback) -> PyResult<()> {
+        // Track I/O operation
+        self.track_io_operation();
+        
         let mut handles = self.handles.borrow_mut();
         let (reader_exists, writer_exists) = handles.get_states(fd);
 
@@ -97,6 +100,9 @@ impl VeloxLoop {
     }
 
     pub(crate) fn add_writer_internal(&self, fd: RawFd, callback: IoCallback) -> PyResult<()> {
+        // Track I/O operation
+        self.track_io_operation();
+        
         let mut handles = self.handles.borrow_mut();
         let (reader_exists, writer_exists) = handles.get_states(fd);
 

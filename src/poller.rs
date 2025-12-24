@@ -22,23 +22,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use io_uring::{opcode, types, IoUring, Probe};
 
 #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
 use rustc_hash::FxHashMap;
 
 #[cfg(not(target_os = "linux"))]
 use rustc_hash::FxHashMap;
 
-// Re-export completion-based backend types for use in event loop
-#[cfg(target_os = "linux")]
-pub use crate::io_backend::{OpToken, OpCompletion, OpResult, IoOp};
-
-/// Cached event state
-/// Used by non-io_uring backends for tracking FD state
+/// Cached event state - used for non-Linux backends
+#[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct FdInterest {
     pub readable: bool,
     pub writable: bool,
 }
 
+#[cfg(not(target_os = "linux"))]
 impl FdInterest {
     #[inline]
     pub fn new(readable: bool, writable: bool) -> Self {
@@ -49,8 +47,6 @@ impl FdInterest {
 /// Event type that works across platforms
 #[derive(Clone, Copy)]
 pub struct PollerEvent {
-    /// Key for identifying the event source (may be unused with io-uring)
-    pub key: usize,
     pub readable: bool,
     pub writable: bool,
 }
@@ -58,25 +54,14 @@ pub struct PollerEvent {
 impl PollerEvent {
     /// Create a new poller event with specified interest
     #[inline]
-    pub fn new(key: usize, readable: bool, writable: bool) -> Self {
-        Self { key, readable, writable }
-    }
-
-    /// Create an event with no interest (used for deregistration)
-    #[inline]
-    pub fn none(key: usize) -> Self {
-        Self {
-            key,
-            readable: false,
-            writable: false,
-        }
+    pub fn new(_key: usize, readable: bool, writable: bool) -> Self {
+        Self { readable, writable }
     }
 
     /// Create an event for readable interest only
     #[inline]
-    pub fn readable(key: usize) -> Self {
+    pub fn readable(_key: usize) -> Self {
         Self {
-            key,
             readable: true,
             writable: false,
         }
@@ -84,28 +69,11 @@ impl PollerEvent {
 
     /// Create an event for writable interest only
     #[inline]
-    pub fn writable(key: usize) -> Self {
+    pub fn writable(_key: usize) -> Self {
         Self {
-            key,
             readable: false,
             writable: true,
         }
-    }
-
-    /// Create an event for both readable and writable interest
-    #[inline]
-    pub fn all(key: usize) -> Self {
-        Self {
-            key,
-            readable: true,
-            writable: true,
-        }
-    }
-    
-    /// Check if this event has any interest
-    #[inline]
-    pub fn has_interest(&self) -> bool {
-        self.readable || self.writable
     }
 }
 
@@ -118,7 +86,6 @@ pub struct PlatformEvent {
     pub writable: bool,
     pub error: bool,
 }
-
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy)]
 pub struct PlatformEvent {
@@ -136,7 +103,9 @@ pub struct IoToken(pub u64);
 #[cfg(target_os = "linux")]
 struct PendingPoll {
     fd: RawFd,
+    #[allow(dead_code)]
     readable: bool,
+    #[allow(dead_code)]
     writable: bool,
 }
 
@@ -170,7 +139,8 @@ pub struct LoopPoller {
     eventfd: RawFd,
     /// Token for eventfd poll
     eventfd_token: u64,
-    /// Probe for checking supported operations
+    /// Probe for checking supported operations (kept for future op support checks)
+    #[allow(dead_code)]
     probe: Probe,
 }
 
@@ -254,15 +224,6 @@ impl LoopPoller {
 
         // Don't submit immediately - batch submissions for better throughput
         // Submissions happen in poll_native or when SQ gets full
-        Ok(())
-    }
-
-    /// Flush any pending submissions
-    #[inline]
-    fn flush_submissions(&mut self) -> crate::utils::VeloxResult<()> {
-        if !self.ring.submission().is_empty() {
-            self.ring.submit().map_err(crate::utils::VeloxError::Io)?;
-        }
         Ok(())
     }
 
@@ -461,27 +422,6 @@ impl LoopPoller {
 
         Ok(events)
     }
-
-    /// Check if FD is registered
-    #[inline]
-    pub fn is_registered(&self, fd: RawFd) -> bool {
-        self.fd_tokens.contains_key(&fd)
-    }
-
-    /// Get access to the io-uring ring for advanced operations
-    #[inline]
-    pub fn ring(&mut self) -> &mut IoUring {
-        &mut self.ring
-    }
-
-    /// Submit a raw io-uring operation (for advanced use)
-    #[inline]
-    pub fn submit_raw(&mut self) -> crate::utils::VeloxResult<usize> {
-        self.ring
-            .submit()
-            .map_err(crate::utils::VeloxError::Io)
-    }
-
     // ==================== Completion-Based I/O Operations ====================
     // These methods provide true async I/O via io-uring's completion model
     // for maximum performance (zero-copy, kernel-side operations)
@@ -772,12 +712,6 @@ impl LoopPoller {
         self.pending_polls.remove(&target_token.0);
         let _ = self.ring.submit();
         Ok(())
-    }
-
-    /// Submit multiple operations as a batch for reduced syscall overhead
-    #[inline]
-    pub fn submit_batch(&mut self) -> crate::utils::VeloxResult<usize> {
-        self.ring.submit().map_err(crate::utils::VeloxError::Io)
     }
 }
 
