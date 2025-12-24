@@ -12,8 +12,12 @@ use pyo3::ffi;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use std::cell::RefCell;
-use std::io::Read;
+use std::io::{self, Read};
 use std::sync::Arc;
+
+thread_local! {
+    static TEMP_READ_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0; 131072]);
+}
 
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct StreamReader {
@@ -388,50 +392,26 @@ impl StreamReader {
     /// Uses larger buffer (128KB) for better large message performance
     pub(crate) fn read_from_socket(
         &self,
-        py: Python<'_>,
         stream: &mut std::net::TcpStream,
     ) -> std::io::Result<usize> {
-        let mut total_read = 0;
-        // Use 128KB buffer - matches uvloop's internal buffer size
-        let mut temp = [0u8; 131072];
-
-        loop {
-            match stream.read(&mut temp) {
-                Ok(0) => {
-                    // EOF
-                    if total_read == 0 {
-                        return Ok(0);
+        TEMP_READ_BUF.with(|buf_cell| {
+            let mut temp = buf_cell.borrow_mut();
+            let mut total = 0;
+            
+            loop {
+                match stream.read(&mut temp[..]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        total += n;
+                        self.inner.borrow_mut().buffer.extend_from_slice(&temp[..n]);
+                        if n < 131072 { break; }  // Partial read
                     }
-                    break;
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
                 }
-                Ok(n) => {
-                    total_read += n;
-                    // Extend buffer directly
-                    self.inner.borrow_mut().buffer.extend_from_slice(&temp[..n]);
-
-                    // Continue reading if we filled the buffer (more data likely available)
-                    if n < temp.len() {
-                        break;
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    break;
-                }
-                Err(e) => return Err(e),
             }
-        }
-
-        if total_read > 0 {
-            // Try to wakeup waiters
-            if let Err(e) = self._wakeup_waiters(py) {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to wakeup waiters: {}", e),
-                ));
-            }
-        }
-
-        Ok(total_read)
+            Ok(total)
+        })
     }
 }
 

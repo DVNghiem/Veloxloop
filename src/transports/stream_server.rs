@@ -103,7 +103,7 @@ impl StreamTransport {
 
         if let Some(stream) = self.stream.as_mut() {
             let reader = self.reader.bind(py).borrow();
-            match reader.read_from_socket(py, stream) {
+            match reader.read_from_socket(stream) {
                 Ok(0) => {
                     // Signal EOF to reader and let protocol decide when to close
                     drop(reader);

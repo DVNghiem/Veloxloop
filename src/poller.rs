@@ -10,13 +10,15 @@
 //! - Integrated with IoUringBackend from io_backend module
 //! - Lock-free data structures via dashmap/crossbeam
 
+#[cfg(target_os = "linux")]
+use std::io;
 use std::os::fd::RawFd;
 
 #[cfg(target_os = "linux")]
 use std::net::SocketAddr;
 
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(target_os = "linux")]
 use io_uring::{opcode, types, IoUring, Probe};
@@ -142,6 +144,8 @@ pub struct LoopPoller {
     /// Probe for checking supported operations (kept for future op support checks)
     #[allow(dead_code)]
     probe: Probe,
+    pending_submissions: AtomicUsize,
+    submission_batch_size: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -172,6 +176,8 @@ impl LoopPoller {
             eventfd,
             eventfd_token: 0,
             probe,
+            pending_submissions: AtomicUsize::new(0),
+            submission_batch_size: 32,
         };
 
         // Register eventfd for notifications
@@ -435,6 +441,7 @@ impl LoopPoller {
         buf: &mut [u8],
         offset: Option<u64>,
     ) -> crate::utils::VeloxResult<IoToken> {
+
         let token = self.next_token();
         let off = offset.unwrap_or(u64::MAX); // -1 for current position
 
@@ -459,8 +466,17 @@ impl LoopPoller {
             },
         );
 
-        let _ = self.ring.submit();
+        self.pending_submissions.fetch_add(1, Ordering::Relaxed);
+        if self.pending_submissions.load(Ordering::Relaxed) >= self.submission_batch_size {
+            self.flush_submissions()?;
+        }
         Ok(IoToken(token))
+    }
+
+    fn flush_submissions(&mut self) -> io::Result<()> {
+        let _ = self.ring.submit()?;
+        self.pending_submissions.store(0, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Submit an async write operation via io-uring

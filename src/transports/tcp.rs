@@ -523,7 +523,7 @@ impl crate::transports::StreamTransport for TcpTransport {
             if let Some(stream) = self.stream.as_mut() {
                 let reader = reader_py.bind(py).borrow();
                 // Read directly using StreamReader's optimized method
-                match reader.read_from_socket(py, stream) {
+                match reader.read_from_socket(stream) {
                     Ok(0) => {
                         // EOF
                         let _ = reader.feed_eof_native(py);
@@ -597,7 +597,10 @@ impl crate::transports::StreamTransport for TcpTransport {
         })?;
 
         if let Some(mut stream) = self.stream.as_ref() {
-            // Convert slice to mutable bytes for reading
+            // SAFETY: PyBuffer guarantees:
+            // 1. Pointer is valid for `len` bytes
+            // 2. Memory is writable (checked by as_mut_slice)
+            // 3. No aliasing - we have exclusive access via PyBuffer
             let slice_mut = unsafe {
                 std::slice::from_raw_parts_mut(slice.as_ptr() as *mut u8, slice.len())
             };
@@ -1017,7 +1020,14 @@ impl TcpTransport {
                 }
                 Ok(n) => {
                     // Create PyBytes directly from stack slice - no Vec allocation!
-                    let py_data = PyBytes::new(py, &buf[..n]);
+                    let py_data: Py<PyAny> = unsafe {
+                        let ptr = pyo3::ffi::PyMemoryView_FromMemory(
+                            buf.as_ptr() as *mut i8,
+                            n as isize,
+                            pyo3::ffi::PyBUF_READ
+                        );
+                        Py::from_owned_ptr(py, ptr)
+                    };
                     let protocol = slf.borrow().protocol.clone_ref(py);
                     protocol.call_method1(py, "data_received", (py_data,))?;
                 }
