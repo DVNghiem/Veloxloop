@@ -180,6 +180,7 @@ impl WorkStealingExecutor {
     }
 
     /// Spawn a blocking task and return a handle to get the result
+    #[allow(dead_code)]
     pub fn spawn_blocking<F, R>(&self, f: F) -> TaskHandle<R>
     where
         F: FnOnce() -> R + Send + 'static,
@@ -223,6 +224,7 @@ impl Drop for WorkStealingExecutor {
 /// Can be replaced with WorkStealingExecutor for pure Rust workloads
 pub struct ThreadPoolExecutor {
     executor: WorkStealingExecutor,
+    rt: tokio::runtime::Runtime,
 }
 
 impl ThreadPoolExecutor {
@@ -230,6 +232,7 @@ impl ThreadPoolExecutor {
     pub fn new() -> PyResult<Self> {
         Ok(Self {
             executor: WorkStealingExecutor::with_default_workers(),
+            rt: tokio::runtime::Runtime::new()?,
         })
     }
 
@@ -239,7 +242,12 @@ impl ThreadPoolExecutor {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.executor.spawn_blocking(f)
+        let (tx, rx) = bounded(1);
+        self.rt.spawn_blocking(move || {
+            let res = f();
+            let _ = tx.send(res);
+        });
+        TaskHandle { receiver: rx }
     }
     
     /// Spawn a fire-and-forget task

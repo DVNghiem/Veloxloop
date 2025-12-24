@@ -13,3 +13,5 @@ pub const WHEELS: usize = 4;
 pub const PRECISION_NS: u64 = 1_000_000; // 1ms - keep for timer precision
 
 pub const STACK_BUF_SIZE: usize = 65536;
+
+pub const POLLER_BATCH_THRESHOLD: usize = 32; // Batch size for processing callbacks poller events

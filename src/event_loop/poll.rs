@@ -1,5 +1,5 @@
 use crate::event_loop::VeloxLoop;
-use crate::handles::Handle;
+use crate::handles::{Handle, IoCallback};
 use crate::poller::{PlatformEvent, PollerEvent};
 use crate::utils::VeloxResult;
 use pyo3::prelude::*;
@@ -177,15 +177,19 @@ impl VeloxLoop {
             }
         }
 
+        let mut python_callbacks: Vec<Handle> = Vec::new();
+
         for (fd, r_h, w_h, _has_r, _has_w) in pending.iter() {
             if let Some(h) = r_h {
-                if let Err(e) = h.execute(py) {
-                    e.print(py);
+                match &h.callback {
+                    IoCallback::Native(cb) => { let _ = cb(py); } // Native first, no GIL hold
+                    _ => python_callbacks.push(h.clone()), // Batch Python
                 }
             }
             if let Some(h) = w_h {
-                if let Err(e) = h.execute(py) {
-                    e.print(py);
+                match &h.callback {
+                    IoCallback::Native(cb) => { let _ = cb(py); }
+                    _ => python_callbacks.push(h.clone()),
                 }
             }
 
@@ -200,6 +204,12 @@ impl VeloxLoop {
             if still_has_reader || still_has_writer {
                 let ev = PollerEvent::new(*fd as usize, still_has_reader, still_has_writer);
                 let _ = self.poller.borrow_mut().rearm_oneshot(*fd, ev);
+            }
+        }
+        // Execute batched Python callbacks at end (one GIL hold)
+        for cb in python_callbacks {
+            if let Err(e) = cb.execute(py) {
+                e.print(py);
             }
         }
 

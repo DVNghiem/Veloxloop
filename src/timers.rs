@@ -1,3 +1,5 @@
+use std::{cmp::Reverse, collections::BinaryHeap};
+
 use slab::Slab;
 
 use crate::constants::{PRECISION_NS, WHEEL_BITS, WHEEL_MASK, WHEEL_SIZE, WHEELS};
@@ -31,6 +33,8 @@ pub struct Timers {
     next_id: u64,
     /// Cached minimum expiry for fast next_expiry() calls
     min_expiry_cache: Option<u64>,
+
+    heap: BinaryHeap<Reverse<(u64, TimerKey)>>
 }
 
 impl Timers {
@@ -49,6 +53,7 @@ impl Timers {
             current_ms: 0,
             next_id: 1,
             min_expiry_cache: None,
+            heap: BinaryHeap::with_capacity(1024),
         }
     }
 
@@ -85,7 +90,7 @@ impl Timers {
             None => self.min_expiry_cache = Some(expires_at_ns),
             _ => {}
         }
-
+        self.heap.push(Reverse((expires_at_ns, slab_key)));
         id
     }
 
@@ -117,6 +122,7 @@ impl Timers {
                 return true;
             }
         }
+        self.min_expiry_cache = None; // Invalidate, recompute lazy
         false
     }
 
@@ -128,15 +134,14 @@ impl Timers {
     }
 
     fn recompute_min_expiry(&mut self) {
-        let mut min: Option<u64> = None;
-        for entry in self.entries.iter() {
-            match min {
-                None => min = Some(entry.1.expires_at),
-                Some(current) if entry.1.expires_at < current => min = Some(entry.1.expires_at),
-                _ => {}
+        while let Some(Reverse((exp, key))) = self.heap.peek() {
+            if self.entries.contains(*key) && *exp == self.entries[*key].expires_at {
+                self.min_expiry_cache = Some(*exp);
+                return;
             }
+            self.heap.pop(); // Clean stale
         }
-        self.min_expiry_cache = min;
+        self.min_expiry_cache = None;
     }
 
     /// Pop all expired timers up to current_ns

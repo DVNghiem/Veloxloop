@@ -145,7 +145,6 @@ pub struct LoopPoller {
     #[allow(dead_code)]
     probe: Probe,
     pending_submissions: AtomicUsize,
-    submission_batch_size: usize,
 }
 
 #[cfg(target_os = "linux")]
@@ -177,7 +176,6 @@ impl LoopPoller {
             eventfd_token: 0,
             probe,
             pending_submissions: AtomicUsize::new(0),
-            submission_batch_size: 32,
         };
 
         // Register eventfd for notifications
@@ -441,6 +439,8 @@ impl LoopPoller {
         buf: &mut [u8],
         offset: Option<u64>,
     ) -> crate::utils::VeloxResult<IoToken> {
+        use crate::constants::POLLER_BATCH_THRESHOLD;
+
 
         let token = self.next_token();
         let off = offset.unwrap_or(u64::MAX); // -1 for current position
@@ -467,7 +467,7 @@ impl LoopPoller {
         );
 
         self.pending_submissions.fetch_add(1, Ordering::Relaxed);
-        if self.pending_submissions.load(Ordering::Relaxed) >= self.submission_batch_size {
+        if self.pending_submissions.load(Ordering::Relaxed) >= POLLER_BATCH_THRESHOLD {
             self.flush_submissions()?;
         }
         Ok(IoToken(token))
