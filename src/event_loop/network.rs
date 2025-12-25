@@ -524,14 +524,76 @@ impl VeloxLoop {
         let py = slf.py();
         let self_ = slf.borrow();
 
-        let host = host.unwrap_or("127.0.0.1");
-        let port = port.unwrap_or(0);
-        let addr_str = format!("{}:{}", host, port);
-
         let ssl_context = _kwargs
             .as_ref()
             .and_then(|kw| kw.get_item("ssl").ok().flatten())
             .and_then(|v| v.extract::<Py<crate::transports::ssl::SSLContext>>().ok());
+
+        // Check if a pre-existing socket is provided
+        let sock_obj = _kwargs
+            .as_ref()
+            .and_then(|kw| kw.get_item("sock").ok().flatten());
+
+        let (stream, fd) = if let Some(sock) = sock_obj {
+            // Use the provided socket
+            let fd = sock.call_method0("fileno")?.extract::<RawFd>()?;
+            
+            // Duplicate the file descriptor so we don't steal it from Python
+            use std::os::unix::io::FromRawFd;
+            let dup_fd = unsafe { libc::dup(fd) };
+            if dup_fd < 0 {
+                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
+                    "Failed to duplicate file descriptor"
+                ));
+            }
+            let stream = unsafe { std::net::TcpStream::from_raw_fd(dup_fd) };
+            
+            // Set nonblocking mode
+            stream
+                .set_nonblocking(true)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+            
+            (stream, dup_fd)
+        } else {
+            // Create a new socket as before
+            let host = host.unwrap_or("127.0.0.1");
+            let port = port.unwrap_or(0);
+            let addr_str = format!("{}:{}", host, port);
+
+            let mut addrs = std::net::ToSocketAddrs::to_socket_addrs(&addr_str)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+
+            let addr = addrs
+                .next()
+                .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyOSError, _>("No address found"))?;
+
+            let is_ipv6 = addr.is_ipv6();
+            let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
+            let socket = Socket::new(domain, Type::STREAM, None)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+
+            socket
+                .set_nonblocking(true)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
+
+            match socket.connect(&addr.into()) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                #[cfg(unix)]
+                Err(e) if e.raw_os_error() == Some(36) || e.raw_os_error() == Some(115) => {}
+                Err(e) => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
+                        "Connection failed: {}",
+                        e
+                    )));
+                }
+            }
+
+            let stream: std::net::TcpStream = socket.into();
+            let fd = stream.as_raw_fd();
+            
+            (stream, fd)
+        };
 
         let server_hostname = _kwargs
             .as_ref()
@@ -539,43 +601,11 @@ impl VeloxLoop {
             .and_then(|v| v.extract::<String>().ok())
             .or_else(|| {
                 if ssl_context.is_some() {
-                    Some(host.to_string())
+                    host.map(|h| h.to_string())
                 } else {
                     None
                 }
             });
-
-        let mut addrs = std::net::ToSocketAddrs::to_socket_addrs(&addr_str)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-
-        let addr = addrs
-            .next()
-            .ok_or_else(|| PyErr::new::<pyo3::exceptions::PyOSError, _>("No address found"))?;
-
-        let is_ipv6 = addr.is_ipv6();
-        let domain = if is_ipv6 { Domain::IPV6 } else { Domain::IPV4 };
-        let socket = Socket::new(domain, Type::STREAM, None)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-
-        match socket.connect(&addr.into()) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            #[cfg(unix)]
-            Err(e) if e.raw_os_error() == Some(36) || e.raw_os_error() == Some(115) => {}
-            Err(e) => {
-                return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
-                    "Connection failed: {}",
-                    e
-                )));
-            }
-        }
-
-        let stream: std::net::TcpStream = socket.into();
-        let fd = stream.as_raw_fd();
 
         let fut = self_.create_future(py)?;
 
