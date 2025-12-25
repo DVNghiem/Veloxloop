@@ -8,6 +8,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::buffer_pool::BufferPool;
 use crate::constants::{DEFAULT_HIGH, DEFAULT_LOW};
@@ -361,6 +362,9 @@ pub struct TcpTransport {
     write_buffer_low: usize,
     // Direct path to reader
     reader: Option<Py<crate::streams::StreamReader>>,
+
+    reading: AtomicBool,
+    
 }
 
 unsafe impl Send for TcpTransport {}
@@ -906,111 +910,109 @@ impl TcpTransport {
     /// 3. Minimal RefCell borrows
     #[inline(always)]
     pub(crate) fn _read_ready(slf: &Bound<'_, Self>) -> PyResult<()> {
+        // Lock-free guard against re-entrance
+        if slf.borrow().reading.swap(true, Ordering::Acquire) {
+            return Ok(()); // Already reading
+        }
+        
         let py = slf.py();
-
-        // Fast path check - avoid borrow if already closed
-        {
+        
+        // OPTIMIZATION 1: Single borrow, extract what we need
+        let (has_reader, reader_py, protocol_py, stream_ptr) = {
             let self_ = slf.borrow();
+            
             if self_.state.intersects(
-                TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
+                TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED
             ) {
+                self_.reading.store(false, Ordering::Release);
                 return Ok(());
             }
+            
+            let has_reader = self_.reader.is_some();
+            let reader = self_.reader.as_ref().map(|r| r.clone_ref(py));
+            let protocol = self_.protocol.clone_ref(py);
+            
+            // SAFETY: We hold self_ borrow, stream won't be dropped
+            let stream_ptr = self_.stream.as_ref()
+                .map(|s| s as *const std::net::TcpStream as usize);
+            
+            (has_reader, reader, protocol, stream_ptr)
+        }; // Drop borrow immediately
+        
+        if stream_ptr.is_none() {
+            slf.borrow().reading.store(false, Ordering::Release);
+            return Ok(());
         }
-
-        // Check if we have a direct reader path (streams API)
-        let has_reader = slf.borrow().reader.is_some();
-
-        // Stack-allocated read buffer - 128KB for optimal large message performance
-        let mut buf = [0u8; 131072];
-
+        
+        // OPTIMIZATION 2: Use smaller, cache-friendly buffer
+        const BUF_SIZE: usize = 16384; // 16KB fits in L2 cache
+        let mut buf = [0u8; BUF_SIZE];
+        
         if has_reader {
-            // StreamReader path: read directly into reader's buffer, no Python callback
+            // FAST PATH: Direct StreamReader (zero Python calls)
+            let reader_obj = reader_py.as_ref().unwrap().bind(py).borrow();
+            let mut should_wakeup = false;
+            
+            let mut eof_reached = false;
             loop {
-                // Read data while holding only stream borrow (not self_)
-                let read_result = {
-                    let self_ = slf.borrow();
-                    if self_.state.intersects(
-                        TransportState::CLOSING
-                            | TransportState::CLOSED
-                            | TransportState::READING_PAUSED,
-                    ) {
-                        break;
-                    }
-                    if let Some(stream) = self_.stream.as_ref() {
-                        let mut s = stream;
-                        std::io::Read::read(&mut s, &mut buf)
-                    } else {
-                        break;
-                    }
-                }; // self_ borrow dropped here
-
-                match read_result {
+                // SAFETY: stream_ptr is valid, we checked state above
+                let n = unsafe {
+                    let stream = &*(stream_ptr.unwrap() as *const std::net::TcpStream);
+                    let mut s = stream;
+                    std::io::Read::read(&mut s, &mut buf)
+                };
+                
+                match n {
                     Ok(0) => {
                         // EOF
-                        let self_ = slf.borrow();
-                        if let Some(reader_py) = &self_.reader {
-                            let reader = reader_py.bind(py).borrow();
-                            let _ = reader.feed_eof_native(py);
-                            reader._wakeup_waiters(py)?;
-                        }
-                        drop(self_);
-                        Self::close(slf)?;
+                        eof_reached = true;
                         break;
                     }
-                    Ok(n) => {
-                        // Feed data directly to reader's buffer (zero-copy from stack)
-                        let reader_clone = {
-                            let self_ = slf.borrow();
-                            self_.reader.as_ref().map(|r| r.clone_ref(py))
-                        };
-                        if let Some(reader_py) = reader_clone {
-                            let reader = reader_py.bind(py).borrow();
-                            reader
-                                .inner
-                                .borrow_mut()
-                                .buffer
-                                .extend_from_slice(&buf[..n]);
-                            reader._wakeup_waiters(py)?;
-                        }
-                        // Continue reading if we got a full buffer
-                        if n < 131072 {
-                            break;
+                    Ok(n) => {  
+                        // OPTIMIZATION 3: Direct buffer write (no PyBytes allocation)
+                        reader_obj.inner.borrow_mut().buffer.extend_from_slice(&buf[..n]);
+                        should_wakeup = true;
+                        
+                        // Partial read? Socket drained
+                        if n < BUF_SIZE { 
+                            break; 
                         }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e.into()),
+                    Err(e) => {
+                        drop(reader_obj);
+                        slf.borrow().reading.store(false, Ordering::Release);
+                        return Err(e.into());
+                    }
                 }
             }
+            
+            // Wake waiters ONCE after all reads (not per read)
+            if should_wakeup {
+                reader_obj._wakeup_waiters(py)?;
+            }
+            
+            // Handle EOF after waking waiters
+            if eof_reached {
+                drop(reader_obj);
+                reader_py.unwrap().bind(py).borrow().feed_eof_native(py)?;
+                Self::close(slf)?;
+            }
+            
         } else {
-            // Protocol path: read and call data_received
-            // Single read per callback (protocol may pause reading)
-            let read_result = {
-                let self_ = slf.borrow();
-                if self_.state.intersects(
-                    TransportState::CLOSING
-                        | TransportState::CLOSED
-                        | TransportState::READING_PAUSED,
-                ) {
-                    return Ok(());
-                }
-                if let Some(stream) = self_.stream.as_ref() {
-                    let mut s = stream;
-                    std::io::Read::read(&mut s, &mut buf)
-                } else {
-                    return Ok(());
-                }
-            }; // self_ borrow dropped here
-
-            match read_result {
+            // PROTOCOL PATH: Single read + batch callback
+            let n = unsafe {
+                let stream = &*(stream_ptr.unwrap() as *const std::net::TcpStream);
+                let mut s = stream;
+                std::io::Read::read(&mut s, &mut buf)
+            };
+            
+            match n {
                 Ok(0) => {
                     // EOF
-                    let protocol = slf.borrow().protocol.clone_ref(py);
-                    if let Ok(res) = protocol.call_method0(py, "eof_received") {
+                    if let Ok(res) = protocol_py.call_method0(py, "eof_received") {
                         if let Ok(keep_open) = res.extract::<bool>(py) {
-                            if !keep_open {
-                                Self::close(slf)?;
-                            }
+                            if !keep_open { Self::close(slf)?; }
                         } else {
                             Self::close(slf)?;
                         }
@@ -1019,24 +1021,19 @@ impl TcpTransport {
                     }
                 }
                 Ok(n) => {
-                    // Create PyBytes directly from stack slice - no Vec allocation!
-                    // let py_data: Py<PyAny> = unsafe {
-                    //     let ptr = pyo3::ffi::PyMemoryView_FromMemory(
-                    //         buf.as_ptr() as *mut i8,
-                    //         n as isize,
-                    //         pyo3::ffi::PyBUF_READ
-                    //     );
-                    //     Py::from_owned_ptr(py, ptr)
-                    // };
+                    // OPTIMIZATION 4: Zero-copy PyBytes with GIL
                     let py_data = PyBytes::new(py, &buf[..n]);
-                    let protocol = slf.borrow().protocol.clone_ref(py);
-                    protocol.call_method1(py, "data_received", (py_data,))?;
+                    protocol_py.call_method1(py, "data_received", (py_data,))?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    slf.borrow().reading.store(false, Ordering::Release);
+                    return Err(e.into());
+                }
             }
         }
-
+        
+        slf.borrow().reading.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -1249,6 +1246,7 @@ impl TcpTransport {
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,
             reader: None,
+            reading: AtomicBool::new(false),
         })
     }
 }

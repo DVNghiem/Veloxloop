@@ -25,7 +25,7 @@ pub struct Callback {
 /// Uses crossbeam-channel internally for efficient lock-free operations.
 pub struct CallbackQueue {
     /// Lock-free concurrent queue using crossbeam channels
-    inner: ConcurrentCallbackQueue<Callback>,
+   pub inner: ConcurrentCallbackQueue<Callback>,
 }
 
 impl CallbackQueue {
@@ -44,6 +44,7 @@ impl CallbackQueue {
     /// Drain all callbacks into a target vector (lock-free)
     /// This is more efficient than swap for concurrent access
     #[inline]
+    #[allow(dead_code)]
     pub fn swap_into(&self, target: &mut Vec<Callback>) {
         self.inner.drain_into(target);
     }

@@ -1,7 +1,7 @@
 # Veloxloop Benchmarks
 
-Run at: Thu 25 Dec 2025, 13:12  
-Environment: Linux x86_64 (CPUs: 8)  
+Run at: Thu 25 Dec 2025, 23:41  
+Environment: Linux x86_64 (CPUs: 12)  
 Python version: 3.13  
 Veloxloop version: 0.1.0  
 
@@ -13,33 +13,33 @@ TCP echo server with raw sockets comparison.
 ### Overview (1 concurrent connection)
 | Loop | 1KB rps | 10KB rps | 100KB rps |
 | --- | --- | --- | --- |
-| **veloxloop** | 71,765 | 61,926 | 23,887 |
-| **asyncio** | 48,550 | 41,620 | 21,400 |
-| **uvloop** | 54,478 | 44,580 | 17,706 |
+| **veloxloop** | 70,497 | 60,809 | 22,613 |
+| **asyncio** | 48,599 | 40,687 | 19,606 |
+| **uvloop** | 54,034 | 43,173 | 16,506 |
 
 ### 1KB Details
 
 | Loop | RPS | Mean Latency | 99p Latency | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 71,764.8 | 0.011ms | 0.027ms | 0.010ms | 3.630ms |
-| **asyncio** | 48,549.5 | 0.021ms | 0.039ms | 0.010ms | 0.310ms |
-| **uvloop** | 54,478.4 | 0.017ms | 0.038ms | 0.010ms | 0.200ms |
+| **veloxloop** | 70,496.6 | 0.011ms | 0.027ms | 0.010ms | 0.120ms |
+| **asyncio** | 48,598.6 | 0.021ms | 0.040ms | 0.010ms | 0.550ms |
+| **uvloop** | 54,033.6 | 0.020ms | 0.035ms | 0.010ms | 0.160ms |
 
 ### 10KB Details
 
 | Loop | RPS | Mean Latency | 99p Latency | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 61,925.7 | 0.015ms | 0.030ms | 0.010ms | 3.850ms |
-| **asyncio** | 41,619.6 | 0.023ms | 0.043ms | 0.010ms | 0.960ms |
-| **uvloop** | 44,580.2 | 0.022ms | 0.039ms | 0.010ms | 0.650ms |
+| **veloxloop** | 60,808.7 | 0.016ms | 0.030ms | 0.010ms | 3.150ms |
+| **asyncio** | 40,687.3 | 0.024ms | 0.042ms | 0.010ms | 0.180ms |
+| **uvloop** | 43,172.7 | 0.021ms | 0.040ms | 0.020ms | 0.180ms |
 
 ### 100KB Details
 
 | Loop | RPS | Mean Latency | 99p Latency | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 23,886.8 | 0.042ms | 0.065ms | 0.030ms | 2.890ms |
-| **asyncio** | 21,400.2 | 0.045ms | 0.072ms | 0.030ms | 0.220ms |
-| **uvloop** | 17,706.2 | 0.054ms | 0.083ms | 0.040ms | 2.270ms |
+| **veloxloop** | 22,613.1 | 0.041ms | 0.060ms | 0.040ms | 0.500ms |
+| **asyncio** | 19,606.2 | 0.051ms | 0.070ms | 0.040ms | 0.210ms |
+| **uvloop** | 16,505.8 | 0.061ms | 0.086ms | 0.040ms | 0.490ms |
 
 
 ## Streams
@@ -50,33 +50,33 @@ TCP echo server with `asyncio` streams comparison.
 ### Overview (1 concurrent connection)
 | Loop | 1KB rps | 10KB rps | 100KB rps |
 | --- | --- | --- | --- |
-| **veloxloop** | 47,607 | 40,927 | 17,010 |
-| **asyncio** | 47,921 | 40,648 | 14,245 |
-| **uvloop** | 52,483 | 45,578 | 17,926 |
+| **veloxloop** | 51,497 | 42,075 | 10,498 |
+| **asyncio** | 48,450 | 36,281 | 14,407 |
+| **uvloop** | 48,726 | 39,307 | 15,463 |
 
 ### 1KB Details
 
 | Loop | RPS | Mean Latency | 99p Latency | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 47,607.2 | 0.021ms | 0.039ms | 0.010ms | 0.920ms |
-| **asyncio** | 47,920.9 | 0.021ms | 0.039ms | 0.020ms | 2.370ms |
-| **uvloop** | 52,482.8 | 0.020ms | 0.036ms | 0.010ms | 5.040ms |
+| **veloxloop** | 51,497.0 | 0.020ms | 0.036ms | 0.010ms | 0.600ms |
+| **asyncio** | 48,449.8 | 0.021ms | 0.037ms | 0.020ms | 0.150ms |
+| **uvloop** | 48,726.4 | 0.021ms | 0.040ms | 0.020ms | 1.490ms |
 
 ### 10KB Details
 
 | Loop | RPS | Mean Latency | 99p Latency | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 40,926.9 | 0.023ms | 0.042ms | 0.020ms | 2.990ms |
-| **asyncio** | 40,647.9 | 0.023ms | 0.047ms | 0.020ms | 1.210ms |
-| **uvloop** | 45,577.6 | 0.021ms | 0.038ms | 0.020ms | 0.710ms |
+| **veloxloop** | 42,075.0 | 0.021ms | 0.040ms | 0.020ms | 2.050ms |
+| **asyncio** | 36,281.3 | 0.025ms | 0.054ms | 0.020ms | 0.840ms |
+| **uvloop** | 39,306.6 | 0.023ms | 0.049ms | 0.020ms | 1.020ms |
 
 ### 100KB Details
 
 | Loop | RPS | Mean Latency | 99p Latency | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 17,010.2 | 0.057ms | 0.090ms | 0.040ms | 1.790ms |
-| **asyncio** | 14,245.2 | 0.069ms | 0.120ms | 0.040ms | 2.090ms |
-| **uvloop** | 17,925.5 | 0.054ms | 0.086ms | 0.040ms | 3.080ms |
+| **veloxloop** | 10,498.4 | 0.094ms | 0.154ms | 0.080ms | 1.350ms |
+| **asyncio** | 14,407.0 | 0.069ms | 0.102ms | 0.050ms | 0.640ms |
+| **uvloop** | 15,462.9 | 0.065ms | 0.107ms | 0.050ms | 2.160ms |
 
 
 ## Protocol
@@ -87,33 +87,33 @@ TCP echo server with `asyncio.Protocol` comparison.
 ### Overview (1 concurrent connection)
 | Loop | 1KB rps | 10KB rps | 100KB rps |
 | --- | --- | --- | --- |
-| **veloxloop** | 60,817 | 55,074 | 23,800 |
-| **asyncio** | 66,555 | 58,499 | 27,699 |
-| **uvloop** | 73,377 | 61,373 | 26,068 |
+| **veloxloop** | 73,901 | 61,783 | 14,652 |
+| **asyncio** | 66,702 | 56,513 | 26,273 |
+| **uvloop** | 73,409 | 60,983 | 24,346 |
 
 ### 1KB Details
 
 | Loop | RPS | Mean Latency | 99p Latency | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 60,817.1 | 0.014ms | 0.030ms | 0.010ms | 2.920ms |
-| **asyncio** | 66,554.6 | 0.012ms | 0.029ms | 0.010ms | 2.790ms |
-| **uvloop** | 73,376.7 | 0.012ms | 0.029ms | 0.010ms | 1.250ms |
+| **veloxloop** | 73,901.3 | 0.011ms | 0.027ms | 0.010ms | 1.080ms |
+| **asyncio** | 66,701.9 | 0.011ms | 0.029ms | 0.010ms | 0.140ms |
+| **uvloop** | 73,408.6 | 0.011ms | 0.027ms | 0.010ms | 0.140ms |
 
 ### 10KB Details
 
 | Loop | RPS | Mean Latency | 99p Latency | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 55,073.8 | 0.019ms | 0.030ms | 0.010ms | 2.910ms |
-| **asyncio** | 58,499.2 | 0.017ms | 0.030ms | 0.010ms | 0.340ms |
-| **uvloop** | 61,372.8 | 0.015ms | 0.030ms | 0.010ms | 4.530ms |
+| **veloxloop** | 61,783.4 | 0.015ms | 0.030ms | 0.010ms | 0.740ms |
+| **asyncio** | 56,513.4 | 0.020ms | 0.030ms | 0.010ms | 0.160ms |
+| **uvloop** | 60,983.2 | 0.015ms | 0.030ms | 0.010ms | 0.470ms |
 
 ### 100KB Details
 
 | Loop | RPS | Mean Latency | 99p Latency | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 23,800.3 | 0.041ms | 0.060ms | 0.030ms | 1.180ms |
-| **asyncio** | 27,698.7 | 0.034ms | 0.054ms | 0.030ms | 0.210ms |
-| **uvloop** | 26,067.9 | 0.039ms | 0.054ms | 0.030ms | 0.730ms |
+| **veloxloop** | 14,652.3 | 0.066ms | 0.104ms | 0.060ms | 0.510ms |
+| **asyncio** | 26,273.4 | 0.038ms | 0.055ms | 0.030ms | 0.160ms |
+| **uvloop** | 24,346.3 | 0.041ms | 0.059ms | 0.030ms | 0.230ms |
 
 
 ## Concurrency Scaling
@@ -123,25 +123,25 @@ TCP echo server performance with different concurrency levels (1KB messages).
 
 ### Overview
 
-| Loop| 4 conn | 7 conn |
+| Loop| 6 conn | 11 conn |
 | --- | --- | --- |
-| **veloxloop** | 86,246 | 90,522 |
-| **asyncio** | 47,412 | 48,095 |
-| **uvloop** | 64,088 | 65,582 |
+| **veloxloop** | 101,082 | 98,644 |
+| **asyncio** | 56,103 | 57,098 |
+| **uvloop** | 69,835 | 79,608 |
 
-### 4 Concurrent Connections
-
-| Loop | RPS | Mean Latency | 99p Latency | Min | Max |
-| --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 86,245.5 | 0.045ms | 0.090ms | 0.010ms | 3.630ms |
-| **asyncio** | 47,412.5 | 0.083ms | 0.128ms | 0.010ms | 2.240ms |
-| **uvloop** | 64,087.5 | 0.061ms | 0.091ms | 0.020ms | 2.580ms |
-
-### 7 Concurrent Connections
+### 6 Concurrent Connections
 
 | Loop | RPS | Mean Latency | 99p Latency | Min | Max |
 | --- | --- | --- | --- | --- | --- |
-| **veloxloop** | 90,521.5 | 0.076ms | 0.157ms | 0.010ms | 5.400ms |
-| **asyncio** | 48,095.0 | 0.144ms | 0.218ms | 0.010ms | 4.260ms |
-| **uvloop** | 65,582.4 | 0.106ms | 0.149ms | 0.020ms | 8.050ms |
+| **veloxloop** | 101,081.8 | 0.060ms | 0.124ms | 0.010ms | 17.440ms |
+| **asyncio** | 56,103.1 | 0.105ms | 0.147ms | 0.010ms | 1.130ms |
+| **uvloop** | 69,835.2 | 0.085ms | 0.130ms | 0.030ms | 3.560ms |
+
+### 11 Concurrent Connections
+
+| Loop | RPS | Mean Latency | 99p Latency | Min | Max |
+| --- | --- | --- | --- | --- | --- |
+| **veloxloop** | 98,644.1 | 0.110ms | 0.240ms | 0.010ms | 5.050ms |
+| **asyncio** | 57,097.6 | 0.191ms | 0.274ms | 0.010ms | 3.560ms |
+| **uvloop** | 79,608.3 | 0.136ms | 0.193ms | 0.040ms | 3.780ms |
 

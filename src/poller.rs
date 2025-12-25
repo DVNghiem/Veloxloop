@@ -30,6 +30,8 @@ use rustc_hash::FxHashMap;
 #[cfg(not(target_os = "linux"))]
 use rustc_hash::FxHashMap;
 
+use std::time::Duration;
+
 /// Cached event state - used for non-Linux backends
 #[cfg(not(target_os = "linux"))]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -145,6 +147,7 @@ pub struct LoopPoller {
     #[allow(dead_code)]
     probe: Probe,
     pending_submissions: AtomicUsize,
+    last_submit_time: parking_lot::Mutex<std::time::Instant>,
 }
 
 #[cfg(target_os = "linux")]
@@ -176,6 +179,7 @@ impl LoopPoller {
             eventfd_token: 0,
             probe,
             pending_submissions: AtomicUsize::new(0),
+            last_submit_time: parking_lot::Mutex::new(std::time::Instant::now()),
         };
 
         // Register eventfd for notifications
@@ -191,6 +195,7 @@ impl LoopPoller {
     }
 
     /// Submit a poll_add operation to io-uring (queues for batch submission)
+    #[inline]
     fn submit_poll_add(
         &mut self,
         fd: RawFd,
@@ -198,6 +203,8 @@ impl LoopPoller {
         writable: bool,
         token: u64,
     ) -> crate::utils::VeloxResult<()> {
+        use crate::constants::POLLER_BATCH_THRESHOLD;
+
         let mut flags: u32 = 0;
         if readable {
             flags |= libc::POLLIN as u32;
@@ -226,8 +233,10 @@ impl LoopPoller {
             },
         );
 
-        // Don't submit immediately - batch submissions for better throughput
-        // Submissions happen in poll_native or when SQ gets full
+        if self.pending_submissions.load(Ordering::Relaxed) >= POLLER_BATCH_THRESHOLD {
+            self.flush_submissions()?;
+        }
+        
         Ok(())
     }
 
@@ -331,36 +340,29 @@ impl LoopPoller {
         &mut self,
         timeout: Option<std::time::Duration>,
     ) -> crate::utils::VeloxResult<Vec<PlatformEvent>> {
-        // Submit any pending operations and wait for completions
-        let want = if timeout == Some(std::time::Duration::ZERO) {
-            0
-        } else {
-            1
+        let should_flush = {
+            let last_submit = *self.last_submit_time.lock();
+            last_submit.elapsed() > Duration::from_micros(100) // 100µs batching window
         };
+        
+        if should_flush {
+            self.flush_submissions()?;
+        }
 
         // Use submit_and_wait with timeout
         if let Some(dur) = timeout {
-            if dur > std::time::Duration::ZERO {
-                // Submit a timeout operation
+            if dur > Duration::ZERO {
                 let ts = types::Timespec::new()
                     .sec(dur.as_secs() as u64)
                     .nsec(dur.subsec_nanos() as u32);
-
-                let timeout_e = opcode::Timeout::new(&ts)
-                    .build()
-                    .user_data(0); // Special token for timeout
-
-                unsafe {
-                    let _ = self.ring.submission().push(&timeout_e);
-                }
+                
+                let timeout_e = opcode::Timeout::new(&ts).build().user_data(0);
+                unsafe { let _ = self.ring.submission().push(&timeout_e); }
             }
         }
-
-        if want > 0 {
-            let _ = self.ring.submit_and_wait(want);
-        } else {
-            let _ = self.ring.submit();
-        }
+        
+        let want = if timeout == Some(Duration::ZERO) { 0 } else { 1 };
+        let _ = self.ring.submit_and_wait(want);
 
         // Collect completions first to avoid borrow issues
         let completions: Vec<(u64, i32)> = {
@@ -473,9 +475,13 @@ impl LoopPoller {
         Ok(IoToken(token))
     }
 
+    #[inline]
     fn flush_submissions(&mut self) -> io::Result<()> {
-        let _ = self.ring.submit()?;
-        self.pending_submissions.store(0, Ordering::Relaxed);
+        if self.pending_submissions.load(Ordering::Relaxed) > 0 {
+            self.ring.submit()?;
+            self.pending_submissions.store(0, Ordering::Relaxed);
+            *self.last_submit_time.lock() = std::time::Instant::now();
+        }
         Ok(())
     }
 
