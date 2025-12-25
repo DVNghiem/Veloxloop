@@ -1020,14 +1020,15 @@ impl TcpTransport {
                 }
                 Ok(n) => {
                     // Create PyBytes directly from stack slice - no Vec allocation!
-                    let py_data: Py<PyAny> = unsafe {
-                        let ptr = pyo3::ffi::PyMemoryView_FromMemory(
-                            buf.as_ptr() as *mut i8,
-                            n as isize,
-                            pyo3::ffi::PyBUF_READ
-                        );
-                        Py::from_owned_ptr(py, ptr)
-                    };
+                    // let py_data: Py<PyAny> = unsafe {
+                    //     let ptr = pyo3::ffi::PyMemoryView_FromMemory(
+                    //         buf.as_ptr() as *mut i8,
+                    //         n as isize,
+                    //         pyo3::ffi::PyBUF_READ
+                    //     );
+                    //     Py::from_owned_ptr(py, ptr)
+                    // };
+                    let py_data = PyBytes::new(py, &buf[..n]);
                     let protocol = slf.borrow().protocol.clone_ref(py);
                     protocol.call_method1(py, "data_received", (py_data,))?;
                 }

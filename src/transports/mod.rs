@@ -41,6 +41,7 @@ pub trait Transport {
 }
 
 /// Trait for stream-based transports (TCP, SSL)
+#[allow(dead_code)]
 pub trait StreamTransport: Transport {
     /// Close the transport gracefully
     fn close(&mut self, py: Python<'_>) -> PyResult<()>;
