@@ -4,13 +4,13 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/veloxloop.svg)](https://pypi.org/project/veloxloop/)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-**VeloxLoop** — A modern, high-performance asyncio event loop implementation written from scratch in **Rust** using **PyO3** and the **polling** crate.
+**VeloxLoop** — A modern, high-performance asyncio event loop implementation written from scratch in **Rust** using **PyO3**, **tokio** and **io-uring** crate.
 
 *Velox* is Latin for "swift" or "rapid" — reflecting the goal of delivering significantly faster I/O and lower overhead than the default selector event loop while remaining fully compatible with the standard `asyncio` API.
 
 ⚡ **Why VeloxLoop?**  
 - Built in Rust for memory safety, zero-cost abstractions, and exceptional performance.  
-- Powered by the lightweight and modern `polling` crate for cross-platform epoll/kqueue/IOCP support.  
+- Powered by the lightweight and modern `io-uring` and `tokio` crate for cross-platform epoll/kqueue/IOCP support.  
 - Completely independent design — no shared code or direct architectural overlap with existing projects (including RLoop, uvloop, or others).  
 - Focus on clean, efficient readiness handling, minimal overhead, and excellent cross-platform behavior.  
 - Early results show strong potential for outperforming current alternatives.
@@ -51,7 +51,6 @@ The following asyncio features are **not yet implemented** and are planned for f
 
 ### Advanced I/O
 - [ ] **File descriptor passing** - Passing file descriptors between processes
-- [ ] **Raw socket support** - Low-level socket operations
 - [ ] **`connect_accepted_socket()`** - Create transport from accepted socket
 
 ### Platform-Specific Features
@@ -62,7 +61,6 @@ The following asyncio features are **not yet implemented** and are planned for f
 ### Performance & Diagnostics
 - [ ] **Slow callback warnings** - Debug mode performance monitoring
 - [ ] **Loop instrumentation** - Detailed metrics and statistics
-- [ ] **Memory pooling** - Reduce allocation overhead
 - [ ] **Zero-copy operations** - Minimize data copying where possible
 
 ### Compatibility & Standards
