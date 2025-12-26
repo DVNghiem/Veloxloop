@@ -2,7 +2,16 @@ import argparse
 import asyncio
 import os
 import os.path
-from socket import AF_INET, AF_UNIX, IPPROTO_TCP, SO_REUSEADDR, SOCK_STREAM, SOL_SOCKET, TCP_NODELAY, socket
+from socket import (
+    AF_INET,
+    AF_UNIX,
+    IPPROTO_TCP,
+    SO_REUSEADDR,
+    SOCK_STREAM,
+    SOL_SOCKET,
+    TCP_NODELAY,
+    socket,
+)
 
 
 PRINT = 0
@@ -66,6 +75,7 @@ async def echo_client_streams(reader, writer):
 
 class EchoProtocol(asyncio.Protocol):
     """Echo server using asyncio.Protocol"""
+
     def connection_made(self, transport):
         self.transport = transport
         sock = transport.get_extra_info('socket')
@@ -84,7 +94,7 @@ class EchoProtocol(asyncio.Protocol):
 def run(args):
     if args.loop == 'veloxloop':
         import veloxloop
-        
+
         loop = veloxloop.new_event_loop()
         print('using Veloxloop')
     elif args.loop == 'uvloop':
@@ -123,7 +133,9 @@ def run(args):
 
         print('using asyncio/streams')
         if unix:
-            coro = asyncio.start_unix_server(echo_client_streams, addr, limit=1024 * 1024)
+            coro = asyncio.start_unix_server(
+                echo_client_streams, addr, limit=1024 * 1024
+            )
         else:
             coro = asyncio.start_server(echo_client_streams, *addr, limit=1024 * 1024)
         loop.run_until_complete(coro)

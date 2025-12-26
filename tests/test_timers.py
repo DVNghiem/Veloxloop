@@ -1,4 +1,5 @@
 """Tests for Timers & Scheduling"""
+
 import asyncio
 import veloxloop
 import pytest
@@ -155,7 +156,7 @@ class TestTimersScheduling:
             h1 = loop.call_later(0.01, callback, 1)
             h2 = loop.call_later(0.02, callback, 2)
             h3 = loop.call_later(0.03, callback, 3)
-            
+
             h2.cancel()  # Cancel the middle one
             await asyncio.sleep(0.05)
             assert result == [1, 3]  # 2 should be skipped
@@ -164,6 +165,7 @@ class TestTimersScheduling:
 
     def test_timer_handle_when(self):
         """Test timer handle when() returns scheduled time"""
+
         async def main():
             loop = asyncio.get_running_loop()
             start = loop.time()
@@ -180,6 +182,7 @@ class TestTimersScheduling:
 
     def test_timer_handle_cancelled(self):
         """Test timer handle cancelled() reflects state"""
+
         async def main():
             loop = asyncio.get_running_loop()
 
@@ -238,7 +241,7 @@ class TestTimersScheduling:
             # Schedule 100 timers
             for i in range(100):
                 loop.call_later(0.01 * (i % 10), callback, i)
-            
+
             await asyncio.sleep(0.15)
             assert len(result) == 100
             assert set(result) == set(range(100))
@@ -299,10 +302,10 @@ class TestTimersScheduling:
             loop.call_later(0.01, timer_callback, 1)
             task = asyncio.create_task(io_task(2))
             loop.call_later(0.03, timer_callback, 3)
-            
+
             await task
             await asyncio.sleep(0.05)
-            
+
             assert len(result) == 3
             assert ('timer', 1) in result
             assert ('io', 2) in result
@@ -324,10 +327,10 @@ class TestTimersScheduling:
             start = loop.time()
             for i in range(5):
                 loop.call_later(0.01 * (i + 1), callback, i)
-            
+
             await asyncio.sleep(0.1)
             assert len(times) == 5
-            
+
             # Check they executed in order
             for i in range(5):
                 assert times[i][0] == i

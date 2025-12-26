@@ -4,7 +4,8 @@ from ._veloxloop import VeloxLoopPolicy as _VeloxLoopPolicyImpl
 from ._veloxloop import StreamReader, StreamWriter
 import threading
 
-__version__ = "0.1.0"
+__version__ = '0.1.0'
+
 
 class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
     def get_debug(self):
@@ -21,7 +22,7 @@ class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
         future.add_done_callback(lambda f: self.stop())
         self.run_forever()
         if not future.done():
-            raise RuntimeError("Event loop stopped before Future completed.")
+            raise RuntimeError('Event loop stopped before Future completed.')
         return future.result()
 
     def run_forever(self):
@@ -29,9 +30,9 @@ class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
         events = asyncio.events
         events._set_running_loop(self)
         try:
-             super().run_forever()
+            super().run_forever()
         finally:
-             events._set_running_loop(None)
+            events._set_running_loop(None)
 
     def call_soon(self, callback, *args, context=None):
         return super().call_soon(callback, *args, context=context)
@@ -60,16 +61,13 @@ class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
         # In a full implementation, this would shutdown the thread pool executor
         pass
 
-    async def create_datagram_endpoint(self, protocol_factory, 
-                                      local_addr=None, remote_addr=None,
-                                      **kwargs):
+    async def create_datagram_endpoint(
+        self, protocol_factory, local_addr=None, remote_addr=None, **kwargs
+    ):
         """Create datagram endpoint - delegates to Rust implementation"""
         # Call the Rust implementation
         return await super().create_datagram_endpoint(
-            protocol_factory, 
-            local_addr=local_addr, 
-            remote_addr=remote_addr,
-            **kwargs
+            protocol_factory, local_addr=local_addr, remote_addr=remote_addr, **kwargs
         )
 
     def _timer_handle_cancelled(self, handle):
@@ -78,6 +76,7 @@ class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
         # For VeloxTimerHandle, the cancel() method already calls _cancel_timer
         # So we don't need to do anything here
         pass
+
 
 class VeloxTimerHandle(asyncio.TimerHandle):
     def __init__(self, timer_id, when, loop, callback, args, context):
@@ -90,17 +89,18 @@ class VeloxTimerHandle(asyncio.TimerHandle):
 
     def close(self):
         pass
-        
+
     def _check_running(self):
         if self.is_running():
             raise RuntimeError('This event loop is already running')
+
 
 class VeloxLoopPolicy(_VeloxLoopPolicyImpl, asyncio.AbstractEventLoopPolicy):
     def __init__(self):
         self._local = threading.local()
 
     def get_event_loop(self):
-        loop = getattr(self._local, "loop", None)
+        loop = getattr(self._local, 'loop', None)
         if loop is None:
             # For strict asyncio compliance, get_event_loop only creates on main thread or raises RuntimeError?
             # Simplify: auto-create for now like old behavior, or follow spec?
@@ -117,12 +117,23 @@ class VeloxLoopPolicy(_VeloxLoopPolicyImpl, asyncio.AbstractEventLoopPolicy):
         # Return the Python-wrapped VeloxLoop, not the raw Rust implementation
         return VeloxLoop(debug=False)
 
+
 def install():
     asyncio.set_event_loop_policy(VeloxLoopPolicy())
+
 
 def new_event_loop():
     """Create a new VeloxLoop event loop instance."""
     return VeloxLoop(debug=False)
 
-__all__ = ['VeloxLoop', 'VeloxLoopPolicy', 'VeloxTimerHandle', 'install', 'new_event_loop', 
-           'StreamReader', 'StreamWriter', '__version__']
+
+__all__ = [
+    'VeloxLoop',
+    'VeloxLoopPolicy',
+    'VeloxTimerHandle',
+    'install',
+    'new_event_loop',
+    'StreamReader',
+    'StreamWriter',
+    '__version__',
+]

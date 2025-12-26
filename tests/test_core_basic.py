@@ -1,4 +1,5 @@
 """Simplified Tests for Core Polling & I/O Basics - Non-blocking version"""
+
 import asyncio
 import veloxloop
 import pytest
@@ -29,13 +30,14 @@ class TestCorePollingBasic:
 
     def test_loop_time_basic(self):
         """Test loop.time() returns a value"""
+
         async def main():
             loop = asyncio.get_running_loop()
             # Get initial time
             time1 = loop.time()
             assert isinstance(time1, float)
             assert time1 >= 0.0
-            
+
             # Time should be monotonic - getting it again should be >= previous
             time2 = loop.time()
             assert isinstance(time2, float)
@@ -86,7 +88,7 @@ class TestCorePollingBasic:
     def test_call_soon_threadsafe(self):
         """Test call_soon_threadsafe from another thread"""
         result = []
-        
+
         async def main():
             loop = asyncio.get_running_loop()
 
@@ -109,6 +111,7 @@ class TestCorePollingBasic:
 
     def test_create_future(self):
         """Test create_future creates proper Future object"""
+
         async def main():
             loop = asyncio.get_running_loop()
             future = loop.create_future()
@@ -123,6 +126,7 @@ class TestCorePollingBasic:
 
     def test_stop_loop(self):
         """Test callbacks execute"""
+
         async def main():
             loop = asyncio.get_running_loop()
             executed = []
@@ -141,6 +145,7 @@ class TestCorePollingBasic:
 
     def test_is_running(self):
         """Test is_running() reflects loop state"""
+
         async def main():
             loop = asyncio.get_running_loop()
             assert loop.is_running()
@@ -197,6 +202,7 @@ class TestCorePollingBasic:
 
     def test_create_task(self):
         """Test creating and awaiting tasks"""
+
         async def main():
             async def worker(value):
                 return value * 2
@@ -210,6 +216,7 @@ class TestCorePollingBasic:
 
     def test_multiple_tasks(self):
         """Test multiple concurrent tasks"""
+
         async def main():
             async def worker(n):
                 return n * n

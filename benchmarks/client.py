@@ -22,7 +22,9 @@ def wquant(values, quantiles, weights):
     values = np.array(values)
     quantiles = np.array(quantiles)
     weights = np.array(weights)
-    assert np.all(quantiles >= 0) and np.all(quantiles <= 1), 'quantiles should be in [0, 1]'
+    assert np.all(quantiles >= 0) and np.all(quantiles <= 1), (
+        'quantiles should be in [0, 1]'
+    )
 
     wqs = np.cumsum(weights) - 0.5 * weights
     wqs -= wqs[0]
@@ -101,7 +103,9 @@ def run(args):
     with futures.ProcessPoolExecutor(max_workers=wrk) as e:
         fs = []
         for _ in range(wrk):
-            fs.append(e.submit(bench, unix, addr, start, duration, timeout, req_size, msg))
+            fs.append(
+                e.submit(bench, unix, addr, start, duration, timeout, req_size, msg)
+            )
 
         res = futures.wait(fs)
         for fut in res.done:
@@ -145,8 +149,12 @@ def run(args):
     if args.output == 'json':
         print(json.dumps(data))
     else:
-        data['latency_percentiles'] = '; '.join('{}% under {}ms'.format(*v) for v in percentile_data)
-        output = _FMT_OUT.format(duration=duration, size=round(msg_size / 1024, 2), **data)
+        data['latency_percentiles'] = '; '.join(
+            '{}% under {}ms'.format(*v) for v in percentile_data
+        )
+        output = _FMT_OUT.format(
+            duration=duration, size=round(msg_size / 1024, 2), **data
+        )
         print(output)
 
 
@@ -154,9 +162,23 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--msize', default=1024, type=int, help='message size in bytes')
     parser.add_argument('--mpr', default=1, type=int, help='messages per request')
-    parser.add_argument('--duration', '-T', default=10, type=int, help='duration of test in seconds')
-    parser.add_argument('--concurrency', default=1, type=int, help='request concurrency')
-    parser.add_argument('--timeout', default=2, type=int, help='socket timeout in seconds')
-    parser.add_argument('--addr', default='127.0.0.1:25000', type=str, help='server address')
-    parser.add_argument('--output', default='text', type=str, help='output format', choices=['text', 'json'])
+    parser.add_argument(
+        '--duration', '-T', default=10, type=int, help='duration of test in seconds'
+    )
+    parser.add_argument(
+        '--concurrency', default=1, type=int, help='request concurrency'
+    )
+    parser.add_argument(
+        '--timeout', default=2, type=int, help='socket timeout in seconds'
+    )
+    parser.add_argument(
+        '--addr', default='127.0.0.1:25000', type=str, help='server address'
+    )
+    parser.add_argument(
+        '--output',
+        default='text',
+        type=str,
+        help='output format',
+        choices=['text', 'json'],
+    )
     run(parser.parse_args())

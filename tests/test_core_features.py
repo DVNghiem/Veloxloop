@@ -6,6 +6,7 @@ Tests for Core Event Loop Features:
 - Task factory API
 - Async generator shutdown
 """
+
 import pytest
 import asyncio
 import time
@@ -28,6 +29,7 @@ class TestExecutor:
 
     def test_run_in_executor_basic(self, loop):
         """Test basic run_in_executor functionality"""
+
         def blocking_func(x):
             return x * 2
 
@@ -39,6 +41,7 @@ class TestExecutor:
 
     def test_run_in_executor_multiple_args(self, loop):
         """Test run_in_executor with multiple arguments"""
+
         def blocking_func(a, b, c):
             return a + b + c
 
@@ -50,15 +53,16 @@ class TestExecutor:
 
     def test_run_in_executor_blocking_operation(self, loop):
         """Test run_in_executor with actual blocking operation"""
+
         def blocking_sleep(duration):
             time.sleep(duration)
-            return "done"
+            return 'done'
 
         async def test():
             start = time.time()
             result = await loop.run_in_executor(None, blocking_sleep, 0.1)
             elapsed = time.time() - start
-            assert result == "done"
+            assert result == 'done'
             assert elapsed >= 0.1
             assert elapsed < 0.3  # Should be reasonably quick
 
@@ -66,15 +70,13 @@ class TestExecutor:
 
     def test_run_in_executor_concurrent(self, loop):
         """Test running multiple executor tasks concurrently"""
+
         def blocking_func(x):
             time.sleep(0.05)
             return x * 2
 
         async def test():
-            tasks = [
-                loop.run_in_executor(None, blocking_func, i)
-                for i in range(5)
-            ]
+            tasks = [loop.run_in_executor(None, blocking_func, i) for i in range(5)]
             results = await asyncio.gather(*tasks)
             assert results == [0, 2, 4, 6, 8]
 
@@ -96,11 +98,12 @@ class TestExecutor:
 
     def test_run_in_executor_exception(self, loop):
         """Test that exceptions in executor are propagated"""
+
         def blocking_func():
-            raise ValueError("Test error")
+            raise ValueError('Test error')
 
         async def test():
-            with pytest.raises(ValueError, match="Test error"):
+            with pytest.raises(ValueError, match='Test error'):
                 await loop.run_in_executor(None, blocking_func)
 
         loop.run_until_complete(test())
@@ -137,6 +140,7 @@ class TestExceptionHandler:
 
     def test_set_exception_handler_none(self, loop):
         """Test clearing exception handler"""
+
         def custom_handler(loop, context):
             pass
 
@@ -187,6 +191,7 @@ class TestTaskFactory:
 
     def test_set_task_factory(self, loop):
         """Test set_task_factory"""
+
         def custom_factory(loop, coro):
             return asyncio.Task(coro, loop=loop)
 
@@ -196,6 +201,7 @@ class TestTaskFactory:
 
     def test_set_task_factory_none(self, loop):
         """Test clearing task factory"""
+
         def custom_factory(loop, coro):
             return asyncio.Task(coro, loop=loop)
 
@@ -221,6 +227,7 @@ class TestAsyncGeneratorShutdown:
 
     def test_track_async_generator(self, loop):
         """Test tracking async generators"""
+
         async def async_gen():
             yield 1
             yield 2
@@ -231,6 +238,7 @@ class TestAsyncGeneratorShutdown:
 
     def test_untrack_async_generator(self, loop):
         """Test untracking async generators"""
+
         async def async_gen():
             yield 1
             yield 2
@@ -241,6 +249,7 @@ class TestAsyncGeneratorShutdown:
 
     def test_shutdown_asyncgens_empty(self, loop):
         """Test shutdown_asyncgens with no generators"""
+
         async def test():
             await loop.shutdown_asyncgens()
 
@@ -287,6 +296,7 @@ class TestIntegration:
 
     def test_executor_with_asyncio_gather(self, loop):
         """Test executor with asyncio.gather"""
+
         def cpu_bound(x):
             return sum(range(x))
 

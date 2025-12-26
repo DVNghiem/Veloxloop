@@ -1,4 +1,5 @@
 """Tests for Core Polling & I/O Basics"""
+
 import asyncio
 import veloxloop
 import pytest
@@ -28,6 +29,7 @@ class TestCorePolling:
 
     def test_loop_time(self):
         """Test loop.time() returns monotonic time"""
+
         async def check_time():
             loop = asyncio.get_running_loop()
             t1 = loop.time()
@@ -107,6 +109,7 @@ class TestCorePolling:
 
     def test_create_future(self):
         """Test create_future creates proper Future object"""
+
         async def main():
             loop = asyncio.get_running_loop()
             future = loop.create_future()
@@ -121,12 +124,13 @@ class TestCorePolling:
 
     def test_run_until_complete(self):
         """Test run_until_complete executes coroutine"""
+
         # Use asyncio.run which is safer than manual run_until_complete
         async def main():
             async def coro():
                 await asyncio.sleep(0.01)
                 return 'done'
-            
+
             result = await coro()
             assert result == 'done'
 
@@ -134,6 +138,7 @@ class TestCorePolling:
 
     def test_stop_loop(self):
         """Test stop() stops the loop"""
+
         async def main():
             loop = asyncio.get_running_loop()
             stopped = []
@@ -149,6 +154,7 @@ class TestCorePolling:
 
     def test_is_running(self):
         """Test is_running() reflects loop state"""
+
         async def main():
             loop = asyncio.get_running_loop()
             assert loop.is_running()
@@ -200,6 +206,7 @@ class TestCorePolling:
 
     def test_sleep_basic(self):
         """Test basic asyncio.sleep functionality"""
+
         async def main():
             start = time.time()
             await asyncio.sleep(0.1)
@@ -212,6 +219,7 @@ class TestCorePolling:
 
     def test_multiple_sleeps(self):
         """Test multiple concurrent sleeps"""
+
         async def main():
             results = []
 
@@ -221,9 +229,7 @@ class TestCorePolling:
 
             start = time.time()
             await asyncio.gather(
-                sleeper(0.05, 'a'),
-                sleeper(0.05, 'b'),
-                sleeper(0.05, 'c')
+                sleeper(0.05, 'a'), sleeper(0.05, 'b'), sleeper(0.05, 'c')
             )
             end = time.time()
             elapsed = end - start
@@ -237,6 +243,7 @@ class TestCorePolling:
 
     def test_create_task(self):
         """Test creating and awaiting tasks"""
+
         async def main():
             async def worker(value):
                 await asyncio.sleep(0.01)
@@ -251,6 +258,7 @@ class TestCorePolling:
 
     def test_multiple_tasks(self):
         """Test multiple concurrent tasks"""
+
         async def main():
             async def worker(n):
                 await asyncio.sleep(0.01)
