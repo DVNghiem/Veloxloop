@@ -1,5 +1,12 @@
 use pyo3::prelude::*;
 
+#[cfg(not(any(target_env = "musl", target_os = "freebsd", target_os = "openbsd", target_os = "windows")))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(any(target_env = "musl", target_os = "freebsd", target_os = "openbsd", target_os = "windows")))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 mod buffer_pool;
 mod callbacks;
 mod concurrent;
