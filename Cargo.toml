@@ -47,7 +47,7 @@ slab = "0.4"
 io-uring = { version = "0.7" } 
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["winsock2", "ws2def"] }
+winapi = { version = "0.3", features = ["winsock2", "ws2def", "ws2tcpip"] }
 
 [target.'cfg(not(any(target_env = "musl", target_os = "freebsd", target_os = "openbsd", target_os = "windows")))'.dependencies]
 tikv-jemallocator = { version = "0.6.1", default-features = false, features = ["disable_initial_exec_tls"] }
