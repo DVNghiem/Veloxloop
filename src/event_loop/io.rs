@@ -191,11 +191,6 @@ impl VeloxLoop {
     }
 }
 
-// ==================== Completion-Based I/O Operations (io-uring) ====================
-// These methods provide true async I/O via io-uring's completion model
-// for maximum performance. They directly submit operations to the kernel
-// and receive completion notifications, bypassing traditional poll-based I/O.
-
 #[cfg(target_os = "linux")]
 impl VeloxLoop {
     /// Submit an async read operation via io-uring for true zero-copy I/O

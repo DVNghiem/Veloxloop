@@ -4,6 +4,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use crate::concurrent::ConcurrentCallbackQueue;
+use crate::constants::STACK_BUF_SIZE;
 use crate::event_loop::VeloxLoop;
 
 use crate::transports::future::PendingFuture;
@@ -20,7 +21,6 @@ pub struct Callback {
 
 /// High-performance lock-free callback queue using crossbeam channels.
 ///
-/// This replaces the previous Vec-based CallbackQueue with a concurrent
 /// MPMC queue for better scalability in multi-threaded scenarios.
 /// Uses crossbeam-channel internally for efficient lock-free operations.
 pub struct CallbackQueue {
@@ -389,7 +389,6 @@ impl SockRecvCallback {
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
         // Use stack buffer for small reads (most common case in benchmarks)
         // For larger reads, fall back to heap allocation
-        const STACK_BUF_SIZE: usize = 65536; // 64KB stack buffer
 
         if self.nbytes <= STACK_BUF_SIZE {
             let mut buf = [0u8; STACK_BUF_SIZE];
