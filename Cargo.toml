@@ -20,7 +20,7 @@ parking_lot = "0.12"
 socket2 = "0.6.1"
 tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 libc = "0.2"
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 rustls-pemfile = "2.0"
 webpki-roots = "1.0.4"
 rustls-native-certs = "0.8"
@@ -44,7 +44,10 @@ slab = "0.4"
 
 # io-uring for Linux (replaces polling crate for best performance)
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7"
+io-uring = { version = "0.7" } 
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winsock2", "ws2def"] }
 
 [target.'cfg(not(any(target_env = "musl", target_os = "freebsd", target_os = "openbsd", target_os = "windows")))'.dependencies]
 tikv-jemallocator = { version = "0.6.1", default-features = false, features = ["disable_initial_exec_tls"] }
