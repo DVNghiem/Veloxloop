@@ -113,23 +113,11 @@ struct PendingPoll {
     writable: bool,
 }
 
-// ============================================================================
-// Linux: io-uring based poller (REQUIRED - no epoll fallback)
-// ============================================================================
-
 #[cfg(target_os = "linux")]
 const SQ_SIZE: u32 = 256;
 #[cfg(target_os = "linux")]
 const CQ_SIZE: u32 = 512;
 
-/// High-performance poller using io-uring
-/// 
-/// This implementation uses io-uring's poll_add operation for readiness
-/// notifications, which is more efficient than traditional epoll:
-/// - Batched submissions reduce syscalls
-/// - Completion-based model integrates with other io-uring operations
-/// - Can transition to true async IO operations later
-#[cfg(target_os = "linux")]
 pub struct LoopPoller {
     /// The io-uring instance
     ring: IoUring,
@@ -428,10 +416,6 @@ impl LoopPoller {
 
         Ok(events)
     }
-    // ==================== Completion-Based I/O Operations ====================
-    // These methods provide true async I/O via io-uring's completion model
-    // for maximum performance (zero-copy, kernel-side operations)
-
     /// Submit an async read operation via io-uring
     /// Returns a token to track completion
     #[inline]

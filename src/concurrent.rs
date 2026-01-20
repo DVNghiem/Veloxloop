@@ -1,14 +1,7 @@
-//! Lock-free concurrent data structures for high-performance event loop operations.
-//!
-//! This module provides thread-safe, lock-free alternatives to standard data structures
-//! using the `dashmap` and `crossbeam` crates for improved scalability.
-
 use dashmap::DashMap;
 use crossbeam_channel::{unbounded, Sender, Receiver, TrySendError};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-/// A lock-free MPMC (Multi-Producer Multi-Consumer) queue for callbacks
-/// 
 /// Uses crossbeam channels for high-performance concurrent callback scheduling.
 pub struct ConcurrentCallbackQueue<T> {
     sender: Sender<T>,

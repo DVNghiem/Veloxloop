@@ -3,8 +3,9 @@ use pyo3::types::{PyBytes, PyInt, PyString, PyTuple};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use crate::event_loop::VeloxLoop;
 use crate::concurrent::ConcurrentCallbackQueue;
+use crate::constants::STACK_BUF_SIZE;
+use crate::event_loop::VeloxLoop;
 
 use crate::transports::future::PendingFuture;
 use crate::transports::ssl::SSLContext;
@@ -19,13 +20,12 @@ pub struct Callback {
 }
 
 /// High-performance lock-free callback queue using crossbeam channels.
-/// 
-/// This replaces the previous Vec-based CallbackQueue with a concurrent
+///
 /// MPMC queue for better scalability in multi-threaded scenarios.
 /// Uses crossbeam-channel internally for efficient lock-free operations.
 pub struct CallbackQueue {
     /// Lock-free concurrent queue using crossbeam channels
-   pub inner: ConcurrentCallbackQueue<Callback>,
+    pub inner: ConcurrentCallbackQueue<Callback>,
 }
 
 impl CallbackQueue {
@@ -303,7 +303,24 @@ impl SockAcceptCallback {
                 // Parse address
                 let addr_tuple = if addr_len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
                     let addr_in = &*((&addr) as *const _ as *const libc::sockaddr_in);
-                    if addr_in.sin_family == libc::AF_INET as u16 {
+                    #[cfg(any(
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "freebsd",
+                        target_os = "openbsd",
+                        target_os = "netbsd"
+                    ))]
+                    let is_ipv4 = addr_in.sin_family == libc::AF_INET as u8;
+                    #[cfg(not(any(
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "freebsd",
+                        target_os = "openbsd",
+                        target_os = "netbsd"
+                    )))]
+                    let is_ipv4 = addr_in.sin_family == libc::AF_INET as u16;
+
+                    if is_ipv4 {
                         let ip = u32::from_be(addr_in.sin_addr.s_addr);
                         let port = u16::from_be(addr_in.sin_port);
                         let ip_str = format!(
@@ -372,7 +389,6 @@ impl SockRecvCallback {
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
         // Use stack buffer for small reads (most common case in benchmarks)
         // For larger reads, fall back to heap allocation
-        const STACK_BUF_SIZE: usize = 65536; // 64KB stack buffer
 
         if self.nbytes <= STACK_BUF_SIZE {
             let mut buf = [0u8; STACK_BUF_SIZE];
@@ -578,7 +594,46 @@ impl SendfileCallback {
                 };
 
                 let remaining = self.count - self.sent;
+
+                #[cfg(target_os = "linux")]
                 let n = libc::sendfile(self.out_fd, self.in_fd, off_ptr, remaining);
+
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+                let n = {
+                    let mut len = remaining as libc::off_t;
+                    let result = libc::sendfile(
+                        self.in_fd,
+                        self.out_fd,
+                        *off_ptr.cast::<libc::off_t>(),
+                        &mut len,
+                        std::ptr::null_mut(),
+                        0,
+                    );
+                    if result == 0 { len as isize } else { -1 }
+                };
+
+                #[cfg(not(any(
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "freebsd"
+                )))]
+                let n = {
+                    // Fallback for platforms without sendfile
+                    let mut buf = [0u8; 8192];
+                    let to_read = remaining.min(8192);
+                    let read_result =
+                        libc::read(self.in_fd, buf.as_mut_ptr() as *mut libc::c_void, to_read);
+                    if read_result > 0 {
+                        libc::write(
+                            self.out_fd,
+                            buf.as_ptr() as *const libc::c_void,
+                            read_result as usize,
+                        )
+                    } else {
+                        read_result
+                    }
+                };
 
                 if n > 0 {
                     self.sent += n as usize;

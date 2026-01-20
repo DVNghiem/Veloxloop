@@ -94,7 +94,7 @@ impl VeloxLoop {
         if events.len() == 1 {
             let event = &events[0];
             let fd = event.fd;
-            
+
             // Handle error events - unregister the FD if there's an error
             #[cfg(target_os = "linux")]
             if event.error {
@@ -109,13 +109,18 @@ impl VeloxLoop {
             // Clone callbacks to avoid borrow issues
             let callbacks: Vec<(RawFd, Option<Handle>, Option<Handle>)> = {
                 let handles = self.handles.borrow();
-                events.iter().map(|ev| {
-                    (ev.fd, handles.get_reader(ev.fd), handles.get_writer(ev.fd))
-                }).collect()
+                events
+                    .iter()
+                    .map(|ev| (ev.fd, handles.get_reader(ev.fd), handles.get_writer(ev.fd)))
+                    .collect()
             };
             for (_, r_cb, w_cb) in callbacks {
-                if let Some(cb) = r_cb { cb.execute(py)?; }
-                if let Some(cb) = w_cb { cb.execute(py)?; }
+                if let Some(cb) = r_cb {
+                    cb.execute(py)?;
+                }
+                if let Some(cb) = w_cb {
+                    cb.execute(py)?;
+                }
             }
             // Re-arm the FD for io-uring (poll_add is oneshot)
             // CRITICAL: Re-check handles state AFTER callback execution since callbacks
@@ -124,16 +129,25 @@ impl VeloxLoop {
                 let handles = self.handles.borrow();
                 handles.get_states(fd)
             };
-            
+
             if still_has_reader || still_has_writer {
                 let ev = PollerEvent::new(fd as usize, still_has_reader, still_has_writer);
                 let mut poller = self.poller.borrow_mut();
-                
+
                 // Check FD state: is it already registered or not
-                if self.oneshot_disabled.borrow().contains(&fd) {
-                    poller.rearm_oneshot(fd, ev)?;
-                } else {
-                    // FD is new or has been removed → needs to be registered again
+                #[cfg(target_os = "linux")]
+                {
+                    if self.oneshot_disabled.borrow().contains(&fd) {
+                        poller.rearm_oneshot(fd, ev)?;
+                    } else {
+                        // FD is new or has been removed → needs to be registered again
+                        poller.register_oneshot(fd, ev)?;
+                    }
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // On non-Linux platforms, always register as oneshot
                     poller.register_oneshot(fd, ev)?;
                 }
             }
@@ -182,13 +196,17 @@ impl VeloxLoop {
         for (fd, r_h, w_h, _has_r, _has_w) in pending.iter() {
             if let Some(h) = r_h {
                 match &h.callback {
-                    IoCallback::Native(cb) => { let _ = cb(py); } // Native first, no GIL hold
+                    IoCallback::Native(cb) => {
+                        let _ = cb(py);
+                    } // Native first, no GIL hold
                     _ => python_callbacks.push(h.clone()), // Batch Python
                 }
             }
             if let Some(h) = w_h {
                 match &h.callback {
-                    IoCallback::Native(cb) => { let _ = cb(py); }
+                    IoCallback::Native(cb) => {
+                        let _ = cb(py);
+                    }
                     _ => python_callbacks.push(h.clone()),
                 }
             }
@@ -200,7 +218,7 @@ impl VeloxLoop {
                 let handles = self.handles.borrow();
                 handles.get_states(*fd)
             };
-            
+
             if still_has_reader || still_has_writer {
                 let ev = PollerEvent::new(*fd as usize, still_has_reader, still_has_writer);
                 let _ = self.poller.borrow_mut().rearm_oneshot(*fd, ev);

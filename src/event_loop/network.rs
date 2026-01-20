@@ -1,5 +1,6 @@
 use crate::callbacks::{
-    RemoveWriterCallback, SendfileCallback, SockAcceptCallback, SockConnectCallback, AsyncConnectCallback
+    AsyncConnectCallback, RemoveWriterCallback, SendfileCallback, SockAcceptCallback,
+    SockConnectCallback,
 };
 use crate::constants::STACK_BUF_SIZE;
 use crate::event_loop::VeloxLoop;
@@ -8,11 +9,11 @@ use crate::transports::tcp::TcpServer;
 use crate::transports::udp::UdpTransport;
 use crate::transports::{DefaultTransportFactory, TransportFactory};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyTuple, PyInt, PyString};
-use socket2::{Domain, Socket, Type, SockAddr, Protocol};
+use pyo3::types::{PyBytes, PyDict, PyInt, PyString, PyTuple};
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
-use std::net::SocketAddr;
 
 use pyo3::IntoPyObjectExt;
 
@@ -22,7 +23,6 @@ impl VeloxLoop {
         sock: Py<PyAny>,
         address: Bound<'_, PyAny>,
     ) -> PyResult<Py<PyAny>> {
-
         let py = slf.py();
         let self_ = slf.borrow();
 
@@ -103,7 +103,6 @@ impl VeloxLoop {
             );
 
             if client_fd >= 0 {
-
                 let socket_module = py.import("socket")?;
                 let client_sock = socket_module.call_method1("fromfd", (client_fd, 2, 1))?;
 
@@ -114,7 +113,24 @@ impl VeloxLoop {
 
                 let addr_tuple = if addr_len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
                     let addr_in = &*((&addr) as *const _ as *const libc::sockaddr_in);
-                    if addr_in.sin_family == libc::AF_INET as u16 {
+                    #[cfg(any(
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "freebsd",
+                        target_os = "openbsd",
+                        target_os = "netbsd"
+                    ))]
+                    let is_ipv4 = addr_in.sin_family == libc::AF_INET as u8;
+                    #[cfg(not(any(
+                        target_os = "macos",
+                        target_os = "ios",
+                        target_os = "freebsd",
+                        target_os = "openbsd",
+                        target_os = "netbsd"
+                    )))]
+                    let is_ipv4 = addr_in.sin_family == libc::AF_INET as u16;
+
+                    if is_ipv4 {
                         let ip = u32::from_be(addr_in.sin_addr.s_addr);
                         let ip_str = format!(
                             "{}.{}.{}.{}",
@@ -375,7 +391,38 @@ impl VeloxLoop {
         let mut current_sent = 0;
         unsafe {
             let mut off = offset as libc::off_t;
+
+            #[cfg(target_os = "linux")]
             let n = libc::sendfile(out_fd, in_fd, &mut off, total_count);
+
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+            let n = {
+                let mut len = total_count as libc::off_t;
+                let result = libc::sendfile(in_fd, out_fd, off, &mut len, std::ptr::null_mut(), 0);
+                if result == 0 { len as isize } else { -1 }
+            };
+
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd"
+            )))]
+            let n = {
+                // Fallback for platforms without sendfile (e.g., Windows)
+                let mut buf = [0u8; 8192];
+                let to_read = total_count.min(8192);
+                let read_result = libc::read(in_fd, buf.as_mut_ptr() as *mut libc::c_void, to_read);
+                if read_result > 0 {
+                    libc::write(
+                        out_fd,
+                        buf.as_ptr() as *const libc::c_void,
+                        read_result as usize,
+                    )
+                } else {
+                    read_result
+                }
+            };
             if n > 0 {
                 current_sent = n as usize;
                 if current_sent >= total_count {
@@ -537,22 +584,22 @@ impl VeloxLoop {
         let (stream, fd) = if let Some(sock) = sock_obj {
             // Use the provided socket
             let fd = sock.call_method0("fileno")?.extract::<RawFd>()?;
-            
+
             // Duplicate the file descriptor so we don't steal it from Python
             use std::os::unix::io::FromRawFd;
             let dup_fd = unsafe { libc::dup(fd) };
             if dup_fd < 0 {
                 return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                    "Failed to duplicate file descriptor"
+                    "Failed to duplicate file descriptor",
                 ));
             }
             let stream = unsafe { std::net::TcpStream::from_raw_fd(dup_fd) };
-            
+
             // Set nonblocking mode
             stream
                 .set_nonblocking(true)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyOSError, _>(e.to_string()))?;
-            
+
             (stream, dup_fd)
         } else {
             // Create a new socket as before
@@ -591,7 +638,7 @@ impl VeloxLoop {
 
             let stream: std::net::TcpStream = socket.into();
             let fd = stream.as_raw_fd();
-            
+
             (stream, fd)
         };
 

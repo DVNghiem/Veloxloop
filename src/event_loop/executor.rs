@@ -3,8 +3,8 @@ use crate::event_loop::VeloxLoop;
 use crate::executor::ThreadPoolExecutor;
 use std::ffi::{CStr, CString};
 use std::mem;
-use std::ptr;
 use std::net::{IpAddr, SocketAddr};
+use std::ptr;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyInt, PyList, PyString, PyTuple};
@@ -48,7 +48,7 @@ impl VeloxLoop {
 
         Ok(future.into_any())
     }
-    
+
     /// Run a blocking function synchronously in the executor and wait for result
     /// This uses TaskHandle::join() to wait for completion
     pub fn run_in_executor_sync<F, R>(&self, func: F) -> PyResult<Option<R>>
@@ -61,10 +61,10 @@ impl VeloxLoop {
         }
         let executor_bind = self.executor.borrow();
         let executor_ref = executor_bind.as_ref().unwrap();
-        
+
         // Use spawn_blocking which returns TaskHandle
         let handle = executor_ref.spawn_blocking(func);
-        
+
         // Use TaskHandle::join() to wait for result
         Ok(handle.join())
     }
@@ -183,6 +183,7 @@ impl VeloxLoop {
     }
 }
 
+#[cfg(unix)]
 fn perform_getaddrinfo(
     py: Python<'_>,
     host: Option<String>,
@@ -329,8 +330,63 @@ fn perform_getaddrinfo(
     }
 }
 
-fn perform_getnameinfo(py: Python<'_>, addr: &str, port: u16, flags: i32) -> PyResult<Py<PyAny>> {
+#[cfg(windows)]
+fn perform_getaddrinfo(
+    py: Python<'_>,
+    host: Option<String>,
+    port: Option<String>,
+    _family: i32,
+    _socktype: i32,
+    _protocol: i32,
+    _flags: i32,
+) -> PyResult<Py<PyAny>> {
+    // Use std::net for cross-platform DNS resolution
+    let host_str = host.as_deref().unwrap_or("localhost");
+    let port_str = port.as_deref().unwrap_or("0");
+    let addr_str = format!("{}:{}", host_str, port_str);
 
+    use std::net::ToSocketAddrs;
+    let addrs: Vec<_> = addr_str
+        .to_socket_addrs()
+        .map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyOSError, _>(format!("getaddrinfo failed: {}", e))
+        })?
+        .collect();
+
+    let py_list = PyList::empty(py);
+    for addr in addrs {
+        let (ip_str, port) = match addr {
+            SocketAddr::V4(v4) => (v4.ip().to_string(), v4.port()),
+            SocketAddr::V6(v6) => (v6.ip().to_string(), v6.port()),
+        };
+
+        let family = if addr.is_ipv4() { 2 } else { 23 }; // AF_INET=2, AF_INET6=23
+        let fam_py = PyInt::new(py, family);
+        let stype_py = PyInt::new(py, 1); // SOCK_STREAM
+        let proto_py = PyInt::new(py, 6); // IPPROTO_TCP
+        let canon_py = PyString::new(py, "");
+        let ip_py = PyString::new(py, &ip_str);
+        let port_py = PyInt::new(py, port);
+        let addr_tuple = PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?;
+
+        let tuple = PyTuple::new(
+            py,
+            vec![
+                fam_py.as_any(),
+                stype_py.as_any(),
+                proto_py.as_any(),
+                canon_py.as_any(),
+                addr_tuple.as_any(),
+            ],
+        )?;
+        py_list.append(tuple)?;
+    }
+
+    Ok(py_list.into())
+}
+
+#[cfg(unix)]
+fn perform_getnameinfo(py: Python<'_>, addr: &str, port: u16, flags: i32) -> PyResult<Py<PyAny>> {
     let ip_addr: IpAddr = addr.parse().map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyValueError, _>(format!("Invalid IP address: {}", e))
     })?;
@@ -402,4 +458,14 @@ fn perform_getnameinfo(py: Python<'_>, addr: &str, port: u16, flags: i32) -> PyR
 
         Ok(result_tuple.into())
     }
+}
+
+#[cfg(windows)]
+fn perform_getnameinfo(py: Python<'_>, addr: &str, port: u16, _flags: i32) -> PyResult<Py<PyAny>> {
+    // Simple implementation using std::net for Windows
+    // In a production system, you might want to use Windows-specific APIs
+    let host_py = PyString::new(py, addr);
+    let serv_py = PyString::new(py, &port.to_string());
+    let result_tuple = PyTuple::new(py, vec![host_py.as_any(), serv_py.as_any()])?;
+    Ok(result_tuple.into())
 }
