@@ -123,7 +123,6 @@ impl VeloxLoop {
                 }
             }
             // Re-arm the FD for io-uring (poll_add is oneshot)
-            // CRITICAL: Re-check handles state AFTER callback execution since callbacks
             // may have removed themselves (e.g., oneshot sock_recv callbacks)
             let (still_has_reader, still_has_writer) = {
                 let handles = self.handles.borrow();
@@ -143,12 +142,6 @@ impl VeloxLoop {
                         // FD is new or has been removed → needs to be registered again
                         poller.register_oneshot(fd, ev)?;
                     }
-                }
-
-                #[cfg(not(target_os = "linux"))]
-                {
-                    // On non-Linux platforms, always register as oneshot
-                    poller.register_oneshot(fd, ev)?;
                 }
             }
 

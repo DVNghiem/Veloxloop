@@ -2,7 +2,7 @@
 //! 
 //! This module provides the core event loop polling mechanism.
 //! On Linux: Uses io-uring for completion-based async IO (REQUIRED)
-//! Non-Linux: Stub for future Tokio integration
+//! Non-Linux: Stub for future Tokio integration (not implemented yet)
 //!
 //! Performance features:
 //! - io-uring for zero-copy, batched I/O operations
@@ -24,29 +24,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use io_uring::{opcode, types, IoUring, Probe};
 
 #[cfg(target_os = "linux")]
-#[cfg(target_os = "linux")]
-use rustc_hash::FxHashMap;
-
-#[cfg(not(target_os = "linux"))]
 use rustc_hash::FxHashMap;
 
 use std::time::Duration;
-
-/// Cached event state - used for non-Linux backends
-#[cfg(not(target_os = "linux"))]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct FdInterest {
-    pub readable: bool,
-    pub writable: bool,
-}
-
-#[cfg(not(target_os = "linux"))]
-impl FdInterest {
-    #[inline]
-    pub fn new(readable: bool, writable: bool) -> Self {
-        Self { readable, writable }
-    }
-}
 
 /// Event type that works across platforms
 #[derive(Clone, Copy)]
@@ -89,13 +69,6 @@ pub struct PlatformEvent {
     pub readable: bool,
     pub writable: bool,
     pub error: bool,
-}
-#[cfg(not(target_os = "linux"))]
-#[derive(Clone, Copy)]
-pub struct PlatformEvent {
-    pub fd: RawFd,
-    pub readable: bool,
-    pub writable: bool,
 }
 
 /// io-uring operation token for tracking pending operations
@@ -727,84 +700,5 @@ impl Drop for LoopPoller {
         unsafe {
             libc::close(self.eventfd);
         }
-    }
-}
-
-// ============================================================================
-// Non-Linux: Stub implementation (future Tokio integration)
-// ============================================================================
-
-#[cfg(not(target_os = "linux"))]
-pub struct LoopPoller {
-    fd_interests: FxHashMap<RawFd, FdInterest>,
-}
-
-#[cfg(not(target_os = "linux"))]
-impl LoopPoller {
-    pub fn new() -> crate::utils::VeloxResult<Self> {
-        Ok(Self {
-            fd_interests: FxHashMap::with_capacity_and_hasher(256, Default::default()),
-        })
-    }
-
-    #[inline]
-    pub fn register(
-        &mut self,
-        fd: RawFd,
-        interest: PollerEvent,
-    ) -> crate::utils::VeloxResult<()> {
-        let fd_interest = FdInterest::new(interest.readable, interest.writable);
-        self.fd_interests.insert(fd, fd_interest);
-        Ok(())
-    }
-
-    #[inline]
-    pub fn register_oneshot(
-        &mut self,
-        fd: RawFd,
-        interest: PollerEvent,
-    ) -> crate::utils::VeloxResult<()> {
-        self.register(fd, interest)
-    }
-
-    #[inline]
-    pub fn rearm_oneshot(
-        &mut self,
-        fd: RawFd,
-        interest: PollerEvent,
-    ) -> crate::utils::VeloxResult<()> {
-        self.modify(fd, interest)
-    }
-
-    #[inline]
-    pub fn modify(&mut self, fd: RawFd, interest: PollerEvent) -> crate::utils::VeloxResult<()> {
-        let new_interest = FdInterest::new(interest.readable, interest.writable);
-        self.fd_interests.insert(fd, new_interest);
-        Ok(())
-    }
-
-    #[inline]
-    pub fn delete(&mut self, fd: RawFd) -> crate::utils::VeloxResult<()> {
-        self.fd_interests.remove(&fd);
-        Ok(())
-    }
-
-    #[inline]
-    pub fn notify(&self) -> crate::utils::VeloxResult<()> {
-        Ok(())
-    }
-
-    #[inline]
-    pub fn poll_native(
-        &mut self,
-        _timeout: Option<std::time::Duration>,
-    ) -> crate::utils::VeloxResult<Vec<PlatformEvent>> {
-        // TODO: Implement via Tokio for non-Linux platforms
-        Ok(Vec::new())
-    }
-
-    #[inline]
-    pub fn is_registered(&self, fd: RawFd) -> bool {
-        self.fd_interests.contains_key(&fd)
     }
 }

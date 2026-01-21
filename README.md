@@ -2,7 +2,7 @@
 
 [![PyPI version](https://badge.fury.io/py/veloxloop.svg)](https://badge.fury.io/py/veloxloop) <!-- Update when published -->
 [![Python versions](https://img.shields.io/pypi/pyversions/veloxloop.svg)](https://pypi.org/project/veloxloop/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License](https://img.shields.io/badge/license-BSD-blue.svg)](https://opensource.org/license/bsd-3-clause)
 
 **VeloxLoop** — A modern, high-performance asyncio event loop implementation written from scratch in **Rust** using **PyO3**, **tokio** and **io-uring** crate.
 

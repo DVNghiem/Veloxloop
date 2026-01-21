@@ -13,12 +13,12 @@ name = "_veloxloop"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.27.2", features = ["extension-module", "generate-import-lib", "experimental-async"] }
+pyo3 = { version = "0.27.2", features = [] }
 mimalloc = { version = "0.1.48", optional = true }
 thiserror = "2.0.17"
 parking_lot = "0.12"
 socket2 = "0.6.1"
-tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1.49.0", features = ["rt", "rt-multi-thread"] }
 libc = "0.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 rustls-pemfile = "2.0"

@@ -141,73 +141,6 @@ impl InnerSocketOptions {
                 }
             }
         }
-
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            if let Some(keep_idle) = self.keepalive_time {
-                unsafe {
-                    let optval = keep_idle as libc::c_int;
-                    let ret = setsockopt(
-                        fd,
-                        IPPROTO_TCP,
-                        libc::TCP_KEEPALIVE,
-                        &optval as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&optval) as libc::socklen_t,
-                    );
-                    if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
-                            "Failed to set TCP_KEEPALIVE: {}",
-                            std::io::Error::last_os_error()
-                        )));
-                    }
-                }
-            }
-
-            if let Some(keep_intvl) = self.keepalive_interval {
-                unsafe {
-                    let optval = keep_intvl as libc::c_int;
-                    let ret = setsockopt(
-                        fd,
-                        IPPROTO_TCP,
-                        libc::TCP_KEEPINTVL,
-                        &optval as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&optval) as libc::socklen_t,
-                    );
-                    if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
-                            "Failed to set TCP_KEEPINTVL: {}",
-                            std::io::Error::last_os_error()
-                        )));
-                    }
-                }
-            }
-
-            if let Some(keep_cnt) = self.keepalive_count {
-                unsafe {
-                    let optval = keep_cnt as libc::c_int;
-                    let ret = setsockopt(
-                        fd,
-                        IPPROTO_TCP,
-                        libc::TCP_KEEPCNT,
-                        &optval as *const _ as *const libc::c_void,
-                        std::mem::size_of_val(&optval) as libc::socklen_t,
-                    );
-                    if ret != 0 {
-                        return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
-                            "Failed to set TCP_KEEPCNT: {}",
-                            std::io::Error::last_os_error()
-                        )));
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    #[cfg(not(unix))]
-    fn apply_keepalive(&self, _socket: &Socket) -> PyResult<()> {
-        // Keepalive is Unix-specific for now
         Ok(())
     }
 
@@ -235,12 +168,6 @@ impl InnerSocketOptions {
                 }
             }
         }
-        Ok(())
-    }
-
-    #[cfg(not(all(unix, not(target_os = "solaris"))))]
-    fn apply_reuseport(&self, _socket: &Socket) -> PyResult<()> {
-        // SO_REUSEPORT is not available on this platform
         Ok(())
     }
 
@@ -306,66 +233,6 @@ impl InnerSocketOptions {
                         if ret != 0 {
                             return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
                                 "Failed to set TCP_KEEPIDLE: {}",
-                                std::io::Error::last_os_error()
-                            )));
-                        }
-                    }
-                }
-
-                if let Some(keep_intvl) = self.keepalive_interval {
-                    unsafe {
-                        let optval = keep_intvl as libc::c_int;
-                        let ret = setsockopt(
-                            fd,
-                            IPPROTO_TCP,
-                            libc::TCP_KEEPINTVL,
-                            &optval as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&optval) as libc::socklen_t,
-                        );
-                        if ret != 0 {
-                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
-                                "Failed to set TCP_KEEPINTVL: {}",
-                                std::io::Error::last_os_error()
-                            )));
-                        }
-                    }
-                }
-
-                if let Some(keep_cnt) = self.keepalive_count {
-                    unsafe {
-                        let optval = keep_cnt as libc::c_int;
-                        let ret = setsockopt(
-                            fd,
-                            IPPROTO_TCP,
-                            libc::TCP_KEEPCNT,
-                            &optval as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&optval) as libc::socklen_t,
-                        );
-                        if ret != 0 {
-                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
-                                "Failed to set TCP_KEEPCNT: {}",
-                                std::io::Error::last_os_error()
-                            )));
-                        }
-                    }
-                }
-            }
-
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
-            {
-                if let Some(keep_idle) = self.keepalive_time {
-                    unsafe {
-                        let optval = keep_idle as libc::c_int;
-                        let ret = setsockopt(
-                            fd,
-                            IPPROTO_TCP,
-                            libc::TCP_KEEPALIVE,
-                            &optval as *const _ as *const libc::c_void,
-                            std::mem::size_of_val(&optval) as libc::socklen_t,
-                        );
-                        if ret != 0 {
-                            return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(format!(
-                                "Failed to set TCP_KEEPALIVE: {}",
                                 std::io::Error::last_os_error()
                             )));
                         }

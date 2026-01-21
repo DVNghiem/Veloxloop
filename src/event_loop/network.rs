@@ -113,21 +113,6 @@ impl VeloxLoop {
 
                 let addr_tuple = if addr_len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
                     let addr_in = &*((&addr) as *const _ as *const libc::sockaddr_in);
-                    #[cfg(any(
-                        target_os = "macos",
-                        target_os = "ios",
-                        target_os = "freebsd",
-                        target_os = "openbsd",
-                        target_os = "netbsd"
-                    ))]
-                    let is_ipv4 = addr_in.sin_family == libc::AF_INET as u8;
-                    #[cfg(not(any(
-                        target_os = "macos",
-                        target_os = "ios",
-                        target_os = "freebsd",
-                        target_os = "openbsd",
-                        target_os = "netbsd"
-                    )))]
                     let is_ipv4 = addr_in.sin_family == libc::AF_INET as u16;
 
                     if is_ipv4 {
@@ -391,38 +376,7 @@ impl VeloxLoop {
         let mut current_sent = 0;
         unsafe {
             let mut off = offset as libc::off_t;
-
-            #[cfg(target_os = "linux")]
             let n = libc::sendfile(out_fd, in_fd, &mut off, total_count);
-
-            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
-            let n = {
-                let mut len = total_count as libc::off_t;
-                let result = libc::sendfile(in_fd, out_fd, off, &mut len, std::ptr::null_mut(), 0);
-                if result == 0 { len as isize } else { -1 }
-            };
-
-            #[cfg(not(any(
-                target_os = "linux",
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "freebsd"
-            )))]
-            let n = {
-                // Fallback for platforms without sendfile (e.g., Windows)
-                let mut buf = [0u8; 8192];
-                let to_read = total_count.min(8192);
-                let read_result = libc::read(in_fd, buf.as_mut_ptr() as *mut libc::c_void, to_read);
-                if read_result > 0 {
-                    libc::write(
-                        out_fd,
-                        buf.as_ptr() as *const libc::c_void,
-                        read_result as usize,
-                    )
-                } else {
-                    read_result
-                }
-            };
             if n > 0 {
                 current_sent = n as usize;
                 if current_sent >= total_count {
