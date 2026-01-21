@@ -4,7 +4,7 @@ from ._veloxloop import VeloxLoopPolicy as _VeloxLoopPolicyImpl
 from ._veloxloop import StreamReader, StreamWriter
 import threading
 
-__version__ = '0.1.1'
+__version__ = '0.2.0'
 
 
 class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):

@@ -1,6 +1,6 @@
 [package]
 name = "veloxloop"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "A modern, high-performance asyncio event loop implementation written from scratch in Rust"
 authors = ["Dang Van Nghiem <martin@smartsolution.id.vn>"]
