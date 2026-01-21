@@ -3,7 +3,7 @@ use crate::handles::{Handle, IoCallback};
 use crate::poller::{PlatformEvent, PollerEvent};
 use crate::utils::VeloxResult;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
+use pyo3::types::{PyDict, PyTuple};
 use std::os::fd::RawFd;
 use std::time::Duration;
 
@@ -24,7 +24,7 @@ impl VeloxLoop {
         py: Python<'_>,
         _events: &mut PlatformEvents,
     ) -> VeloxResult<()> {
-        let has_callbacks = !self.callbacks.borrow().is_empty();
+        let has_callbacks = !self.callbacks.is_empty();
 
         // Calculate timeout
         let timeout = if has_callbacks {
@@ -48,7 +48,8 @@ impl VeloxLoop {
         self.atomic_state.set_polling(true);
 
         // Use io-uring based polling on Linux
-        let events = self.poller.borrow_mut().poll_native(timeout);
+        // Release GIL during blocking poll to allow other threads to run
+        let events = py.detach(|| self.poller.borrow_mut().poll_native(timeout));
         self.atomic_state.set_polling(false);
 
         match events {
@@ -71,10 +72,16 @@ impl VeloxLoop {
         // Process Callbacks (call_soon) - lock-free drain via crossbeam
         let mut cb_batch = self.callback_buffer.borrow_mut();
         cb_batch.clear();
-        self.callbacks.borrow().swap_into(&mut *cb_batch);
+        self.callbacks.swap_into(&mut *cb_batch);
 
         for cb in cb_batch.drain(..) {
-            let _ = cb.callback.bind(py).call(PyTuple::new(py, cb.args)?, None);
+            if let Err(e) = cb.callback.bind(py).call(PyTuple::new(py, cb.args)?, None) {
+                // If callback fails, log and continue or handle exception
+                let context = PyDict::new(py);
+                context.set_item("message", "Exception in callback")?;
+                context.set_item("exception", e.value(py))?;
+                self.call_exception_handler(py, context.unbind())?;
+            }
         }
 
         Ok(())

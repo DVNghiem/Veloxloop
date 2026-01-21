@@ -8,7 +8,7 @@ use std::time::Instant;
 use crate::callbacks::{Callback, CallbackQueue};
 use crate::executor::ThreadPoolExecutor;
 use crate::handles::{Handle, IoHandles};
-use crate::poller::LoopPoller;
+use crate::poller::{LoopPoller, PollerWaker};
 use crate::timers::Timers;
 use crate::transports::future::PendingFuture;
 use crate::utils::VeloxResult;
@@ -72,11 +72,6 @@ impl AtomicState {
     }
 
     #[inline(always)]
-    pub fn is_polling(&self) -> bool {
-        self.is_polling.is_set()
-    }
-
-    #[inline(always)]
     pub fn set_polling(&self, val: bool) {
         if val { self.is_polling.set(); } else { self.is_polling.clear(); }
     }
@@ -96,8 +91,9 @@ pub struct HotState {
 #[pyclass(subclass, module = "veloxloop._veloxloop")]
 pub struct VeloxLoop {
     pub(crate) poller: RefCell<LoopPoller>,
+    pub(crate) waker: PollerWaker,
     pub(crate) handles: RefCell<IoHandles>,
-    pub(crate) callbacks: RefCell<CallbackQueue>,
+    pub(crate) callbacks: CallbackQueue,
     pub(crate) timers: RefCell<Timers>,
     pub(crate) state: RefCell<HotState>,
     /// Atomic state for lock-free hot path checks (duplicates key state vars)
@@ -141,12 +137,14 @@ impl VeloxLoop {
     #[pyo3(signature = (debug=None))]
     pub fn new(debug: Option<bool>) -> VeloxResult<Self> {
         let poller = LoopPoller::new()?;
+        let waker = poller.waker();
         let debug_val = debug.unwrap_or(false);
 
         Ok(Self {
             poller: RefCell::new(poller),
+            waker,
             handles: RefCell::new(IoHandles::new()),
-            callbacks: RefCell::new(CallbackQueue::new()),
+            callbacks: CallbackQueue::new(),
             timers: RefCell::new(Timers::new()),
             state: RefCell::new(HotState {
                 running: false,

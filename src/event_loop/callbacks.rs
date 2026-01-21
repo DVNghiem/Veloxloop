@@ -7,7 +7,7 @@ impl VeloxLoop {
     /// Schedule a callback to be called on the next iteration (lock-free).
     /// Uses crossbeam-channel internally for efficient MPMC queue operations.
     pub fn call_soon(&self, callback: Py<PyAny>, args: Vec<Py<PyAny>>, context: Option<Py<PyAny>>) {
-        self.callbacks.borrow().push(Callback {
+        self.callbacks.push(Callback {
             callback,
             args,
             context,
@@ -22,17 +22,16 @@ impl VeloxLoop {
         args: Vec<Py<PyAny>>,
         context: Option<Py<PyAny>>,
     ) {
-        // Lock-free push via crossbeam channel
-        self.callbacks.borrow().push(Callback {
+        // Lock-free push via crossbeam channel - safe from any thread!
+        self.callbacks.push(Callback {
             callback,
             args,
             context,
         });
-        // Use atomic state for lock-free polling check
-        if self.atomic_state.is_polling() {
-            let _ = self.poller.borrow().notify();
-        }
+        // Always notify the waker to wake up the event loop (thread-safe)
+        let _ = self.waker.notify();
     }
+
 
     pub fn call_later(
         &self,

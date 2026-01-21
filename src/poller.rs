@@ -91,6 +91,30 @@ const SQ_SIZE: u32 = 256;
 #[cfg(target_os = "linux")]
 const CQ_SIZE: u32 = 512;
 
+/// Thread-safe waker for the event loop
+#[derive(Clone)]
+pub struct PollerWaker {
+    eventfd: RawFd,
+}
+
+impl PollerWaker {
+    pub fn new(eventfd: RawFd) -> Self {
+        Self { eventfd }
+    }
+
+    /// Wake up the poller from any thread
+    #[inline]
+    pub fn notify(&self) -> crate::utils::VeloxResult<()> {
+        let val: u64 = 1;
+        unsafe {
+            if libc::write(self.eventfd, &val as *const _ as *const _, 8) < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct LoopPoller {
     /// The io-uring instance
     ring: IoUring,
@@ -146,8 +170,14 @@ impl LoopPoller {
         // Register eventfd for notifications
         poller.eventfd_token = poller.next_token();
         poller.submit_poll_add(eventfd, true, false, poller.eventfd_token)?;
+        poller.flush_submissions()?;
 
         Ok(poller)
+    }
+
+    /// Get a thread-safe waker for this poller
+    pub fn waker(&self) -> PollerWaker {
+        PollerWaker::new(self.eventfd)
     }
 
     #[inline]
@@ -279,18 +309,6 @@ impl LoopPoller {
     pub fn delete(&mut self, fd: RawFd) -> crate::utils::VeloxResult<()> {
         if let Some(IoToken(token)) = self.fd_tokens.remove(&fd) {
             self.submit_poll_remove(token)?;
-        }
-        Ok(())
-    }
-
-    /// Wake up the poller from another thread
-    #[inline]
-    pub fn notify(&self) -> crate::utils::VeloxResult<()> {
-        let val: u64 = 1;
-        unsafe {
-            if libc::write(self.eventfd, &val as *const _ as *const _, 8) < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
         }
         Ok(())
     }
