@@ -2,7 +2,7 @@ use crate::callbacks::{
     AsyncConnectCallback, RemoveWriterCallback, SendfileCallback, SockAcceptCallback,
     SockConnectCallback,
 };
-use crate::constants::STACK_BUF_SIZE;
+use crate::constants::{STACK_BUF_SIZE, get_socket};
 use crate::event_loop::VeloxLoop;
 use crate::transports::future::{CompletedFuture, PendingFuture};
 use crate::transports::tcp::TcpServer;
@@ -103,7 +103,7 @@ impl VeloxLoop {
             );
 
             if client_fd >= 0 {
-                let socket_module = py.import("socket")?;
+                let socket_module = get_socket(py).bind(py);
                 let client_sock = socket_module.call_method1("fromfd", (client_fd, 2, 1))?;
 
                 let flags = libc::fcntl(client_fd, libc::F_GETFL, 0);

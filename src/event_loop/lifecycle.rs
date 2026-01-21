@@ -1,3 +1,4 @@
+use crate::constants::get_asyncio;
 use crate::event_loop::VeloxLoop;
 use crate::event_loop::poll::PlatformEvents;
 use crate::utils::{VeloxError, VeloxResult};
@@ -186,7 +187,7 @@ impl VeloxLoop {
             }
         }
 
-        let asyncio = py.import("asyncio")?;
+        let asyncio = get_asyncio(py).bind(py);
         let gather = asyncio.getattr("gather")?;
 
         let coros_tuple = PyTuple::new(py, &close_coros)?;

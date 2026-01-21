@@ -4,7 +4,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use crate::concurrent::ConcurrentCallbackQueue;
-use crate::constants::STACK_BUF_SIZE;
+use crate::constants::{STACK_BUF_SIZE, get_socket};
 use crate::event_loop::VeloxLoop;
 
 use crate::transports::future::PendingFuture;
@@ -297,7 +297,7 @@ impl SockAcceptCallback {
                 }
 
                 // Create Python socket object using socket.fromfd()
-                let socket_module = py.import("socket")?;
+                let socket_module = get_socket(py).bind(py);
                 let py_socket = socket_module.call_method1("fromfd", (client_fd, 2, 1))?; // AF_INET=2, SOCK_STREAM=1
 
                 // Parse address
