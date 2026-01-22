@@ -7,6 +7,7 @@ use bytes::BytesMut;
 use memchr::memchr;
 use parking_lot::Mutex;
 use pyo3::IntoPyObjectExt;
+use pyo3::buffer::PyBuffer;
 use pyo3::ffi;
 #[allow(unused)]
 use pyo3::prelude::*;
@@ -389,29 +390,45 @@ impl StreamReader {
     }
 
     /// Optimized zero-copy read from socket
-    /// Uses larger buffer (128KB) for better large message performance
+    /// Reads directly into the BytesMut buffer to avoid temporary copies
     pub(crate) fn read_from_socket(
         &self,
         stream: &mut std::net::TcpStream,
     ) -> std::io::Result<usize> {
-        TEMP_READ_BUF.with(|buf_cell| {
-            let mut temp = buf_cell.borrow_mut();
-            let mut total = 0;
-            
-            loop {
-                match stream.read(&mut temp[..]) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        total += n;
-                        self.inner.borrow_mut().buffer.extend_from_slice(&temp[..n]);
-                        if n < 131072 { break; }  // Partial read
+        let mut inner = self.inner.borrow_mut();
+        let mut total = 0;
+
+        // Chunk size for reading
+        const CHUNK_SIZE: usize = 131072;
+
+        loop {
+            // Reserve space in the buffer
+            inner.buffer.reserve(CHUNK_SIZE);
+            let len = inner.buffer.len();
+            let cap = inner.buffer.capacity();
+
+            // BytesMut guarantees that the capacity up to `cap` is allocated and valid.
+            // We only set the length to the actual bytes read.
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut(inner.buffer.as_mut_ptr().add(len), cap - len)
+            };
+
+            match stream.read(slice) {
+                Ok(0) => break,
+                Ok(n) => {
+                    total += n;
+                    unsafe { inner.buffer.set_len(len + n) };
+                    // If we read less than we requested, it might be that the socket
+                    // is drained for now or we filled the chunk.
+                    if n < slice.len() {
+                        break;
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => return Err(e),
                 }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
             }
-            Ok(total)
-        })
+        }
+        Ok(total)
     }
 }
 
@@ -605,6 +622,95 @@ impl VeloxBuffer {
     #[new]
     fn new() -> Self {
         Self { data: None }
+    }
+
+    fn __eq__(&self, _py: Python<'_>, other: Bound<'_, PyAny>) -> PyResult<bool> {
+        let self_data = self.data.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyBufferError::new_err("Buffer is empty or released")
+        })?;
+
+        // Fast path for another VeloxBuffer
+        if let Ok(other_velox) = other.extract::<PyRef<VeloxBuffer>>() {
+            let other_data = other_velox.data.as_ref().ok_or_else(|| {
+                pyo3::exceptions::PyBufferError::new_err("Other buffer is empty or released")
+            })?;
+            return Ok(&self_data[..] == &other_data[..]);
+        }
+
+        let other_buf = if let Ok(buf) = PyBuffer::<u8>::get(&other) {
+            buf
+        } else {
+            return Ok(false);
+        };
+
+        if self_data.len() != other_buf.len_bytes() {
+            return Ok(false);
+        }
+
+        if !other_buf.is_c_contiguous() {
+            return Err(pyo3::exceptions::PyBufferError::new_err(
+                "Only contiguous buffers supported for comparison",
+            ));
+        }
+
+        let other_ptr = other_buf.buf_ptr() as *const u8;
+        let other_slice = unsafe { std::slice::from_raw_parts(other_ptr, other_buf.len_bytes()) };
+
+        Ok(&self_data[..] == other_slice)
+    }
+
+    fn __hash__(&self, py: Python<'_>) -> PyResult<isize> {
+        let data = self.data.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyBufferError::new_err("Buffer is empty or released")
+        })?;
+
+        let bytes = PyBytes::new(py, &data[..]);
+        bytes.hash()
+    }
+
+    fn __getitem__(&self, py: Python<'_>, idx: Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
+        let data = self.data.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyBufferError::new_err("Buffer is empty or released")
+        })?;
+
+        if let Ok(i) = idx.extract::<isize>() {
+            let len = data.len() as isize;
+            let i = if i < 0 { i + len } else { i };
+            if i < 0 || i >= len {
+                return Err(pyo3::exceptions::PyIndexError::new_err(
+                    "index out of range",
+                ));
+            }
+            // Return u8 as Python int
+            return Ok(data[i as usize].into_py_any(py)?);
+        }
+
+        if let Ok(slice) = idx.cast::<pyo3::types::PySlice>() {
+            let indices = slice.indices(data.len() as isize)?;
+            let start = indices.start as usize;
+            let stop = indices.stop as usize;
+
+            if indices.step != 1 {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "Slicing with step != 1 is not supported for zero-copy buffer",
+                ));
+            }
+
+            if start >= stop {
+                return Ok(PyBytes::new(py, &[]).into_any().unbind());
+            }
+
+            return Ok(PyBytes::new(py, &data[start..stop]).into_any().unbind());
+        }
+
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "indices must be integers or slices",
+        ))
+    }
+
+    fn __repr__(&self) -> String {
+        let len = self.data.as_ref().map(|d| d.len()).unwrap_or(0);
+        format!("<VeloxBuffer len={} released={}>", len, self.data.is_none())
     }
 
     fn __len__(&self) -> usize {
