@@ -1,7 +1,9 @@
 """Test get_extra_info and set_write_buffer_limits methods."""
 
 import asyncio
+
 import pytest
+
 import veloxloop
 
 
@@ -44,7 +46,6 @@ class TestTransportMethods:
 
         async def run_test():
             # Create a server
-            server_protocol = SimpleProtocol()
             client_protocol = SimpleProtocol()
 
             def protocol_factory():
@@ -58,7 +59,7 @@ class TestTransportMethods:
             _, port = sockets[0].getsockname()
 
             # Connect a client
-            transport, protocol = await asyncio.get_event_loop().create_connection(
+            transport, _ = await asyncio.get_event_loop().create_connection(
                 lambda: client_protocol, '127.0.0.1', port
             )
 
@@ -110,7 +111,6 @@ class TestTransportMethods:
 
         async def run_test():
             # Create a server
-            server_protocol = SimpleProtocol()
             client_protocol = SimpleProtocol()
 
             def protocol_factory():
@@ -123,7 +123,7 @@ class TestTransportMethods:
             _, port = sockets[0].getsockname()
 
             # Connect a client
-            transport, protocol = await asyncio.get_event_loop().create_connection(
+            transport, _ = await asyncio.get_event_loop().create_connection(
                 lambda: client_protocol, '127.0.0.1', port
             )
 
@@ -140,7 +140,7 @@ class TestTransportMethods:
             transport.set_write_buffer_limits()
 
             # Test invalid limits (low >= high)
-            with pytest.raises(ValueError):
+            with pytest.raises(ValueError):  # noqa: PT011
                 transport.set_write_buffer_limits(high=1024, low=2048)
 
             # Cleanup
@@ -155,7 +155,6 @@ class TestTransportMethods:
 
         async def run_test():
             # Create a server
-            server_protocol = SimpleProtocol()
             client_protocol = SimpleProtocol()
 
             def protocol_factory():
@@ -168,7 +167,7 @@ class TestTransportMethods:
             _, port = sockets[0].getsockname()
 
             # Connect a client
-            transport, protocol = await asyncio.get_event_loop().create_connection(
+            transport, _ = await asyncio.get_event_loop().create_connection(
                 lambda: client_protocol, '127.0.0.1', port
             )
 

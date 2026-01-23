@@ -3,8 +3,10 @@ Test UDP/Datagram transport implementation with VeloxLoop
 """
 
 import asyncio
-import veloxloop
+
 import pytest
+
+import veloxloop
 
 
 class EchoDatagramProtocol(asyncio.DatagramProtocol):
@@ -98,7 +100,7 @@ class TestUDPTransport:
             # Create client
             message = b'Hello, UDP!'
             client_protocol = ClientDatagramProtocol(message)
-            client_transport, client_proto = await loop.create_datagram_endpoint(
+            client_transport, _ = await loop.create_datagram_endpoint(
                 lambda: client_protocol, remote_addr=(server_host, server_port)
             )
 
@@ -110,7 +112,7 @@ class TestUDPTransport:
 
             # Verify echo
             assert client_protocol.received is not None
-            received_data, received_addr = client_protocol.received
+            received_data, _ = client_protocol.received
             assert received_data == message
 
             # Cleanup

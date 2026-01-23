@@ -1,7 +1,9 @@
 import asyncio
 import os
 import tempfile
+
 import pytest
+
 import veloxloop
 
 
@@ -36,7 +38,7 @@ async def test_sendfile_basic():
     server = await asyncio.start_server(handle_client, '127.0.0.1', 0)
     addr = server.sockets[0].getsockname()
 
-    reader, writer = await asyncio.open_connection(addr[0], addr[1])
+    _, writer = await asyncio.open_connection(addr[0], addr[1])
 
     with open(file_path, 'rb') as f:
         # transport is the writer's transport
@@ -81,7 +83,7 @@ async def test_sendfile_offset_count():
     server = await asyncio.start_server(handle_client, '127.0.0.1', 0)
     addr = server.sockets[0].getsockname()
 
-    reader, writer = await asyncio.open_connection(addr[0], addr[1])
+    _, writer = await asyncio.open_connection(addr[0], addr[1])
 
     offset = 10
     count = 10

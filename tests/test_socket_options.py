@@ -1,8 +1,10 @@
 """Test socket options functionality."""
 
 import asyncio
-import pytest
 import socket
+
+import pytest
+
 import veloxloop
 
 
@@ -49,7 +51,7 @@ class TestSocketOptions:
             addr = server.sockets[0].getsockname()
 
             # Connect to server
-            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            _, writer = await asyncio.open_connection(addr[0], addr[1])
 
             # Get the transport from writer
             transport = writer.transport
@@ -86,7 +88,7 @@ class TestSocketOptions:
 
             addr = server.sockets[0].getsockname()
 
-            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            _, writer = await asyncio.open_connection(addr[0], addr[1])
             transport = writer.transport
 
             # Set SO_KEEPALIVE
@@ -119,7 +121,7 @@ class TestSocketOptions:
 
             addr = server.sockets[0].getsockname()
 
-            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            _, writer = await asyncio.open_connection(addr[0], addr[1])
             transport = writer.transport
 
             # Set SO_REUSEADDR
@@ -186,7 +188,7 @@ class TestSocketOptions:
 
             addr = server.sockets[0].getsockname()
 
-            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            _, writer = await asyncio.open_connection(addr[0], addr[1])
             transport = writer.transport
 
             # Set keep-alive time (60 seconds)
@@ -223,7 +225,7 @@ class TestSocketOptions:
 
             addr = server.sockets[0].getsockname()
 
-            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            _, writer = await asyncio.open_connection(addr[0], addr[1])
             transport = writer.transport
 
             # Set keep-alive interval (10 seconds)
@@ -260,7 +262,7 @@ class TestSocketOptions:
 
             addr = server.sockets[0].getsockname()
 
-            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            _, writer = await asyncio.open_connection(addr[0], addr[1])
             transport = writer.transport
 
             # Set keep-alive count (5 probes)
@@ -297,7 +299,7 @@ class TestSocketOptions:
             # Test that the server still works
             addr = server.sockets[0].getsockname()
 
-            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            _, writer = await asyncio.open_connection(addr[0], addr[1])
             writer.write(b'test')
             await writer.drain()
             writer.close()
@@ -324,7 +326,7 @@ class TestSocketOptions:
 
             addr = server.sockets[0].getsockname()
 
-            reader, writer = await asyncio.open_connection(addr[0], addr[1])
+            _, writer = await asyncio.open_connection(addr[0], addr[1])
             transport = writer.transport
 
             # Set multiple options
@@ -365,13 +367,13 @@ class TestSocketOptions:
         opts.set_send_buffer_size(8192)
 
         # Get options
-        assert opts.get_tcp_nodelay() == True
-        assert opts.get_keepalive() == True
+        assert opts.get_tcp_nodelay() == True  # noqa: E712
+        assert opts.get_keepalive() == True  # noqa: E712
         assert opts.get_keepalive_time() == 60
         assert opts.get_keepalive_interval() == 10
         assert opts.get_keepalive_count() == 5
-        assert opts.get_reuse_address() == True
-        assert opts.get_reuse_port() == True
+        assert opts.get_reuse_address() == True  # noqa: E712
+        assert opts.get_reuse_port() == True  # noqa: E712
         assert opts.get_recv_buffer_size() == 8192
         assert opts.get_send_buffer_size() == 8192
 
@@ -394,8 +396,8 @@ class TestSocketOptions:
         opts.set_keepalive(True)
 
         # Verify they're set
-        assert opts.get_tcp_nodelay() == True
-        assert opts.get_keepalive() == True
+        assert opts.get_tcp_nodelay() == True  # noqa: E712
+        assert opts.get_keepalive() == True  # noqa: E712
 
         # Reset
         opts.reset()
@@ -414,7 +416,7 @@ class TestSocketOptions:
         opts.set_tcp_nodelay(True)
 
         # Verify
-        assert opts.get_tcp_nodelay() == True
+        assert opts.get_tcp_nodelay() == True  # noqa: E712
         assert opts.get_keepalive() is None
         assert opts.get_reuse_address() is None
 
@@ -443,7 +445,7 @@ class TestSocketOptionsWithContext:
 
                 addr = server.sockets[0].getsockname()
 
-                reader, writer = await asyncio.open_connection(addr[0], addr[1])
+                _, writer = await asyncio.open_connection(addr[0], addr[1])
                 transport = writer.transport
 
                 # Set options on client transport

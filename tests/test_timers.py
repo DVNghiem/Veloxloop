@@ -1,9 +1,10 @@
 """Tests for Timers & Scheduling"""
 
 import asyncio
-import veloxloop
+
 import pytest
-import time
+
+import veloxloop
 
 
 class TestTimersScheduling:
@@ -153,9 +154,9 @@ class TestTimersScheduling:
             def callback(value):
                 result.append(value)
 
-            h1 = loop.call_later(0.01, callback, 1)
+            _ = loop.call_later(0.01, callback, 1)
             h2 = loop.call_later(0.02, callback, 2)
-            h3 = loop.call_later(0.03, callback, 3)
+            _ = loop.call_later(0.03, callback, 3)
 
             h2.cancel()  # Cancel the middle one
             await asyncio.sleep(0.05)
@@ -315,8 +316,6 @@ class TestTimersScheduling:
 
     def test_timer_precision(self):
         """Test timer precision for short delays"""
-        result = []
-
         async def main():
             loop = asyncio.get_running_loop()
             times = []
@@ -324,7 +323,6 @@ class TestTimersScheduling:
             def callback(idx):
                 times.append((idx, loop.time()))
 
-            start = loop.time()
             for i in range(5):
                 loop.call_later(0.01 * (i + 1), callback, i)
 
