@@ -4,6 +4,7 @@ Pure Rust implementation - zero Python function calls
 """
 
 import pytest
+
 import veloxloop._veloxloop as _veloxloop
 
 
@@ -420,7 +421,7 @@ class TestStreamReaderEdgeCases:
     def test_many_small_feeds(self):
         """Test many small feed operations"""
         reader = _veloxloop.StreamReader()
-        for i in range(1000):
+        for _ in range(1000):
             reader.feed_data(b'x')
         assert reader.buffer_size() == 1000
 
@@ -447,7 +448,7 @@ class TestStreamWriterEdgeCases:
     def test_many_small_writes(self):
         """Test many small write operations"""
         writer = _veloxloop.StreamWriter()
-        for i in range(1000):
+        for _ in range(1000):
             writer.write(b'x')
         assert writer.get_write_buffer_size() == 1000
 

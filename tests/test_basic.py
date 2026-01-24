@@ -1,7 +1,8 @@
 import asyncio
-import veloxloop
+
 import pytest
-import time
+
+import veloxloop
 
 
 def setup_module():

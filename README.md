@@ -61,7 +61,6 @@ The following asyncio features are **not yet implemented** and are planned for f
 ### Performance & Diagnostics
 - [ ] **Slow callback warnings** - Debug mode performance monitoring
 - [ ] **Loop instrumentation** - Detailed metrics and statistics
-- [ ] **Zero-copy operations** - Minimize data copying where possible
 
 ### Compatibility & Standards
 - [ ] **PEP 567 context variables** - Full context support in all callbacks

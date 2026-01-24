@@ -2,9 +2,10 @@
 
 import asyncio
 import os
-import pytest
-from pathlib import Path
 import subprocess
+from pathlib import Path
+
+import pytest
 
 # Import veloxloop
 try:
@@ -21,7 +22,8 @@ SERVER_CERT = str(SSL_CERT_DIR / 'server-cert.pem')
 SERVER_KEY = str(SSL_CERT_DIR / 'server-key.pem')
 
 # If cert/key files are missing, try to auto-generate a self-signed pair with openssl.
-# If openssl isn't available, create simple placeholder files so tests won't error on missing files.
+# If openssl isn't available, 
+# create simple placeholder files so tests won't error on missing files.
 if not (Path(SERVER_CERT).exists() and Path(SERVER_KEY).exists()):
     try:
         subprocess.check_call(
@@ -181,7 +183,7 @@ class TestSSLClientConnection:
                 await asyncio.wait_for(
                     protocol.data_received_event.wait(), timeout=10.0
                 )
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError:  # noqa: UP041
                 pass  # Server may have disconnected
 
             # Should have received some HTTP response (if connection didn't fail)
@@ -211,7 +213,7 @@ class TestSSLClientConnection:
                     self.connected = True
                     self.connection_made_event.set()
                     transport.write(
-                        b'GET / HTTP/1.1\r\nHost: www.example.com\r\nConnection: close\r\n\r\n'
+                        b'GET / HTTP/1.1\r\nHost: www.example.com\r\nConnection: close\r\n\r\n'  # noqa: E501
                     )
 
                 def data_received(self, data):
@@ -246,7 +248,7 @@ class TestSSLClientConnection:
                     protocol.data_received_event.wait(), timeout=10.0
                 )
                 assert protocol.received_data
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError:  # noqa: UP041
                 pass  # Some servers may close before sending data
 
             transport.close()
@@ -412,7 +414,7 @@ class TestSSLClientConnection:
             transport.close()
 
             # Wait for connection lost
-            exc = await asyncio.wait_for(protocol.connection_lost_future, timeout=5.0)
+            await asyncio.wait_for(protocol.connection_lost_future, timeout=5.0)
             # Should close cleanly (exc should be None or acceptable error)
             assert protocol.data_sent
 

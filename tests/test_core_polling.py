@@ -1,11 +1,12 @@
 """Tests for Core Polling & I/O Basics"""
 
 import asyncio
-import veloxloop
-import pytest
-import sys
 import threading
 import time
+
+import pytest
+
+import veloxloop
 
 
 class TestCorePolling:

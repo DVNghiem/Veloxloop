@@ -4,9 +4,11 @@ Tests for DNS Resolution Features:
 - getnameinfo()
 """
 
-import pytest
 import asyncio
 import socket
+
+import pytest
+
 from veloxloop import VeloxLoopPolicy
 
 
@@ -31,7 +33,7 @@ class TestDNSResolution:
             results = await loop.getaddrinfo('localhost', '80')
             assert len(results) > 0
 
-            # Each result should be a 5-tuple: (family, type, proto, canonname, sockaddr)
+            # Each result should be a 5-tuple:(family, type, proto, canonname, sockaddr)
             for family, socktype, proto, canonname, sockaddr in results:
                 assert family in (socket.AF_INET, socket.AF_INET6)
                 # socktype can be STREAM, DGRAM, RAW, or 0
@@ -55,7 +57,7 @@ class TestDNSResolution:
             results = await loop.getaddrinfo('127.0.0.1', '80', family=socket.AF_INET)
             assert len(results) > 0
 
-            family, socktype, proto, canonname, sockaddr = results[0]
+            family, _, _, _, sockaddr = results[0]
             assert family == socket.AF_INET
             assert sockaddr[0] == '127.0.0.1'
             assert sockaddr[1] == 80
@@ -88,7 +90,7 @@ class TestDNSResolution:
             )
             assert len(results) > 0
 
-            for family, socktype, proto, _, _ in results:
+            for family, socktype, _, _, _ in results:
                 assert family == socket.AF_INET
                 assert socktype == socket.SOCK_STREAM
                 # proto might be 0 or IPPROTO_TCP depending on implementation
@@ -131,7 +133,7 @@ class TestDNSResolution:
             assert len(results) > 0
 
             # At least one result should have a canonical name
-            canonnames = [r[3] for r in results if r[3]]
+            _ = [r[3] for r in results if r[3]]
             # Note: canonname might be empty even with AI_CANONNAME on some systems
 
         loop.run_until_complete(test())
@@ -140,7 +142,7 @@ class TestDNSResolution:
         """Test getaddrinfo with invalid host"""
 
         async def test():
-            with pytest.raises(OSError):
+            with pytest.raises(OSError):  # noqa: PT011
                 await loop.getaddrinfo('this-host-does-not-exist-12345.invalid', '80')
 
         loop.run_until_complete(test())
@@ -207,7 +209,7 @@ class TestDNSResolution:
             results = await loop.getaddrinfo('localhost', '80', family=socket.AF_INET)
             assert len(results) > 0
 
-            family, socktype, proto, canonname, sockaddr = results[0]
+            _, _, _, _, sockaddr = results[0]
 
             # Reverse lookup the address
             hostname, service = await loop.getnameinfo(
@@ -268,7 +270,7 @@ class TestDNSResolution:
                 results = await loop.getaddrinfo('::1', '80', family=socket.AF_INET6)
 
                 if len(results) > 0:
-                    family, socktype, proto, canonname, sockaddr = results[0]
+                    family, _, _, _, sockaddr = results[0]
                     assert family == socket.AF_INET6
                     assert len(sockaddr) == 4  # IPv6 addresses are 4-tuples
                     assert sockaddr[0] == '::1' or sockaddr[0] == '0:0:0:0:0:0:0:1'
@@ -280,7 +282,8 @@ class TestDNSResolution:
         loop.run_until_complete(test())
 
     def test_getaddrinfo_default_parameters(self, loop):
-        """Test getaddrinfo with default parameters (family=0, type=0, proto=0, flags=0)"""
+        """Test getaddrinfo with default parameters 
+        (family=0, type=0, proto=0, flags=0)"""
 
         async def test():
             # All parameters should default to 0
@@ -288,7 +291,7 @@ class TestDNSResolution:
             assert len(results) > 0
 
             # Should return multiple address families/types
-            families = set(r[0] for r in results)
+            families = {r[0] for r in results}
             assert len(families) >= 1  # At least one address family
 
         loop.run_until_complete(test())

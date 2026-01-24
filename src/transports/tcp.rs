@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::buffer_pool::BufferPool;
-use crate::constants::{DEFAULT_HIGH, DEFAULT_LOW};
+use crate::constants::{BUF_SIZE, DEFAULT_HIGH, DEFAULT_LOW};
 use crate::event_loop::VeloxLoop;
 use crate::transports::DefaultTransportFactory;
 
@@ -364,7 +364,6 @@ pub struct TcpTransport {
     reader: Option<Py<crate::streams::StreamReader>>,
 
     reading: AtomicBool,
-    
 }
 
 unsafe impl Send for TcpTransport {}
@@ -451,27 +450,32 @@ impl crate::transports::StreamTransport for TcpTransport {
         self._force_close_internal(py)
     }
 
-    fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
+    fn write(&mut self, _py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
         let buf_view = PyBuffer::<u8>::get(&data)?;
-        let slice = buf_view.as_slice(py).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyBufferError, _>("Could not get buffer as slice")
-        })?;
+
+        if !buf_view.is_c_contiguous() {
+            return Err(PyErr::new::<pyo3::exceptions::PyBufferError, _>(
+                "Only contiguous buffers are supported for zero-copy write",
+            ));
+        }
+
+        let ptr = buf_view.buf_ptr() as *const u8;
+        let len = buf_view.len_bytes();
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
 
         if let Some(mut stream) = self.stream.as_ref() {
-            let bytes: Vec<u8> = slice.iter().map(|cell| cell.get()).collect();
-            match stream.write(&bytes) {
-                Ok(n) if n == slice.len() => {
+            match stream.write(slice) {
+                Ok(n) if n == len => {
                     // All written
                 }
                 Ok(n) => {
-                    // Partial write - convert remaining cells to bytes
-                    let remaining: Vec<u8> = slice[n..].iter().map(|cell| cell.get()).collect();
+                    // Partial write - store remaining in buffer
                     self.write_buffer
                         .borrow_mut()
-                        .extend_from_slice(&remaining);
+                        .extend_from_slice(&slice[n..]);
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.write_buffer.borrow_mut().extend_from_slice(&bytes);
+                    self.write_buffer.borrow_mut().extend_from_slice(slice);
                 }
                 Err(e) => {
                     return Err(e.into());
@@ -571,11 +575,10 @@ impl crate::transports::StreamTransport for TcpTransport {
                 }
                 Ok(n) => {
                     unsafe { buf.set_len(n) };
-                    // Create Python bytes and call protocol
-                    let py_data = PyBytes::new(py, &buf[..n]);
-                    BufferPool::release(buf);
-                    self.protocol
-                        .call_method1(py, "data_received", (py_data,))?;
+                    // Create VeloxBuffer for zero-copy data passing
+                    let velox_buf = crate::streams::VeloxBuffer::from_bytes_mut(buf);
+                    let py_buf = Py::new(py, velox_buf)?;
+                    self.protocol.call_method1(py, "data_received", (py_buf,))?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     BufferPool::release(buf);
@@ -601,13 +604,8 @@ impl crate::transports::StreamTransport for TcpTransport {
         })?;
 
         if let Some(mut stream) = self.stream.as_ref() {
-            // SAFETY: PyBuffer guarantees:
-            // 1. Pointer is valid for `len` bytes
-            // 2. Memory is writable (checked by as_mut_slice)
-            // 3. No aliasing - we have exclusive access via PyBuffer
-            let slice_mut = unsafe {
-                std::slice::from_raw_parts_mut(slice.as_ptr() as *mut u8, slice.len())
-            };
+            let slice_mut =
+                unsafe { std::slice::from_raw_parts_mut(slice.as_ptr() as *mut u8, slice.len()) };
             match stream.read(slice_mut) {
                 Ok(n) => Ok(n),
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(0),
@@ -914,68 +912,70 @@ impl TcpTransport {
         if slf.borrow().reading.swap(true, Ordering::Acquire) {
             return Ok(()); // Already reading
         }
-        
+
         let py = slf.py();
-        
+
         // OPTIMIZATION 1: Single borrow, extract what we need
         let (has_reader, reader_py, protocol_py, stream_ptr) = {
             let self_ = slf.borrow();
-            
+
             if self_.state.intersects(
-                TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED
+                TransportState::CLOSING | TransportState::CLOSED | TransportState::READING_PAUSED,
             ) {
                 self_.reading.store(false, Ordering::Release);
                 return Ok(());
             }
-            
+
             let has_reader = self_.reader.is_some();
             let reader = self_.reader.as_ref().map(|r| r.clone_ref(py));
             let protocol = self_.protocol.clone_ref(py);
-            
-            // SAFETY: We hold self_ borrow, stream won't be dropped
-            let stream_ptr = self_.stream.as_ref()
+
+            // hold self_ borrow, stream won't be dropped
+            let stream_ptr = self_
+                .stream
+                .as_ref()
                 .map(|s| s as *const std::net::TcpStream as usize);
-            
+
             (has_reader, reader, protocol, stream_ptr)
         }; // Drop borrow immediately
-        
+
         if stream_ptr.is_none() {
             slf.borrow().reading.store(false, Ordering::Release);
             return Ok(());
         }
-        
-        // OPTIMIZATION 2: Use smaller, cache-friendly buffer
-        const BUF_SIZE: usize = 16384; // 16KB fits in L2 cache
+
         let mut buf = [0u8; BUF_SIZE];
-        
+
         if has_reader {
             // FAST PATH: Direct StreamReader (zero Python calls)
             let reader_obj = reader_py.as_ref().unwrap().bind(py).borrow();
             let mut should_wakeup = false;
-            
+
             let mut eof_reached = false;
             loop {
-                // SAFETY: stream_ptr is valid, we checked state above
                 let n = unsafe {
                     let stream = &*(stream_ptr.unwrap() as *const std::net::TcpStream);
                     let mut s = stream;
                     std::io::Read::read(&mut s, &mut buf)
                 };
-                
+
                 match n {
                     Ok(0) => {
                         // EOF
                         eof_reached = true;
                         break;
                     }
-                    Ok(n) => {  
-                        // OPTIMIZATION 3: Direct buffer write (no PyBytes allocation)
-                        reader_obj.inner.borrow_mut().buffer.extend_from_slice(&buf[..n]);
+                    Ok(n) => {
+                        reader_obj
+                            .inner
+                            .borrow_mut()
+                            .buffer
+                            .extend_from_slice(&buf[..n]);
                         should_wakeup = true;
-                        
+
                         // Partial read? Socket drained
-                        if n < BUF_SIZE { 
-                            break; 
+                        if n < BUF_SIZE {
+                            break;
                         }
                     }
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -986,19 +986,18 @@ impl TcpTransport {
                     }
                 }
             }
-            
+
             // Wake waiters ONCE after all reads (not per read)
             if should_wakeup {
                 reader_obj._wakeup_waiters(py)?;
             }
-            
+
             // Handle EOF after waking waiters
             if eof_reached {
                 drop(reader_obj);
                 reader_py.unwrap().bind(py).borrow().feed_eof_native(py)?;
                 Self::close(slf)?;
             }
-            
         } else {
             // PROTOCOL PATH: Single read + batch callback
             let n = unsafe {
@@ -1006,13 +1005,15 @@ impl TcpTransport {
                 let mut s = stream;
                 std::io::Read::read(&mut s, &mut buf)
             };
-            
+
             match n {
                 Ok(0) => {
                     // EOF
                     if let Ok(res) = protocol_py.call_method0(py, "eof_received") {
                         if let Ok(keep_open) = res.extract::<bool>(py) {
-                            if !keep_open { Self::close(slf)?; }
+                            if !keep_open {
+                                Self::close(slf)?;
+                            }
                         } else {
                             Self::close(slf)?;
                         }
@@ -1032,7 +1033,7 @@ impl TcpTransport {
                 }
             }
         }
-        
+
         slf.borrow().reading.store(false, Ordering::Release);
         Ok(())
     }

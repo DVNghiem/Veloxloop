@@ -7,10 +7,12 @@ Tests for Core Event Loop Features:
 - Async generator shutdown
 """
 
-import pytest
 import asyncio
-import time
 import threading
+import time
+
+import pytest
+
 from veloxloop import VeloxLoopPolicy
 
 
@@ -272,7 +274,7 @@ class TestAsyncGeneratorShutdown:
             # Consume one value
             await gen.__anext__()
             # Now shutdown - this should close the generator
-            result = await loop.shutdown_asyncgens()
+            await loop.shutdown_asyncgens()
             # Generator should be closed after shutdown completes
             # Give it a moment to actually close
             await asyncio.sleep(0.01)

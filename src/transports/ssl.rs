@@ -11,6 +11,7 @@ use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
+use crate::buffer_pool::BufferPool;
 use crate::constants::{DEFAULT_HIGH, DEFAULT_LOW};
 use crate::event_loop::VeloxLoop;
 use crate::transports::{StreamTransport, Transport, TransportState};
@@ -371,13 +372,14 @@ impl crate::transports::StreamTransport for SSLTransport {
         self._force_close_internal(py)
     }
 
-    fn write(&mut self, py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
-        let buf = PyBuffer::<u8>::get(&data)?;
-        let slice = buf.as_slice(py).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyBufferError, _>(
-                "Could not get buffer as slice",
-            )
-        })?;
+    fn write(&mut self, _py: Python<'_>, data: Bound<'_, PyAny>) -> PyResult<()> {
+        let buf_view = PyBuffer::<u8>::get(&data)?;
+
+        if !buf_view.is_c_contiguous() {
+            return Err(PyErr::new::<pyo3::exceptions::PyBufferError, _>(
+                "Only contiguous buffers are supported for zero-copy write",
+            ));
+        }
 
         if self.state.contains(TransportState::CLOSING)
             || self.state.contains(TransportState::CLOSED)
@@ -387,13 +389,16 @@ impl crate::transports::StreamTransport for SSLTransport {
             ));
         }
 
-        let data_slice: Vec<u8> = slice.iter().map(|cell| cell.get()).collect();
-        self.write_buffer.extend_from_slice(&data_slice);
+        let ptr = buf_view.buf_ptr() as *const u8;
+        let len = buf_view.len_bytes();
+        let data_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+
+        self.write_buffer.extend_from_slice(data_slice);
 
         let mut state = self.tls_state.lock();
         let mut writer = state.connection.writer();
 
-        match writer.write_all(&data_slice) {
+        match writer.write_all(data_slice) {
             Ok(_) => {
                 drop(writer);
                 // Split the mutable borrows by destructuring
@@ -408,27 +413,24 @@ impl crate::transports::StreamTransport for SSLTransport {
         }
     }
 
-    fn recv_into(&mut self, py: Python<'_>, buffer: Bound<'_, PyAny>) -> PyResult<usize> {
-        let buf = PyBuffer::<u8>::get(&buffer)?;
-        let slice = buf.as_mut_slice(py).ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyBufferError, _>(
-                "Could not get buffer as mutable slice",
-            )
-        })?;
+    fn recv_into(&mut self, _py: Python<'_>, buffer: Bound<'_, PyAny>) -> PyResult<usize> {
+        let buf_view = PyBuffer::<u8>::get(&buffer)?;
+        if !buf_view.is_c_contiguous() {
+            return Err(PyErr::new::<pyo3::exceptions::PyBufferError, _>(
+                "Only contiguous buffers are supported for zero-copy recv_into",
+            ));
+        }
+
+        let ptr = buf_view.buf_ptr() as *mut u8;
+        let len = buf_view.len_bytes();
 
         let mut state = self.tls_state.lock();
         let mut reader = state.connection.reader();
 
-        // reader.read expects &mut [u8]; PyBuffer gives &mut [Cell<u8>],
-        // so read into a temporary u8 buffer then copy into the Cell slice.
-        let mut temp_buf = vec![0u8; slice.len()];
-        match reader.read(&mut temp_buf) {
-            Ok(n) => {
-                for (i, b) in temp_buf[..n].iter().enumerate() {
-                    slice[i].set(*b);
-                }
-                Ok(n)
-            }
+        // Rustls reader will write directly into it.
+        let slice_mut = unsafe { std::slice::from_raw_parts_mut(ptr, len) };
+        match reader.read(slice_mut) {
+            Ok(n) => Ok(n),
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
             Err(e) => Err(e.into()),
         }
@@ -507,13 +509,19 @@ impl crate::transports::StreamTransport for SSLTransport {
         }
 
         // Read application data
-        let mut buf = [0u8; 4096];
         let mut reader = state.connection.reader();
+        let mut pbuf = BufferPool::acquire();
+        pbuf.reserve(16384); // Standard TLS record size
+        let len = pbuf.len();
+        let cap = pbuf.capacity();
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(pbuf.as_mut_ptr().add(len), cap - len) };
 
-        match reader.read(&mut buf) {
+        match reader.read(slice) {
             Ok(0) => {
                 drop(reader);
                 drop(state);
+                BufferPool::release(pbuf);
                 if let Ok(res) = self.protocol.call_method0(py, "eof_received") {
                     if let Ok(keep_open) = res.extract::<bool>(py) {
                         if !keep_open {
@@ -527,15 +535,22 @@ impl crate::transports::StreamTransport for SSLTransport {
                 }
             }
             Ok(n) => {
-                let data = &buf[..n];
+                unsafe { pbuf.set_len(len + n) };
                 drop(reader);
                 drop(state);
-                let py_data = PyBytes::new(py, data);
-                self.protocol
-                    .call_method1(py, "data_received", (py_data,))?;
+
+                // Create VeloxBuffer for zero-copy data passing
+                let velox_buf = crate::streams::VeloxBuffer::from_bytes_mut(pbuf);
+                let py_buf = Py::new(py, velox_buf)?;
+                self.protocol.call_method1(py, "data_received", (py_buf,))?;
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e.into()),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                BufferPool::release(pbuf);
+            }
+            Err(e) => {
+                BufferPool::release(pbuf);
+                return Err(e.into());
+            }
         }
 
         Ok(())

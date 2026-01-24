@@ -1,9 +1,11 @@
 """Simplified Tests for Core Polling & I/O Basics - Non-blocking version"""
 
 import asyncio
-import veloxloop
-import pytest
 import threading
+
+import pytest
+
+import veloxloop
 
 
 class TestCorePollingBasic:

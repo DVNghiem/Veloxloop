@@ -1,9 +1,10 @@
 """Tests for TCP Transport"""
 
 import asyncio
-import veloxloop
+
 import pytest
-import time
+
+import veloxloop
 
 
 class TestTCPTransport:
@@ -185,8 +186,8 @@ class TestTCPTransport:
                 await asyncio.wait_for(
                     asyncio.open_connection('127.0.0.1', port), timeout=0.5
                 )
-                assert False, 'Connection should have failed'
-            except (ConnectionRefusedError, asyncio.TimeoutError, OSError):
+                assert False, 'Connection should have failed'  # noqa: B011, PT015
+            except (ConnectionRefusedError, asyncio.TimeoutError, OSError):  # noqa: UP041
                 pass  # Expected
 
         asyncio.run(main())
@@ -271,8 +272,8 @@ class TestTCPTransport:
                 # Try to read with timeout (shorter than handler sleep)
                 try:
                     await asyncio.wait_for(reader.read(100), timeout=0.2)
-                    assert False, 'Should have timed out'
-                except asyncio.TimeoutError:
+                    assert False, 'Should have timed out'  # noqa: B011, PT015
+                except asyncio.TimeoutError:  # noqa: UP041
                     pass  # Expected
 
                 writer.close()
@@ -402,8 +403,8 @@ class TestTCPTransport:
                 await asyncio.wait_for(
                     asyncio.open_connection('127.0.0.1', 59999), timeout=1.0
                 )
-                assert False, 'Should have failed'
-            except (ConnectionRefusedError, asyncio.TimeoutError, OSError):
+                assert False, 'Should have failed'  # noqa: B011, PT015
+            except (ConnectionRefusedError, asyncio.TimeoutError, OSError):  # noqa: UP041
                 pass  # Expected
 
         asyncio.run(main())

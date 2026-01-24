@@ -1,6 +1,5 @@
 use parking_lot::Mutex;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
@@ -121,23 +120,37 @@ impl UdpTransport {
     }
 
     #[pyo3(signature = (data, addr=None))]
-    fn sendto(&self, _py: Python<'_>, data: &[u8], addr: Option<(String, u16)>) -> PyResult<()> {
+    fn sendto(
+        &self,
+        data: Bound<'_, PyAny>,
+        addr: Option<(String, u16)>,
+    ) -> PyResult<()> {
         if self.is_closing() {
             return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                 "Transport is closing or closed",
             ));
         }
 
+        let buf_view = pyo3::buffer::PyBuffer::<u8>::get(&data)?;
+        if !buf_view.is_c_contiguous() {
+            return Err(PyErr::new::<pyo3::exceptions::PyBufferError, _>(
+                "Only contiguous buffers are supported for zero-copy sendto",
+            ));
+        }
+        let ptr = buf_view.buf_ptr() as *const u8;
+        let len = buf_view.len_bytes();
+        let data_slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+
         let socket_guard = self.socket.lock();
         if let Some(socket) = socket_guard.as_ref() {
             match addr {
                 Some((host, port)) => {
                     let target_addr = format!("{}:{}", host, port);
-                    socket.send_to(data, target_addr)?;
+                    socket.send_to(data_slice, target_addr)?;
                 }
                 None => {
                     if let Some(_remote) = self.remote_addr {
-                        socket.send(data)?;
+                        socket.send(data_slice)?;
                     } else {
                         return Err(pyo3::exceptions::PyValueError::new_err(
                             "Sendto requires an address for unconnected sockets",
@@ -221,19 +234,31 @@ impl UdpTransport {
 
         let socket_guard = self.socket.lock();
         if let Some(socket) = socket_guard.as_ref() {
-            let mut buf = [0u8; 65536];
-            match socket.recv_from(&mut buf) {
+            let mut pbuf = crate::buffer_pool::BufferPool::acquire();
+            pbuf.reserve(65536);
+            let len = pbuf.len();
+            let cap = pbuf.capacity();
+            let slice =
+                unsafe { std::slice::from_raw_parts_mut(pbuf.as_mut_ptr().add(len), cap - len) };
+
+            match socket.recv_from(slice) {
                 Ok((n, addr)) => {
-                    let data = PyBytes::new(py, &buf[..n]);
+                    unsafe { pbuf.set_len(len + n) };
                     let addr_tuple = crate::utils::ipv6::socket_addr_to_tuple(py, addr)?;
                     let protocol = self.protocol.clone_ref(py);
                     drop(socket_guard);
-                    protocol.call_method1(py, "datagram_received", (data, addr_tuple))?;
+
+                    // Create VeloxBuffer for zero-copy data passing
+                    let velox_buf = crate::streams::VeloxBuffer::from_bytes_mut(pbuf);
+                    let py_buf = Py::new(py, velox_buf)?;
+
+                    protocol.call_method1(py, "datagram_received", (py_buf, addr_tuple))?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    // No data available
+                    crate::buffer_pool::BufferPool::release(pbuf);
                 }
                 Err(e) => {
+                    crate::buffer_pool::BufferPool::release(pbuf);
                     drop(socket_guard);
                     let protocol = self.protocol.clone_ref(py);
                     let _ = protocol.call_method1(py, "error_received", (e.to_string(),));
