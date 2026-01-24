@@ -8,11 +8,13 @@
 
 *Velox* is Latin for "swift" or "rapid" — reflecting the goal of delivering significantly faster I/O and lower overhead than the default selector event loop while remaining fully compatible with the standard `asyncio` API.
 
+> ⚠️ **Note:** VeloxLoop currently only supports **Linux**. macOS and Windows support is planned for future releases.
+
 ⚡ **Why VeloxLoop?**  
 - Built in Rust for memory safety, zero-cost abstractions, and exceptional performance.  
-- Powered by the lightweight and modern `io-uring` and `tokio` crate for cross-platform epoll/kqueue/IOCP support.  
+- Powered by the lightweight and modern `io-uring` Linux kernel feature for maximum performance. Cross-platform support (kqueue for macOS, IOCP for Windows) planned.  
 - Completely independent design — no shared code or direct architectural overlap with existing projects (including RLoop, uvloop, or others).  
-- Focus on clean, efficient readiness handling, minimal overhead, and excellent cross-platform behavior.  
+- Focus on clean, efficient readiness handling, minimal overhead, and excellent performance.  
 - Early results show strong potential for outperforming current alternatives.
 
 ## Status
@@ -23,7 +25,9 @@ Not yet suitable for production — intended for experimentation, testing, and c
 
 ## Installation
 
-VeloxLoop will be distributed as pre-built wheels for Linux, macOS, and Windows via PyPI.
+**Currently, VeloxLoop is only available for Linux.**
+
+VeloxLoop will be distributed as pre-built wheels via PyPI. Future releases will include support for macOS and Windows.
 
 ```bash
 pip install veloxloop
@@ -31,7 +35,7 @@ pip install veloxloop
 
 ## Missing Features / Roadmap
 
-The following asyncio features are **not yet implemented** and are planned for future development:
+The following asyncio features are **not yet implemented** and are planned for future development. Currently, development is focused on **Linux** support.
 
 ### Core Event Loop Features
 - [ ] **Async context managers** - Full support for `async with` on loop methods
@@ -53,18 +57,19 @@ The following asyncio features are **not yet implemented** and are planned for f
 - [ ] **File descriptor passing** - Passing file descriptors between processes
 - [ ] **`connect_accepted_socket()`** - Create transport from accepted socket
 
-### Platform-Specific Features
-- [ ] **Windows named pipes** - Windows IPC support
-- [ ] **Windows IOCP optimizations** - Better Windows performance
-- [ ] **macOS/BSD kqueue optimizations** - Platform-specific tuning
-
 ### Performance & Diagnostics
 - [ ] **Slow callback warnings** - Debug mode performance monitoring
 - [ ] **Loop instrumentation** - Detailed metrics and statistics
 
 ### Compatibility & Standards
 - [ ] **PEP 567 context variables** - Full context support in all callbacks
-- [ ] **ProactorEventLoop equivalence** - Windows proactor-style operations
+
+### Platform Support (Future)
+*The following features will be prioritized after Linux support is stabilized and macOS/Windows support is added:*
+- [ ] **Windows IOCP implementation** - Windows async I/O support
+- [ ] **macOS/BSD kqueue support** - macOS and BSD async I/O support
+- [ ] **Windows named pipes** - Windows IPC support
+- [ ] **Windows ProactorEventLoop equivalence** - Windows proactor-style operations
 
 ## Benchmarks
 
