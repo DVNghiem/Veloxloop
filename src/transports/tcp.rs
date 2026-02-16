@@ -362,6 +362,13 @@ pub struct TcpTransport {
     write_buffer_low: usize,
     // Direct path to reader
     reader: Option<Py<crate::streams::StreamReader>>,
+    // Cached protocol.data_received method for vectorcall dispatch
+    // Eliminates Python attribute lookup + method call overhead per read
+    cached_data_received: Option<Py<PyAny>>,
+    // Cached protocol.eof_received method
+    cached_eof_received: Option<Py<PyAny>>,
+    // Cached protocol.connection_lost method
+    cached_connection_lost: Option<Py<PyAny>>,
 
     reading: AtomicBool,
 }
@@ -560,13 +567,21 @@ impl crate::transports::StreamTransport for TcpTransport {
             match stream.read(&mut buf[..]) {
                 Ok(0) => {
                     BufferPool::release(buf);
-                    // EOF - notify protocol
-                    if let Ok(res) = self.protocol.call_method0(py, "eof_received") {
-                        if let Ok(keep_open) = res.extract::<bool>(py) {
+                    // EOF - notify protocol via cached method
+                    if let Some(ref cached_eof) = self.cached_eof_received {
+                        let result =
+                            unsafe { pyo3::ffi::PyObject_CallNoArgs(cached_eof.as_ptr()) };
+                        if !result.is_null() {
+                            let keep_open = unsafe {
+                                let val = pyo3::ffi::PyObject_IsTrue(result);
+                                pyo3::ffi::Py_DECREF(result);
+                                val == 1
+                            };
                             if !keep_open {
                                 self.close(py)?;
                             }
                         } else {
+                            unsafe { pyo3::ffi::PyErr_Clear() };
                             self.close(py)?;
                         }
                     } else {
@@ -578,7 +593,16 @@ impl crate::transports::StreamTransport for TcpTransport {
                     // Create VeloxBuffer for zero-copy data passing
                     let velox_buf = crate::streams::VeloxBuffer::from_bytes_mut(buf);
                     let py_buf = Py::new(py, velox_buf)?;
-                    self.protocol.call_method1(py, "data_received", (py_buf,))?;
+                    // Use cached method + vectorcall
+                    if let Some(ref cached_data) = self.cached_data_received {
+                        unsafe {
+                            crate::ffi_utils::vectorcall_one_arg(
+                                py,
+                                cached_data.as_ptr(),
+                                py_buf.as_ptr(),
+                            )?;
+                        }
+                    }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
                     BufferPool::release(buf);
@@ -667,8 +691,19 @@ impl crate::transports::StreamTransport for TcpTransport {
 
         if should_finalize {
             self._force_close_internal(py)?;
-            let protocol = self.protocol.clone_ref(py);
-            let _ = protocol.call_method1(py, "connection_lost", (py.None(),));
+            // Use cached connection_lost method
+            if let Some(ref cached) = self.cached_connection_lost {
+                let _ = unsafe {
+                    crate::ffi_utils::vectorcall_one_arg(
+                        py,
+                        cached.as_ptr(),
+                        pyo3::ffi::Py_None(),
+                    )
+                };
+            } else {
+                let protocol = self.protocol.clone_ref(py);
+                let _ = protocol.call_method1(py, "connection_lost", (py.None(),));
+            }
         }
 
         Ok(())
@@ -782,9 +817,19 @@ impl TcpTransport {
             }
         }
 
-        // Notify protocol after dropping borrow
+        // Notify protocol after dropping borrow via cached method
         if let Some(proto) = protocol {
-            let _ = proto.call_method1(py, "connection_lost", (py.None(),));
+            if let Some(ref cached) = slf.borrow().cached_connection_lost {
+                let _ = unsafe {
+                    crate::ffi_utils::vectorcall_one_arg(
+                        py,
+                        cached.as_ptr(),
+                        pyo3::ffi::Py_None(),
+                    )
+                };
+            } else {
+                let _ = proto.call_method1(py, "connection_lost", (py.None(),));
+            }
         }
 
         if needs_writer {
@@ -802,20 +847,42 @@ impl TcpTransport {
 
     fn abort(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
-        let protocol = {
+        {
             let mut self_ = slf.borrow_mut();
             self_._force_close_internal(py)?;
-            self_.protocol.clone_ref(py)
-        };
-        let _ = protocol.call_method1(py, "connection_lost", (py.None(),));
+        }
+        // Use cached connection_lost method
+        if let Some(ref cached) = slf.borrow().cached_connection_lost {
+            let _ = unsafe {
+                crate::ffi_utils::vectorcall_one_arg(
+                    py,
+                    cached.as_ptr(),
+                    pyo3::ffi::Py_None(),
+                )
+            };
+        } else {
+            let protocol = slf.borrow().protocol.clone_ref(py);
+            let _ = protocol.call_method1(py, "connection_lost", (py.None(),));
+        }
         Ok(())
     }
 
     fn _force_close(&mut self, py: Python<'_>) -> PyResult<()> {
         self._force_close_internal(py)?;
-        let _ = self
-            .protocol
-            .call_method1(py, "connection_lost", (py.None(),));
+        // Use cached connection_lost method
+        if let Some(ref cached) = self.cached_connection_lost {
+            let _ = unsafe {
+                crate::ffi_utils::vectorcall_one_arg(
+                    py,
+                    cached.as_ptr(),
+                    pyo3::ffi::Py_None(),
+                )
+            };
+        } else {
+            let _ = self
+                .protocol
+                .call_method1(py, "connection_lost", (py.None(),));
+        }
         Ok(())
     }
 
@@ -915,8 +982,8 @@ impl TcpTransport {
 
         let py = slf.py();
 
-        // OPTIMIZATION 1: Single borrow, extract what we need
-        let (has_reader, reader_py, protocol_py, stream_ptr) = {
+        // OPTIMIZATION 1: Single borrow, extract what we need (including cached method ptrs)
+        let (has_reader, reader_py, stream_ptr, cached_data_ptr, cached_eof_ptr) = {
             let self_ = slf.borrow();
 
             if self_.state.intersects(
@@ -928,15 +995,19 @@ impl TcpTransport {
 
             let has_reader = self_.reader.is_some();
             let reader = self_.reader.as_ref().map(|r| r.clone_ref(py));
-            let protocol = self_.protocol.clone_ref(py);
 
-            // hold self_ borrow, stream won't be dropped
+            // Extract raw pointers to cached protocol methods.
+            // These are valid as long as the TcpTransport (and its Py<PyAny> fields) is alive,
+            // which is guaranteed by `slf` holding the PyCell.
+            let data_ptr = self_.cached_data_received.as_ref().map(|m| m.as_ptr());
+            let eof_ptr = self_.cached_eof_received.as_ref().map(|m| m.as_ptr());
+
             let stream_ptr = self_
                 .stream
                 .as_ref()
                 .map(|s| s as *const std::net::TcpStream as usize);
 
-            (has_reader, reader, protocol, stream_ptr)
+            (has_reader, reader, stream_ptr, data_ptr, eof_ptr)
         }; // Drop borrow immediately
 
         if stream_ptr.is_none() {
@@ -999,7 +1070,7 @@ impl TcpTransport {
                 Self::close(slf)?;
             }
         } else {
-            // PROTOCOL PATH: Single read + batch callback
+            // PROTOCOL PATH: Single read + vectorcall via cached methods
             let n = unsafe {
                 let stream = &*(stream_ptr.unwrap() as *const std::net::TcpStream);
                 let mut s = stream;
@@ -1008,13 +1079,20 @@ impl TcpTransport {
 
             match n {
                 Ok(0) => {
-                    // EOF
-                    if let Ok(res) = protocol_py.call_method0(py, "eof_received") {
-                        if let Ok(keep_open) = res.extract::<bool>(py) {
+                    // EOF — call cached eof_received (no attribute lookup)
+                    if let Some(eof_ptr) = cached_eof_ptr {
+                        let result = unsafe { pyo3::ffi::PyObject_CallNoArgs(eof_ptr) };
+                        if !result.is_null() {
+                            let keep_open = unsafe {
+                                let val = pyo3::ffi::PyObject_IsTrue(result);
+                                pyo3::ffi::Py_DECREF(result);
+                                val == 1
+                            };
                             if !keep_open {
                                 Self::close(slf)?;
                             }
                         } else {
+                            unsafe { pyo3::ffi::PyErr_Clear() };
                             Self::close(slf)?;
                         }
                     } else {
@@ -1022,9 +1100,17 @@ impl TcpTransport {
                     }
                 }
                 Ok(n) => {
-                    // OPTIMIZATION 4: Zero-copy PyBytes with C API (skip PyO3 wrapper)
+                    // Zero-copy PyBytes via C API + vectorcall data_received
                     let py_data = unsafe { crate::ffi_utils::bytes_from_slice(py, &buf[..n]) };
-                    protocol_py.call_method1(py, "data_received", (py_data,))?;
+                    if let Some(data_ptr) = cached_data_ptr {
+                        unsafe {
+                            crate::ffi_utils::vectorcall_one_arg(
+                                py,
+                                data_ptr,
+                                py_data.as_ptr(),
+                            )?;
+                        }
+                    }
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
                 Err(e) => {
@@ -1237,6 +1323,19 @@ impl TcpTransport {
         stream.set_nonblocking(true)?;
         let fd = stream.as_raw_fd();
 
+        // Cache protocol methods at creation time.
+        // This avoids a Python attribute lookup (tp_getattr → dict search → descriptor __get__)
+        // on every single read/write event. The cached Py<PyAny> is a bound method object.
+        let cached_data_received = Python::attach(|py| {
+            protocol.getattr(py, "data_received").ok()
+        });
+        let cached_eof_received = Python::attach(|py| {
+            protocol.getattr(py, "eof_received").ok()
+        });
+        let cached_connection_lost = Python::attach(|py| {
+            protocol.getattr(py, "connection_lost").ok()
+        });
+
         Ok(Self {
             fd,
             stream: Some(stream),
@@ -1247,6 +1346,9 @@ impl TcpTransport {
             write_buffer_high: DEFAULT_HIGH,
             write_buffer_low: DEFAULT_LOW,
             reader: None,
+            cached_data_received,
+            cached_eof_received,
+            cached_connection_lost,
             reading: AtomicBool::new(false),
         })
     }

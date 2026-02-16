@@ -341,7 +341,7 @@ impl SockAcceptCallback {
                     },
                     addr_tuple_ptr,
                 );
-                let result: Py<PyAny> = Py::from_owned_ptr(py, result_ptr);
+                let result: Py<PyAny> = pyo3::Bound::from_owned_ptr(py, result_ptr).unbind();
 
                 self.future
                     .bind(py)

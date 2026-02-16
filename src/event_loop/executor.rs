@@ -310,7 +310,7 @@ fn perform_getaddrinfo(
 
         libc::freeaddrinfo(res);
 
-        Ok(Py::from_owned_ptr(py, py_list))
+        Ok(pyo3::Bound::from_owned_ptr(py, py_list).unbind())
     }
 }
 
@@ -385,6 +385,6 @@ fn perform_getnameinfo(py: Python<'_>, addr: &str, port: u16, flags: i32) -> PyR
             ffi_utils::string_from_str(&servname),
         );
 
-        Ok(Py::from_owned_ptr(py, result_tuple))
+        Ok(pyo3::Bound::from_owned_ptr(py, result_tuple).unbind())
     }
 }

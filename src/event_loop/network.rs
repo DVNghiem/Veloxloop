@@ -150,7 +150,7 @@ impl VeloxLoop {
                     },
                     addr_tuple_ptr,
                 );
-                let result: Py<PyAny> = Py::from_owned_ptr(py, result_ptr);
+                let result: Py<PyAny> = pyo3::Bound::from_owned_ptr(py, result_ptr).unbind();
 
                 let fut = PendingFuture::new();
                 fut.set_result(py, result)?;

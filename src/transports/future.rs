@@ -74,11 +74,17 @@ impl PendingFuture {
         }
         lock.0 = FutureState::Finished(result);
 
-        // Call all done callbacks
+        // Call all done callbacks via vectorcall (no tuple allocation)
         let callbacks = std::mem::take(&mut lock.1);
         drop(lock); // Drop lock before Python calls
         for callback in callbacks {
-            let _ = callback.call1(py, (py.None(),));
+            let _ = unsafe {
+                crate::ffi_utils::vectorcall_one_arg(
+                    py,
+                    callback.as_ptr(),
+                    pyo3::ffi::Py_None(),
+                )
+            };
         }
 
         Ok(())
@@ -98,7 +104,13 @@ impl PendingFuture {
         let callbacks = std::mem::take(&mut lock.1);
         drop(lock);
         for callback in callbacks {
-            let _ = callback.call1(py, (py.None(),));
+            let _ = unsafe {
+                crate::ffi_utils::vectorcall_one_arg(
+                    py,
+                    callback.as_ptr(),
+                    pyo3::ffi::Py_None(),
+                )
+            };
         }
 
         Ok(())
@@ -124,7 +136,13 @@ impl PendingFuture {
         let callbacks = std::mem::take(&mut lock.1);
         drop(lock);
         for callback in callbacks {
-            let _ = callback.call1(py, (py.None(),));
+            let _ = unsafe {
+                crate::ffi_utils::vectorcall_one_arg(
+                    py,
+                    callback.as_ptr(),
+                    pyo3::ffi::Py_None(),
+                )
+            };
         }
         Ok(true)
     }

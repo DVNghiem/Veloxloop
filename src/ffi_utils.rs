@@ -25,7 +25,7 @@ pub unsafe fn bytes_from_slice(py: Python<'_>, data: &[u8]) -> Py<PyAny> {
             data.as_ptr() as *const c_char,
             data.len() as ffi::Py_ssize_t,
         );
-        Py::from_owned_ptr(py, ptr)
+        Bound::from_owned_ptr(py, ptr).into()
     }
 }
 
@@ -58,6 +58,7 @@ pub unsafe fn long_from_u32(v: u32) -> *mut ffi::PyObject {
 
 /// Create a 1-element tuple. **Steals** the reference to `a`.
 #[inline(always)]
+#[allow(dead_code)]
 pub unsafe fn tuple1(a: *mut ffi::PyObject) -> *mut ffi::PyObject {
     unsafe {
         let t = ffi::PyTuple_New(1);
@@ -130,12 +131,57 @@ pub unsafe fn list_append(list: *mut ffi::PyObject, item: *mut ffi::PyObject) ->
     unsafe { ffi::PyList_Append(list, item) }
 }
 
-// ─── Callback Invocation (C API) ────────────────────────────────────────────
+// ─── Callback Invocation (Vectorcall C API) ─────────────────────────────────
 
-/// Execute a Python callback with arguments using the most efficient C API path.
+/// Call a Python callable with no arguments using C API.
+/// Faster than PyO3's `cb.call0(py)` which internally creates an empty tuple.
+#[inline(always)]
+pub unsafe fn call_no_args(py: Python<'_>, callable: *mut ffi::PyObject) -> PyResult<()> {
+    unsafe {
+        let result = ffi::PyObject_CallNoArgs(callable);
+        if result.is_null() {
+            Err(PyErr::fetch(py))
+        } else {
+            ffi::Py_DECREF(result);
+            Ok(())
+        }
+    }
+}
+
+/// Call a Python callable with exactly 1 argument using vectorcall.
+/// Avoids tuple allocation entirely — args passed on the C stack.
+/// This is the fastest possible path for 1-arg calls in CPython 3.9+.
+#[inline(always)]
+pub unsafe fn vectorcall_one_arg(
+    py: Python<'_>,
+    callable: *mut ffi::PyObject,
+    arg: *mut ffi::PyObject,
+) -> PyResult<()> {
+    unsafe {
+        let args = [arg];
+        let result = ffi::PyObject_Vectorcall(
+            callable,
+            args.as_ptr(),
+            1,
+            std::ptr::null_mut(),
+        );
+        if result.is_null() {
+            Err(PyErr::fetch(py))
+        } else {
+            ffi::Py_DECREF(result);
+            Ok(())
+        }
+    }
+}
+
+/// Execute a Python callback with `Py<PyAny>` arguments using **vectorcall**.
 ///
-/// - **0 args**: Uses `PyObject_CallNoArgs` (no tuple allocation at all)
-/// - **N args**: Builds a minimal C-API tuple + `PyObject_Call`
+/// - **0 args**: `PyObject_CallNoArgs` (no allocation at all)
+/// - **1-2 args**: Stack array + `PyObject_Vectorcall` (no heap allocation, no tuple)
+/// - **3+ args**: Heap Vec + `PyObject_Vectorcall` (rare, still no tuple overhead)
+///
+/// Vectorcall **borrows** argument references (no INCREF/DECREF per arg),
+/// which is strictly faster than the old `PyTuple_New + SET_ITEM(steal) + PyObject_Call` path.
 #[inline(always)]
 pub unsafe fn call_callback(
     py: Python<'_>,
@@ -143,18 +189,25 @@ pub unsafe fn call_callback(
     args: &[Py<PyAny>],
 ) -> PyResult<()> {
     unsafe {
-        let result = if args.is_empty() {
-            ffi::PyObject_CallNoArgs(callable)
-        } else {
-            let nargs = args.len();
-            let tuple = ffi::PyTuple_New(nargs as ffi::Py_ssize_t);
-            for (i, arg) in args.iter().enumerate() {
-                ffi::Py_INCREF(arg.as_ptr());
-                ffi::PyTuple_SET_ITEM(tuple, i as ffi::Py_ssize_t, arg.as_ptr());
+        let result = match args.len() {
+            0 => ffi::PyObject_CallNoArgs(callable),
+            1 => {
+                let ptrs = [args[0].as_ptr()];
+                ffi::PyObject_Vectorcall(callable, ptrs.as_ptr(), 1, std::ptr::null_mut())
             }
-            let r = ffi::PyObject_Call(callable, tuple, std::ptr::null_mut());
-            ffi::Py_DECREF(tuple);
-            r
+            2 => {
+                let ptrs = [args[0].as_ptr(), args[1].as_ptr()];
+                ffi::PyObject_Vectorcall(callable, ptrs.as_ptr(), 2, std::ptr::null_mut())
+            }
+            n => {
+                let ptrs: Vec<*mut ffi::PyObject> = args.iter().map(|a| a.as_ptr()).collect();
+                ffi::PyObject_Vectorcall(
+                    callable,
+                    ptrs.as_ptr(),
+                    n,
+                    std::ptr::null_mut(),
+                )
+            }
         };
 
         if result.is_null() {
@@ -166,26 +219,33 @@ pub unsafe fn call_callback(
     }
 }
 
-/// Execute a Python callback with arguments, ignoring errors.
-/// Used for timer callbacks where errors are silently dropped.
+/// Execute a Python callback, ignoring errors. Used for timer callbacks.
+/// Same vectorcall optimization as `call_callback`.
 #[inline(always)]
 pub unsafe fn call_callback_ignore_err(
     callable: *mut ffi::PyObject,
     args: &[Py<PyAny>],
 ) {
     unsafe {
-        let result = if args.is_empty() {
-            ffi::PyObject_CallNoArgs(callable)
-        } else {
-            let nargs = args.len();
-            let tuple = ffi::PyTuple_New(nargs as ffi::Py_ssize_t);
-            for (i, arg) in args.iter().enumerate() {
-                ffi::Py_INCREF(arg.as_ptr());
-                ffi::PyTuple_SET_ITEM(tuple, i as ffi::Py_ssize_t, arg.as_ptr());
+        let result = match args.len() {
+            0 => ffi::PyObject_CallNoArgs(callable),
+            1 => {
+                let ptrs = [args[0].as_ptr()];
+                ffi::PyObject_Vectorcall(callable, ptrs.as_ptr(), 1, std::ptr::null_mut())
             }
-            let r = ffi::PyObject_Call(callable, tuple, std::ptr::null_mut());
-            ffi::Py_DECREF(tuple);
-            r
+            2 => {
+                let ptrs = [args[0].as_ptr(), args[1].as_ptr()];
+                ffi::PyObject_Vectorcall(callable, ptrs.as_ptr(), 2, std::ptr::null_mut())
+            }
+            n => {
+                let ptrs: Vec<*mut ffi::PyObject> = args.iter().map(|a| a.as_ptr()).collect();
+                ffi::PyObject_Vectorcall(
+                    callable,
+                    ptrs.as_ptr(),
+                    n,
+                    std::ptr::null_mut(),
+                )
+            }
         };
 
         if result.is_null() {

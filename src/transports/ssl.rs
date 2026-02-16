@@ -19,7 +19,7 @@ use crate::utils::VeloxResult;
 use bytes::BytesMut;
 
 /// SSL/TLS Context for configuring secure connections
-#[pyclass(module = "veloxloop._veloxloop")]
+#[pyclass(module = "veloxloop._veloxloop", skip_from_py_object)]
 #[derive(Clone)]
 pub struct SSLContext {
     client_config: Option<Arc<ClientConfig>>,
