@@ -13,6 +13,7 @@ mod concurrent;
 mod constants;
 mod event_loop;
 mod executor;
+mod ffi_utils;
 mod handles;
 mod policy;
 mod poller;

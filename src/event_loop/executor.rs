@@ -1,13 +1,14 @@
 use crate::constants::{NI_MAXHOST, NI_MAXSERV};
 use crate::event_loop::VeloxLoop;
 use crate::executor::ThreadPoolExecutor;
+use crate::ffi_utils;
 use std::ffi::{CStr, CString};
 use std::mem;
 use std::net::{IpAddr, SocketAddr};
 use std::ptr;
 
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{PyBytes, PyString, PyTuple};
 
 impl VeloxLoop {
     pub fn run_in_executor(
@@ -226,7 +227,8 @@ fn perform_getaddrinfo(
             return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(error_msg));
         }
 
-        let py_list = PyList::empty(py);
+        // Use C API to build the result list - avoids dozens of PyO3 wrapper calls
+        let py_list = ffi_utils::list_new(0);
         let mut current = res;
 
         while !current.is_null() {
@@ -253,25 +255,20 @@ fn perform_getaddrinfo(
                 );
                 let port = u16::from_be(addr.sin_port);
 
-                let fam_py = PyInt::new(py, fam);
-                let stype_py = PyInt::new(py, stype);
-                let proto_py = PyInt::new(py, proto);
-                let canon_py = PyString::new(py, &canonname);
-                let ip_py = PyString::new(py, &ip);
-                let port_py = PyInt::new(py, port);
-                let addr_tuple = PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?;
+                let addr_tuple = ffi_utils::tuple2(
+                    ffi_utils::string_from_str(&ip),
+                    ffi_utils::long_from_u16(port),
+                );
+                let entry = ffi_utils::tuple5(
+                    ffi_utils::long_from_i32(fam),
+                    ffi_utils::long_from_i32(stype),
+                    ffi_utils::long_from_i32(proto),
+                    ffi_utils::string_from_str(&canonname),
+                    addr_tuple,
+                );
 
-                let tuple = PyTuple::new(
-                    py,
-                    vec![
-                        fam_py.as_any(),
-                        stype_py.as_any(),
-                        proto_py.as_any(),
-                        canon_py.as_any(),
-                        addr_tuple.as_any(),
-                    ],
-                )?;
-                py_list.append(tuple)?;
+                ffi_utils::list_append(py_list, entry);
+                pyo3::ffi::Py_DECREF(entry);
             } else if info.ai_family == libc::AF_INET6 {
                 let addr = &*(info.ai_addr as *const libc::sockaddr_in6);
                 let ip_bytes = addr.sin6_addr.s6_addr;
@@ -290,35 +287,22 @@ fn perform_getaddrinfo(
                 let flowinfo = addr.sin6_flowinfo;
                 let scope_id = addr.sin6_scope_id;
 
-                let fam_py = PyInt::new(py, fam);
-                let stype_py = PyInt::new(py, stype);
-                let proto_py = PyInt::new(py, proto);
-                let canon_py = PyString::new(py, &canonname);
-                let ip_py = PyString::new(py, &ip);
-                let port_py = PyInt::new(py, port);
-                let flowinfo_py = PyInt::new(py, flowinfo);
-                let scope_py = PyInt::new(py, scope_id);
-                let addr_tuple = PyTuple::new(
-                    py,
-                    vec![
-                        ip_py.as_any(),
-                        port_py.as_any(),
-                        flowinfo_py.as_any(),
-                        scope_py.as_any(),
-                    ],
-                )?;
+                let addr_tuple = ffi_utils::tuple4(
+                    ffi_utils::string_from_str(&ip),
+                    ffi_utils::long_from_u16(port),
+                    ffi_utils::long_from_u32(flowinfo),
+                    ffi_utils::long_from_u32(scope_id),
+                );
+                let entry = ffi_utils::tuple5(
+                    ffi_utils::long_from_i32(fam),
+                    ffi_utils::long_from_i32(stype),
+                    ffi_utils::long_from_i32(proto),
+                    ffi_utils::string_from_str(&canonname),
+                    addr_tuple,
+                );
 
-                let tuple = PyTuple::new(
-                    py,
-                    vec![
-                        fam_py.as_any(),
-                        stype_py.as_any(),
-                        proto_py.as_any(),
-                        canon_py.as_any(),
-                        addr_tuple.as_any(),
-                    ],
-                )?;
-                py_list.append(tuple)?;
+                ffi_utils::list_append(py_list, entry);
+                pyo3::ffi::Py_DECREF(entry);
             }
 
             current = info.ai_next;
@@ -326,7 +310,7 @@ fn perform_getaddrinfo(
 
         libc::freeaddrinfo(res);
 
-        Ok(py_list.into())
+        Ok(Py::from_owned_ptr(py, py_list))
     }
 }
 
@@ -391,16 +375,16 @@ fn perform_getnameinfo(py: Python<'_>, addr: &str, port: u16, flags: i32) -> PyR
         }
 
         let hostname = CStr::from_ptr(host.as_ptr() as *const libc::c_char)
-            .to_string_lossy()
-            .to_string();
+            .to_string_lossy();
         let servname = CStr::from_ptr(serv.as_ptr() as *const libc::c_char)
-            .to_string_lossy()
-            .to_string();
+            .to_string_lossy();
 
-        let host_py = PyString::new(py, &hostname);
-        let serv_py = PyString::new(py, &servname);
-        let result_tuple = PyTuple::new(py, vec![host_py.as_any(), serv_py.as_any()])?;
+        // Use C API to build the result tuple directly
+        let result_tuple = ffi_utils::tuple2(
+            ffi_utils::string_from_str(&hostname),
+            ffi_utils::string_from_str(&servname),
+        );
 
-        Ok(result_tuple.into())
+        Ok(Py::from_owned_ptr(py, result_tuple))
     }
 }

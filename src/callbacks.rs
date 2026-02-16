@@ -1,11 +1,12 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyInt, PyString, PyTuple};
+use pyo3::types::PyTuple;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
 use crate::concurrent::ConcurrentCallbackQueue;
 use crate::constants::{STACK_BUF_SIZE, get_socket};
 use crate::event_loop::VeloxLoop;
+use crate::ffi_utils;
 
 use crate::transports::future::PendingFuture;
 use crate::transports::ssl::SSLContext;
@@ -300,8 +301,8 @@ impl SockAcceptCallback {
                 let socket_module = get_socket(py).bind(py);
                 let py_socket = socket_module.call_method1("fromfd", (client_fd, 2, 1))?; // AF_INET=2, SOCK_STREAM=1
 
-                // Parse address
-                let addr_tuple = if addr_len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
+                // Parse address using C API for tuple creation
+                let addr_tuple_ptr = if addr_len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
                     let addr_in = &*((&addr) as *const _ as *const libc::sockaddr_in);
                     let is_ipv4 = addr_in.sin_family == libc::AF_INET as u16;
                     if is_ipv4 {
@@ -314,27 +315,38 @@ impl SockAcceptCallback {
                             (ip >> 8) & 0xff,
                             ip & 0xff
                         );
-                        let ip_py = PyString::new(py, &ip_str);
-                        let port_py = PyInt::new(py, port);
-                        PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
+                        ffi_utils::tuple2(
+                            ffi_utils::string_from_str(&ip_str),
+                            ffi_utils::long_from_u16(port),
+                        )
                     } else {
-                        let ip_py = PyString::new(py, "");
-                        let port_py = PyInt::new(py, 0);
-                        PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
+                        ffi_utils::tuple2(
+                            ffi_utils::string_from_str(""),
+                            ffi_utils::long_from_i32(0),
+                        )
                     }
                 } else {
-                    let ip_py = PyString::new(py, "");
-                    let port_py = PyInt::new(py, 0);
-                    PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
+                    ffi_utils::tuple2(
+                        ffi_utils::string_from_str(""),
+                        ffi_utils::long_from_i32(0),
+                    )
                 };
 
-                // Return tuple (socket, address)
-                let result = PyTuple::new(py, vec![py_socket.as_any(), addr_tuple.as_any()])?;
+                // Return tuple (socket, address) using C API
+                let result_ptr = ffi_utils::tuple2(
+                    {
+                        // Borrow the py_socket ptr with an INCREF since tuple steals ref
+                        pyo3::ffi::Py_INCREF(py_socket.as_ptr());
+                        py_socket.as_ptr()
+                    },
+                    addr_tuple_ptr,
+                );
+                let result: Py<PyAny> = Py::from_owned_ptr(py, result_ptr);
 
                 self.future
                     .bind(py)
                     .borrow()
-                    .set_result(py, result.into())?;
+                    .set_result(py, result)?;
                 self.loop_.bind(py).borrow().remove_reader(py, self.fd)?;
             } else {
                 let err = std::io::Error::last_os_error();
@@ -385,9 +397,9 @@ impl SockRecvCallback {
                 );
 
                 if n >= 0 {
-                    // Create PyBytes directly from stack slice - no heap allocation!
-                    let bytes = PyBytes::new(py, &buf[..n as usize]);
-                    self.future.bind(py).borrow().set_result(py, bytes.into())?;
+                    // C API: avoid PyBytes::new() wrapper overhead
+                    let bytes = ffi_utils::bytes_from_slice(py, &buf[..n as usize]);
+                    self.future.bind(py).borrow().set_result(py, bytes)?;
                     self.loop_.bind(py).borrow().remove_reader(py, self.fd)?;
                 } else {
                     let err = std::io::Error::last_os_error();
@@ -414,8 +426,8 @@ impl SockRecvCallback {
 
                 if n >= 0 {
                     buf.truncate(n as usize);
-                    let bytes = PyBytes::new(py, &buf);
-                    self.future.bind(py).borrow().set_result(py, bytes.into())?;
+                    let bytes = ffi_utils::bytes_from_slice(py, &buf);
+                    self.future.bind(py).borrow().set_result(py, bytes)?;
                     self.loop_.bind(py).borrow().remove_reader(py, self.fd)?;
                 } else {
                     let err = std::io::Error::last_os_error();
@@ -520,9 +532,8 @@ pub struct SockConnectCallback {
 #[pymethods]
 impl SockConnectCallback {
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
-        self.future
-            .bind(py)
-            .call_method1("set_result", (py.None(),))?;
+        // Call Rust method directly instead of going through Python dispatch
+        self.future.bind(py).borrow().set_result(py, py.None())?;
         Ok(())
     }
 }

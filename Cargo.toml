@@ -13,7 +13,7 @@ name = "_veloxloop"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.27.2", features = [] }
+pyo3 = { version = "0.28.1", features = [] }
 mimalloc = { version = "0.1.48", optional = true }
 thiserror = "2.0.17"
 parking_lot = "0.12"
@@ -38,8 +38,7 @@ crossbeam-utils = "0.8"
 # Lock-free concurrent data structures
 dashmap = "6"
 
-# High-precision timing for hierarchical timing wheel
-quanta = "0.12"
+# Timer entry storage
 slab = "0.4"
 
 # io-uring for Linux (replaces polling crate for best performance)
@@ -53,7 +52,7 @@ winapi = { version = "0.3", features = ["winsock2", "ws2def", "ws2tcpip"] }
 tikv-jemallocator = { version = "0.6.1", default-features = false, features = ["disable_initial_exec_tls"] }
 
 [build-dependencies]
-pyo3-build-config = "0.27.2"
+pyo3-build-config = "0.28.1"
 
 [features]
 default = []

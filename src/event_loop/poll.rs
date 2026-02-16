@@ -3,8 +3,7 @@ use crate::handles::{Handle, IoCallback};
 use crate::poller::{PlatformEvent, PollerEvent};
 use crate::utils::VeloxResult;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
-use std::os::fd::RawFd;
+use pyo3::types::PyDict;
 use std::time::Duration;
 
 /// Platform events - on all platforms we use native events
@@ -59,14 +58,17 @@ impl VeloxLoop {
             Err(e) => return Err(e),
         }
 
-        // Process Timers
+        // Process Timers - use C API for callback invocation (no PyTuple allocation)
         let now_ns = (self.time() * 1_000_000_000.0) as u64;
         let expired = self.timers.borrow_mut().pop_expired(now_ns, 0);
         for entry in expired {
-            let _ = entry
-                .callback
-                .bind(py)
-                .call(PyTuple::new(py, entry.args)?, None);
+            // Use C API: avoids PyTuple::new() overhead and trait dispatch
+            unsafe {
+                crate::ffi_utils::call_callback_ignore_err(
+                    entry.callback.as_ptr(),
+                    &entry.args,
+                );
+            }
         }
 
         // Process Callbacks (call_soon) - lock-free drain via crossbeam
@@ -75,12 +77,14 @@ impl VeloxLoop {
         self.callbacks.swap_into(&mut *cb_batch);
 
         for cb in cb_batch.drain(..) {
-            if let Err(e) = cb.callback.bind(py).call(PyTuple::new(py, cb.args)?, None) {
-                // If callback fails, log and continue or handle exception
-                let context = PyDict::new(py);
-                context.set_item("message", "Exception in callback")?;
-                context.set_item("exception", e.value(py))?;
-                self.call_exception_handler(py, context.unbind())?;
+            // Use C API: for 0-arg case uses PyObject_CallNoArgs (no tuple at all)
+            unsafe {
+                if let Err(e) = crate::ffi_utils::call_callback(py, cb.callback.as_ptr(), &cb.args) {
+                    let context = PyDict::new(py);
+                    context.set_item("message", "Exception in callback")?;
+                    context.set_item("exception", e.value(py))?;
+                    self.call_exception_handler(py, context.unbind())?;
+                }
             }
         }
 
@@ -113,21 +117,16 @@ impl VeloxLoop {
                 return Ok(());
             }
 
-            // Clone callbacks to avoid borrow issues
-            let callbacks: Vec<(RawFd, Option<Handle>, Option<Handle>)> = {
+            // Clone callbacks to avoid borrow issues - direct extraction, no Vec needed
+            let (r_cb, w_cb) = {
                 let handles = self.handles.borrow();
-                events
-                    .iter()
-                    .map(|ev| (ev.fd, handles.get_reader(ev.fd), handles.get_writer(ev.fd)))
-                    .collect()
+                (handles.get_reader(fd), handles.get_writer(fd))
             };
-            for (_, r_cb, w_cb) in callbacks {
-                if let Some(cb) = r_cb {
-                    cb.execute(py)?;
-                }
-                if let Some(cb) = w_cb {
-                    cb.execute(py)?;
-                }
+            if let Some(cb) = r_cb {
+                cb.execute(py)?;
+            }
+            if let Some(cb) = w_cb {
+                cb.execute(py)?;
             }
             // Re-arm the FD for io-uring (poll_add is oneshot)
             // may have removed themselves (e.g., oneshot sock_recv callbacks)
@@ -169,13 +168,19 @@ impl VeloxLoop {
             for event in events.iter() {
                 let fd = event.fd;
                 if let Some((r_handle, w_handle)) = handles.get_state_owned(fd) {
+                    // Save is_some state before filter() consumes the Option
+                    let has_reader = r_handle.is_some();
+                    let has_writer = w_handle.is_some();
+
+                    // Use .filter() on owned Option<Handle> - avoids second clone
+                    // that was previously done by .as_ref().filter().cloned()
                     let reader_cb = if event.readable {
-                        r_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                        r_handle.filter(|h| !h.cancelled)
                     } else {
                         None
                     };
                     let writer_cb = if event.writable {
-                        w_handle.as_ref().filter(|h| !h.cancelled).cloned()
+                        w_handle.filter(|h| !h.cancelled)
                     } else {
                         None
                     };
@@ -184,8 +189,8 @@ impl VeloxLoop {
                         fd,
                         reader_cb,
                         writer_cb,
-                        r_handle.is_some(),
-                        w_handle.is_some(),
+                        has_reader,
+                        has_writer,
                     ));
                 }
             }
@@ -193,13 +198,14 @@ impl VeloxLoop {
 
         let mut python_callbacks: Vec<Handle> = Vec::new();
 
-        for (fd, r_h, w_h, _has_r, _has_w) in pending.iter() {
+        // Use drain() to consume pending_ios, moving handles instead of cloning
+        for (fd, r_h, w_h, _has_r, _has_w) in pending.drain(..) {
             if let Some(h) = r_h {
                 match &h.callback {
                     IoCallback::Native(cb) => {
                         let _ = cb(py);
                     } // Native first, no GIL hold
-                    _ => python_callbacks.push(h.clone()), // Batch Python
+                    _ => python_callbacks.push(h), // Move instead of clone
                 }
             }
             if let Some(h) = w_h {
@@ -207,7 +213,7 @@ impl VeloxLoop {
                     IoCallback::Native(cb) => {
                         let _ = cb(py);
                     }
-                    _ => python_callbacks.push(h.clone()),
+                    _ => python_callbacks.push(h), // Move instead of clone
                 }
             }
 
@@ -216,12 +222,12 @@ impl VeloxLoop {
             // may have removed themselves (e.g., oneshot sock_recv callbacks)
             let (still_has_reader, still_has_writer) = {
                 let handles = self.handles.borrow();
-                handles.get_states(*fd)
+                handles.get_states(fd)
             };
 
             if still_has_reader || still_has_writer {
-                let ev = PollerEvent::new(*fd as usize, still_has_reader, still_has_writer);
-                let _ = self.poller.borrow_mut().rearm_oneshot(*fd, ev);
+                let ev = PollerEvent::new(fd as usize, still_has_reader, still_has_writer);
+                let _ = self.poller.borrow_mut().rearm_oneshot(fd, ev);
             }
         }
         // Execute batched Python callbacks at end (one GIL hold)

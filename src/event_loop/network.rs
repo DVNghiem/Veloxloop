@@ -4,12 +4,13 @@ use crate::callbacks::{
 };
 use crate::constants::{STACK_BUF_SIZE, get_socket};
 use crate::event_loop::VeloxLoop;
+use crate::ffi_utils;
 use crate::transports::future::{CompletedFuture, PendingFuture};
 use crate::transports::tcp::TcpServer;
 use crate::transports::udp::UdpTransport;
 use crate::transports::{DefaultTransportFactory, TransportFactory};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyInt, PyString, PyTuple};
+use pyo3::types::{PyDict, PyTuple};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
@@ -111,7 +112,8 @@ impl VeloxLoop {
                     libc::fcntl(client_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
                 }
 
-                let addr_tuple = if addr_len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
+                // Use C API for address tuple creation
+                let addr_tuple_ptr = if addr_len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
                     let addr_in = &*((&addr) as *const _ as *const libc::sockaddr_in);
                     let is_ipv4 = addr_in.sin_family == libc::AF_INET as u16;
 
@@ -124,24 +126,34 @@ impl VeloxLoop {
                             (ip >> 8) & 0xff,
                             ip & 0xff
                         );
-                        let ip_py = PyString::new(py, &ip_str);
-                        let port_py = PyInt::new(py, u16::from_be(addr_in.sin_port));
-                        PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
+                        ffi_utils::tuple2(
+                            ffi_utils::string_from_str(&ip_str),
+                            ffi_utils::long_from_u16(u16::from_be(addr_in.sin_port)),
+                        )
                     } else {
-                        let ip_py = PyString::new(py, "");
-                        let port_py = PyInt::new(py, 0);
-                        PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
+                        ffi_utils::tuple2(
+                            ffi_utils::string_from_str(""),
+                            ffi_utils::long_from_i32(0),
+                        )
                     }
                 } else {
-                    let ip_py = PyString::new(py, "");
-                    let port_py = PyInt::new(py, 0);
-                    PyTuple::new(py, vec![ip_py.as_any(), port_py.as_any()])?
+                    ffi_utils::tuple2(
+                        ffi_utils::string_from_str(""),
+                        ffi_utils::long_from_i32(0),
+                    )
                 };
 
-                let result = PyTuple::new(py, vec![client_sock.as_any(), addr_tuple.as_any()])?;
+                let result_ptr = ffi_utils::tuple2(
+                    {
+                        pyo3::ffi::Py_INCREF(client_sock.as_ptr());
+                        client_sock.as_ptr()
+                    },
+                    addr_tuple_ptr,
+                );
+                let result: Py<PyAny> = Py::from_owned_ptr(py, result_ptr);
 
                 let fut = PendingFuture::new();
-                fut.set_result(py, result.into())?;
+                fut.set_result(py, result)?;
                 return Ok(Py::new(py, fut)?.into_any());
             }
 
@@ -186,12 +198,12 @@ impl VeloxLoop {
                 let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
 
                 if n > 0 {
-                    let bytes = PyBytes::new(py, &buf[..n as usize]);
-                    let fut = CompletedFuture::new(bytes.into_any().unbind());
+                    let bytes = ffi_utils::bytes_from_slice(py, &buf[..n as usize]);
+                    let fut = CompletedFuture::new(bytes);
                     return Ok(Py::new(py, fut)?.into_any());
                 } else if n == 0 {
-                    let bytes = PyBytes::new(py, &[]);
-                    let fut = CompletedFuture::new(bytes.into_any().unbind());
+                    let bytes = ffi_utils::bytes_from_slice(py, &[]);
+                    let fut = CompletedFuture::new(bytes);
                     return Ok(Py::new(py, fut)?.into_any());
                 }
 
@@ -211,12 +223,12 @@ impl VeloxLoop {
 
                 if n > 0 {
                     buf.truncate(n as usize);
-                    let bytes = PyBytes::new(py, &buf);
-                    let fut = CompletedFuture::new(bytes.into_any().unbind());
+                    let bytes = ffi_utils::bytes_from_slice(py, &buf);
+                    let fut = CompletedFuture::new(bytes);
                     return Ok(Py::new(py, fut)?.into_any());
                 } else if n == 0 {
-                    let bytes = PyBytes::new(py, &[]);
-                    let fut = CompletedFuture::new(bytes.into_any().unbind());
+                    let bytes = ffi_utils::bytes_from_slice(py, &[]);
+                    let fut = CompletedFuture::new(bytes);
                     return Ok(Py::new(py, fut)?.into_any());
                 }
 
@@ -249,11 +261,11 @@ impl VeloxLoop {
                     };
 
                     if n > 0 {
-                        let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
-                        let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                        let bytes = unsafe { crate::ffi_utils::bytes_from_slice(py, &buf[..n as usize]) };
+                        let _ = future_clone.bind(py).borrow().set_result(py, bytes);
                     } else if n == 0 {
-                        let bytes = pyo3::types::PyBytes::new(py, &[]);
-                        let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                        let bytes = unsafe { crate::ffi_utils::bytes_from_slice(py, &[]) };
+                        let _ = future_clone.bind(py).borrow().set_result(py, bytes);
                     } else {
                         let err = std::io::Error::last_os_error();
                         if err.kind() != std::io::ErrorKind::WouldBlock
@@ -265,8 +277,8 @@ impl VeloxLoop {
                             let exc_val = py_err.value(py).as_any().clone().unbind();
                             let _ = future_clone.bind(py).borrow().set_exception(py, exc_val);
                         } else if err.raw_os_error() == Some(libc::EBADF) {
-                            let bytes = pyo3::types::PyBytes::new(py, &[]);
-                            let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                            let bytes = unsafe { crate::ffi_utils::bytes_from_slice(py, &[]) };
+                            let _ = future_clone.bind(py).borrow().set_result(py, bytes);
                         }
                     }
                     Ok(())
@@ -296,11 +308,11 @@ impl VeloxLoop {
                     let _ = loop_ref.bind(py).borrow().remove_reader(py, fd);
 
                     if n > 0 {
-                        let bytes = pyo3::types::PyBytes::new(py, &buf[..n as usize]);
-                        let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                        let bytes = unsafe { crate::ffi_utils::bytes_from_slice(py, &buf[..n as usize]) };
+                        let _ = future_clone.bind(py).borrow().set_result(py, bytes);
                     } else if n == 0 {
-                        let bytes = pyo3::types::PyBytes::new(py, &[]);
-                        let _ = future_clone.bind(py).borrow().set_result(py, bytes.into());
+                        let bytes = unsafe { crate::ffi_utils::bytes_from_slice(py, &[]) };
+                        let _ = future_clone.bind(py).borrow().set_result(py, bytes);
                     } else {
                         let err = std::io::Error::last_os_error();
                         if err.kind() != std::io::ErrorKind::WouldBlock

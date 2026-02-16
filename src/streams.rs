@@ -1,4 +1,5 @@
 use crate::buffer_pool::BufferPool;
+use crate::ffi_utils;
 use crate::{
     constants::{DEFAULT_HIGH, DEFAULT_LIMIT, DEFAULT_LOW},
     transports::future::PendingFuture,
@@ -166,10 +167,10 @@ impl StreamReader {
             }
         }
 
-        // Dispatch results outside lock
+        // Dispatch results outside lock - use C API for PyBytes to reduce overhead
         for (future, data) in ready_waiters {
-            let bytes = PyBytes::new(py, &data);
-            future.bind(py).borrow().set_result(py, bytes.into())?;
+            let bytes = unsafe { ffi_utils::bytes_from_slice(py, &data) };
+            future.bind(py).borrow().set_result(py, bytes)?;
         }
 
         for (future, msg) in error_waiters {
@@ -441,10 +442,8 @@ pub trait StreamWriterProxy: Send + Sync {
 pub struct StreamWriter {
     /// Internal write buffer (shared with transport)
     pub(crate) buffer: Arc<Mutex<BytesMut>>,
-    /// Closed flag
-    pub(crate) closed: Arc<Mutex<bool>>,
-    /// Closing flag
-    pub(crate) closing: Arc<Mutex<bool>>,
+    /// Combined closed/closing flags - single lock instead of two
+    pub(crate) flags: Arc<Mutex<WriterFlags>>,
     /// High water mark for flow control
     pub(crate) high_water: usize,
     /// Low water mark for flow control
@@ -457,6 +456,12 @@ pub struct StreamWriter {
     pub(crate) proxy: Arc<Mutex<Option<Arc<dyn StreamWriterProxy>>>>,
 }
 
+/// Combined writer state flags to reduce lock count
+pub(crate) struct WriterFlags {
+    pub closed: bool,
+    pub closing: bool,
+}
+
 #[pymethods]
 impl StreamWriter {
     #[new]
@@ -467,8 +472,7 @@ impl StreamWriter {
 
         Self {
             buffer: Arc::new(Mutex::new(BytesMut::with_capacity(high))),
-            closed: Arc::new(Mutex::new(false)),
-            closing: Arc::new(Mutex::new(false)),
+            flags: Arc::new(Mutex::new(WriterFlags { closed: false, closing: false })),
             high_water: high,
             low_water: low,
             drain_waiters: Arc::new(Mutex::new(Vec::new())),
@@ -484,16 +488,18 @@ impl StreamWriter {
 
     /// Write data to the buffer and trigger transport write
     pub fn write(&self, py: Python<'_>, data: &[u8]) -> PyResult<()> {
-        if *self.closed.lock() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Writer is closed",
-            ));
-        }
-
-        if *self.closing.lock() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                "Writer is closing",
-            ));
+        {
+            let flags = self.flags.lock();
+            if flags.closed {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Writer is closed",
+                ));
+            }
+            if flags.closing {
+                return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                    "Writer is closing",
+                ));
+            }
         }
 
         // Add data to buffer
@@ -546,13 +552,14 @@ impl StreamWriter {
 
     /// Mark the writer as closing
     pub fn close(&self) -> PyResult<()> {
-        *self.closing.lock() = true;
+        self.flags.lock().closing = true;
         Ok(())
     }
 
     /// Check if transport is closing
     pub fn is_closing(&self) -> bool {
-        *self.closing.lock() || *self.closed.lock()
+        let f = self.flags.lock();
+        f.closing || f.closed
     }
 
     /// Check if the buffer needs draining (above high water mark)
@@ -578,17 +585,18 @@ impl StreamWriter {
 
     /// Check if can write EOF
     pub fn can_write_eof(&self) -> bool {
-        !*self.closed.lock()
+        !self.flags.lock().closed
     }
 
     /// Write EOF (mark as closed)
     pub fn write_eof(&self) -> PyResult<()> {
-        if *self.closed.lock() {
+        let mut f = self.flags.lock();
+        if f.closed {
             return Err(pyo3::exceptions::PyRuntimeError::new_err("Already closed"));
         }
 
-        *self.closed.lock() = true;
-        *self.closing.lock() = true;
+        f.closed = true;
+        f.closing = true;
         Ok(())
     }
 

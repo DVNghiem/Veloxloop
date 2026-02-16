@@ -1022,8 +1022,8 @@ impl TcpTransport {
                     }
                 }
                 Ok(n) => {
-                    // OPTIMIZATION 4: Zero-copy PyBytes with GIL
-                    let py_data = PyBytes::new(py, &buf[..n]);
+                    // OPTIMIZATION 4: Zero-copy PyBytes with C API (skip PyO3 wrapper)
+                    let py_data = unsafe { crate::ffi_utils::bytes_from_slice(py, &buf[..n]) };
                     protocol_py.call_method1(py, "data_received", (py_data,))?;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}

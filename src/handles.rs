@@ -13,13 +13,16 @@ pub enum IoCallback {
 }
 
 impl Clone for IoCallback {
+    /// Clone using Python::attach to get the GIL token needed for clone_ref.
+    /// PyO3 0.28 requires a Python token for Py<T> cloning (Py_INCREF).
+    #[inline]
     fn clone(&self) -> Self {
-        match self {
-            IoCallback::Python(cb) => Python::attach(|py| IoCallback::Python(cb.clone_ref(py))),
+        Python::attach(|py| match self {
+            IoCallback::Python(cb) => IoCallback::Python(cb.clone_ref(py)),
             IoCallback::Native(cb) => IoCallback::Native(cb.clone()),
-            IoCallback::TcpRead(cb) => Python::attach(|py| IoCallback::TcpRead(cb.clone_ref(py))),
-            IoCallback::TcpWrite(cb) => Python::attach(|py| IoCallback::TcpWrite(cb.clone_ref(py))),
-        }
+            IoCallback::TcpRead(cb) => IoCallback::TcpRead(cb.clone_ref(py)),
+            IoCallback::TcpWrite(cb) => IoCallback::TcpWrite(cb.clone_ref(py)),
+        })
     }
 }
 

@@ -143,7 +143,7 @@ impl StreamTransport {
                                     self._force_close_internal(py)?;
                                     // Notify StreamWriter it is closed
                                     let writer = self.writer.bind(py).borrow();
-                                    *writer.closed.lock() = true;
+                                    writer.flags.lock().closed = true;
                                 }
                                 break;
                             }
