@@ -2,12 +2,19 @@ use crate::callbacks::{
     AsyncConnectCallback, RemoveWriterCallback, SendfileCallback, SockAcceptCallback,
     SockConnectCallback,
 };
-use crate::constants::{STACK_BUF_SIZE, get_socket};
+use crate::constants::{RECV_BUF_SIZE, get_socket};
 use crate::event_loop::VeloxLoop;
 use crate::ffi_utils;
 use crate::transports::future::{CompletedFuture, PendingFuture};
 use crate::transports::tcp::TcpServer;
 use crate::transports::udp::UdpTransport;
+use std::cell::RefCell;
+
+thread_local! {
+    /// Reusable recv buffer — avoids heap allocation per sock_recv call.
+    /// 256KB matches the transport read buffer size.
+    static SOCK_RECV_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; RECV_BUF_SIZE]);
+}
 use crate::transports::{DefaultTransportFactory, TransportFactory};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
@@ -180,9 +187,11 @@ impl VeloxLoop {
     }
 
     #[inline(always)]
-    pub fn sock_recv(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
+    /// Fast-path synchronous recv attempt.
+    /// Returns Python bytes if data is available, None if WouldBlock.
+    /// Called from Python `async def sock_recv()` wrapper to avoid CompletedFuture overhead.
+    pub fn sock_recv_try(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
         let py = slf.py();
-        let self_ = slf.borrow();
 
         let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
 
@@ -192,56 +201,64 @@ impl VeloxLoop {
             ));
         }
 
-        if nbytes <= STACK_BUF_SIZE {
-            let mut buf = [0u8; STACK_BUF_SIZE];
-            unsafe {
-                let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
-
-                if n > 0 {
-                    let bytes = ffi_utils::bytes_from_slice(py, &buf[..n as usize]);
-                    let fut = CompletedFuture::new(bytes);
-                    return Ok(Py::new(py, fut)?.into_any());
-                } else if n == 0 {
-                    let bytes = ffi_utils::bytes_from_slice(py, &[]);
-                    let fut = CompletedFuture::new(bytes);
-                    return Ok(Py::new(py, fut)?.into_any());
+        // Use thread-local buffer for all sizes up to RECV_BUF_SIZE (256KB)
+        if nbytes <= RECV_BUF_SIZE {
+            let result = SOCK_RECV_BUF.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                unsafe {
+                    let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
+                    if n > 0 {
+                        Ok(Some(ffi_utils::bytes_from_slice(py, &buf[..n as usize])))
+                    } else if n == 0 {
+                        Ok(Some(ffi_utils::bytes_from_slice(py, &[])))
+                    } else {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() != std::io::ErrorKind::WouldBlock
+                            && err.raw_os_error() != Some(libc::EAGAIN)
+                        {
+                            Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string()))
+                        } else {
+                            Ok(None) // WouldBlock — caller will use sock_recv_wait
+                        }
+                    }
                 }
+            })?;
 
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::WouldBlock
-                    && err.raw_os_error() != Some(libc::EAGAIN)
-                {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        err.to_string(),
-                    ));
-                }
+            match result {
+                Some(bytes) => Ok(bytes),
+                None => Ok(py.None()),
             }
         } else {
+            // Very large request — heap allocate (rare path)
             let mut buf = vec![0u8; nbytes];
             unsafe {
                 let n = libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0);
-
                 if n > 0 {
-                    buf.truncate(n as usize);
-                    let bytes = ffi_utils::bytes_from_slice(py, &buf);
-                    let fut = CompletedFuture::new(bytes);
-                    return Ok(Py::new(py, fut)?.into_any());
+                    let bytes = ffi_utils::bytes_from_slice(py, &buf[..n as usize]);
+                    Ok(bytes)
                 } else if n == 0 {
-                    let bytes = ffi_utils::bytes_from_slice(py, &[]);
-                    let fut = CompletedFuture::new(bytes);
-                    return Ok(Py::new(py, fut)?.into_any());
-                }
-
-                let err = std::io::Error::last_os_error();
-                if err.kind() != std::io::ErrorKind::WouldBlock
-                    && err.raw_os_error() != Some(libc::EAGAIN)
-                {
-                    return Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(
-                        err.to_string(),
-                    ));
+                    Ok(ffi_utils::bytes_from_slice(py, &[]))
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::WouldBlock
+                        && err.raw_os_error() != Some(libc::EAGAIN)
+                    {
+                        Err(PyErr::new::<pyo3::exceptions::PyOSError, _>(err.to_string()))
+                    } else {
+                        Ok(py.None())
+                    }
                 }
             }
         }
+    }
+
+    /// Async wait path for sock_recv — registers io_uring/epoll watcher.
+    /// Only called when sock_recv_try returned None (WouldBlock).
+    pub fn sock_recv_wait(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+        let self_ = slf.borrow();
+
+        let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
 
         let future = self_.create_future(py)?;
         let loop_ref = slf.clone().unbind();
@@ -249,15 +266,15 @@ impl VeloxLoop {
 
         #[cfg(target_os = "linux")]
         {
+            let recv_buf = Arc::new(std::sync::Mutex::new(vec![0u8; nbytes]));
             let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> =
                 Arc::new(move |py: Python<'_>| {
                     loop_ref.bind(py).borrow().mark_oneshot_disabled(fd);
 
-                    let mut buf = [0u8; 65536];
-                    let read_size = nbytes.min(65536);
+                    let mut buf = recv_buf.lock().unwrap();
 
                     let n = unsafe {
-                        libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0)
+                        libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0)
                     };
 
                     if n > 0 {
@@ -292,17 +309,17 @@ impl VeloxLoop {
             let handled = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let handled_clone = handled.clone();
 
+            let recv_buf = Arc::new(std::sync::Mutex::new(vec![0u8; nbytes]));
             let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> =
                 Arc::new(move |py: Python<'_>| {
                     if handled_clone.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         return Ok(());
                     }
 
-                    let mut buf = [0u8; 65536];
-                    let read_size = nbytes.min(65536);
+                    let mut buf = recv_buf.lock().unwrap();
 
                     let n = unsafe {
-                        libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, read_size, 0)
+                        libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, nbytes, 0)
                     };
 
                     let _ = loop_ref.bind(py).borrow().remove_reader(py, fd);
@@ -331,6 +348,23 @@ impl VeloxLoop {
         }
 
         Ok(future.into_any())
+    }
+
+    /// Legacy sock_recv that returns CompletedFuture/PendingFuture.
+    /// Kept for backward compatibility. The Python wrapper uses sock_recv_try/sock_recv_wait instead.
+    pub fn sock_recv(slf: &Bound<'_, Self>, sock: Py<PyAny>, nbytes: usize) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+
+        // Try synchronous fast path
+        let result = Self::sock_recv_try(slf, sock.clone_ref(py), nbytes)?;
+        if !result.is_none(py) {
+            // Data ready — wrap in CompletedFuture for legacy callers
+            let fut = CompletedFuture::new(result);
+            return Ok(Py::new(py, fut)?.into_any());
+        }
+
+        // Async path
+        Self::sock_recv_wait(slf, sock, nbytes)
     }
 
     pub fn sendfile(
@@ -431,26 +465,25 @@ impl VeloxLoop {
         Ok(future.into_any())
     }
 
-    pub fn sock_sendall(
+    /// Fast-path synchronous sendall attempt.
+    /// Returns true if all data was sent, false if WouldBlock (caller should use sock_sendall_wait).
+    /// Key optimization: uses the borrowed &[u8] directly — no data.to_vec() on fast path.
+    pub fn sock_sendall_try(
         slf: &Bound<'_, Self>,
         sock: Py<PyAny>,
         data: &[u8],
     ) -> PyResult<Py<PyAny>> {
-        use std::sync::Mutex;
-
         let py = slf.py();
-        let self_ = slf.borrow();
 
         let fd: RawFd = sock.getattr(py, "fileno")?.call0(py)?.extract(py)?;
-        let data_vec = data.to_vec();
 
         let mut total_sent = 0;
-        while total_sent < data_vec.len() {
+        while total_sent < data.len() {
             unsafe {
                 let n = libc::send(
                     fd,
-                    data_vec[total_sent..].as_ptr() as *const libc::c_void,
-                    data_vec.len() - total_sent,
+                    data[total_sent..].as_ptr() as *const libc::c_void,
+                    data.len() - total_sent,
                     0,
                 );
 
@@ -471,15 +504,17 @@ impl VeloxLoop {
             }
         }
 
-        if total_sent == data_vec.len() {
-            let fut = CompletedFuture::new(py.None());
-            return Ok(Py::new(py, fut)?.into_any());
+        if total_sent == data.len() {
+            // All sent synchronously — no copy needed!
+            return Ok(py.None());
         }
 
+        // Partial send — need async completion. Copy only the REMAINING data.
+        let self_ = slf.borrow();
         let future = self_.create_future(py)?;
         let loop_ref = slf.clone().unbind();
-        let remaining_data = Arc::new(Mutex::new(data_vec[total_sent..].to_vec()));
-        let sent_counter = Arc::new(Mutex::new(0usize));
+        let remaining_data = Arc::new(std::sync::Mutex::new(data[total_sent..].to_vec()));
+        let sent_counter = Arc::new(std::sync::Mutex::new(0usize));
         let future_clone = future.clone_ref(py);
 
         let native_callback: Arc<dyn Fn(Python<'_>) -> PyResult<()> + Send + Sync> =
@@ -524,7 +559,28 @@ impl VeloxLoop {
 
         self_.add_writer_native(fd, native_callback)?;
 
+        // Return the PendingFuture — Python wrapper will `await` it
         Ok(future.into_any())
+    }
+
+    /// Legacy sock_sendall — kept for backward compatibility.
+    pub fn sock_sendall(
+        slf: &Bound<'_, Self>,
+        sock: Py<PyAny>,
+        data: &[u8],
+    ) -> PyResult<Py<PyAny>> {
+        let py = slf.py();
+
+        let result = Self::sock_sendall_try(slf, sock.clone_ref(py), data)?;
+
+        // Check if None (all sent) or a PendingFuture
+        if result.is_none(py) {
+            let fut = CompletedFuture::new(py.None());
+            return Ok(Py::new(py, fut)?.into_any());
+        }
+
+        // It's a PendingFuture — return as-is
+        Ok(result)
     }
 
     pub fn create_connection(

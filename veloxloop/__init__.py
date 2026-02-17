@@ -89,6 +89,21 @@ class VeloxLoop(_VeloxLoopImpl, asyncio.AbstractEventLoop):
         # So we don't need to do anything here
         pass
 
+    async def sock_recv(self, sock, nbytes):
+        """Receive data from socket — fast-path avoids Future creation."""
+        data = self._sock_recv_try(sock, nbytes)
+        if data is not None:
+            return data
+        return await self._sock_recv_wait(sock, nbytes)
+
+    async def sock_sendall(self, sock, data):
+        """Send all data to socket — fast-path avoids data copy and Future creation."""
+        result = self._sock_sendall_try(sock, data)
+        if result is None:
+            return
+        # result is a PendingFuture for async completion
+        return await result
+
 
 class VeloxTimerHandle(asyncio.TimerHandle):
     """A TimerHandle for VeloxLoop that integrates with Rust timers."""

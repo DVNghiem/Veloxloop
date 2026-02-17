@@ -11,12 +11,18 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::buffer_pool::BufferPool;
-use crate::constants::{BUF_SIZE, DEFAULT_HIGH, DEFAULT_LOW};
+use crate::constants::{DEFAULT_HIGH, DEFAULT_LOW, RECV_BUF_SIZE};
 use crate::event_loop::VeloxLoop;
 use crate::transports::DefaultTransportFactory;
 
 use super::future::{CompletedFuture, PendingFuture};
 use super::{StreamTransport, Transport, TransportFactory, TransportState};
+
+// Thread-local 256KB read buffer — eliminates per-read allocation,
+// reads 100KB+ messages in a single syscall instead of 7× 16KB chunks.
+thread_local! {
+    static RECV_BUF: RefCell<Vec<u8>> = RefCell::new(vec![0u8; RECV_BUF_SIZE]);
+}
 
 #[pyclass(module = "veloxloop._veloxloop")]
 pub struct SocketWrapper {
@@ -471,21 +477,29 @@ impl crate::transports::StreamTransport for TcpTransport {
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
 
         if let Some(mut stream) = self.stream.as_ref() {
-            match stream.write(slice) {
-                Ok(n) if n == len => {
-                    // All written
-                }
-                Ok(n) => {
-                    // Partial write - store remaining in buffer
-                    self.write_buffer
-                        .borrow_mut()
-                        .extend_from_slice(&slice[n..]);
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    self.write_buffer.borrow_mut().extend_from_slice(slice);
-                }
-                Err(e) => {
-                    return Err(e.into());
+            // Loop to push through as much data as possible in one call.
+            // For 100KB writes, this avoids buffering → event loop → write_ready overhead.
+            let mut offset = 0;
+            while offset < len {
+                match stream.write(&slice[offset..]) {
+                    Ok(0) => {
+                        return Err(PyErr::new::<pyo3::exceptions::PyConnectionError, _>(
+                            "Connection closed during write",
+                        ));
+                    }
+                    Ok(n) => {
+                        offset += n;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Buffer remaining data for write_ready to handle
+                        self.write_buffer
+                            .borrow_mut()
+                            .extend_from_slice(&slice[offset..]);
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(e.into());
+                    }
                 }
             }
         }
@@ -556,62 +570,72 @@ impl crate::transports::StreamTransport for TcpTransport {
             return Ok(());
         }
 
-        // Protocol path: read and call data_received
-        if let Some(mut stream) = self.stream.as_ref() {
-            // Use pooled buffer for reading
-            let mut buf = BufferPool::acquire();
-            buf.reserve(131072);
-            unsafe { buf.set_len(131072) };
+        // Protocol path: read and call data_received with 256KB buffer + loop
+        // Extract raw pointer to avoid borrow conflict with self.close() in the closure
+        let stream_ptr = self.stream.as_ref().map(|s| s as *const std::net::TcpStream);
+        let cached_data_ptr = self.cached_data_received.as_ref().map(|m| m.as_ptr());
+        let cached_eof_ptr = self.cached_eof_received.as_ref().map(|m| m.as_ptr());
 
-            // Try to read as much data as available in one syscall
-            match stream.read(&mut buf[..]) {
-                Ok(0) => {
-                    BufferPool::release(buf);
-                    // EOF - notify protocol via cached method
-                    if let Some(ref cached_eof) = self.cached_eof_received {
-                        let result =
-                            unsafe { pyo3::ffi::PyObject_CallNoArgs(cached_eof.as_ptr()) };
-                        if !result.is_null() {
-                            let keep_open = unsafe {
-                                let val = pyo3::ffi::PyObject_IsTrue(result);
-                                pyo3::ffi::Py_DECREF(result);
-                                val == 1
-                            };
-                            if !keep_open {
-                                self.close(py)?;
+        if let Some(sptr) = stream_ptr {
+            let mut needs_close = false;
+
+            RECV_BUF.with(|buf_cell| -> PyResult<()> {
+                let mut buf = buf_cell.borrow_mut();
+                loop {
+                    let n = unsafe {
+                        let stream = &*sptr;
+                        let mut s = stream;
+                        std::io::Read::read(&mut s, &mut buf[..])
+                    };
+
+                    match n {
+                        Ok(0) => {
+                            // EOF — handle after closure
+                            if let Some(eof_ptr) = cached_eof_ptr {
+                                let result = unsafe { pyo3::ffi::PyObject_CallNoArgs(eof_ptr) };
+                                if !result.is_null() {
+                                    let keep_open = unsafe {
+                                        let val = pyo3::ffi::PyObject_IsTrue(result);
+                                        pyo3::ffi::Py_DECREF(result);
+                                        val == 1
+                                    };
+                                    if !keep_open {
+                                        needs_close = true;
+                                    }
+                                } else {
+                                    unsafe { pyo3::ffi::PyErr_Clear() };
+                                    needs_close = true;
+                                }
+                            } else {
+                                needs_close = true;
                             }
-                        } else {
-                            unsafe { pyo3::ffi::PyErr_Clear() };
-                            self.close(py)?;
+                            break;
                         }
-                    } else {
-                        self.close(py)?;
+                        Ok(n) => {
+                            let py_data =
+                                unsafe { crate::ffi_utils::bytes_from_slice(py, &buf[..n]) };
+                            if let Some(data_ptr) = cached_data_ptr {
+                                unsafe {
+                                    crate::ffi_utils::vectorcall_one_arg(
+                                        py,
+                                        data_ptr,
+                                        py_data.as_ptr(),
+                                    )?;
+                                }
+                            }
+                            if n < RECV_BUF_SIZE {
+                                break;
+                            }
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => return Err(e.into()),
                     }
                 }
-                Ok(n) => {
-                    unsafe { buf.set_len(n) };
-                    // Create VeloxBuffer for zero-copy data passing
-                    let velox_buf = crate::streams::VeloxBuffer::from_bytes_mut(buf);
-                    let py_buf = Py::new(py, velox_buf)?;
-                    // Use cached method + vectorcall
-                    if let Some(ref cached_data) = self.cached_data_received {
-                        unsafe {
-                            crate::ffi_utils::vectorcall_one_arg(
-                                py,
-                                cached_data.as_ptr(),
-                                py_buf.as_ptr(),
-                            )?;
-                        }
-                    }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    BufferPool::release(buf);
-                    // No data available, will be called again when ready
-                }
-                Err(e) => {
-                    BufferPool::release(buf);
-                    return Err(e.into());
-                }
+                Ok(())
+            })?;
+
+            if needs_close {
+                self.close(py)?;
             }
         }
         Ok(())
@@ -1015,109 +1039,127 @@ impl TcpTransport {
             return Ok(());
         }
 
-        let mut buf = [0u8; BUF_SIZE];
-
         if has_reader {
-            // FAST PATH: Direct StreamReader (zero Python calls)
-            let reader_obj = reader_py.as_ref().unwrap().bind(py).borrow();
-            let mut should_wakeup = false;
+            // FAST PATH: Direct StreamReader — loop with 256KB buffer, zero Python calls
+            RECV_BUF.with(|buf_cell| -> PyResult<()> {
+                let mut buf = buf_cell.borrow_mut();
+                let reader_obj = reader_py.as_ref().unwrap().bind(py).borrow();
+                let mut should_wakeup = false;
+                let mut eof_reached = false;
 
-            let mut eof_reached = false;
-            loop {
-                let n = unsafe {
-                    let stream = &*(stream_ptr.unwrap() as *const std::net::TcpStream);
-                    let mut s = stream;
-                    std::io::Read::read(&mut s, &mut buf)
-                };
+                loop {
+                    let n = unsafe {
+                        let stream = &*(stream_ptr.unwrap() as *const std::net::TcpStream);
+                        let mut s = stream;
+                        std::io::Read::read(&mut s, &mut buf[..])
+                    };
 
-                match n {
-                    Ok(0) => {
-                        // EOF
-                        eof_reached = true;
-                        break;
-                    }
-                    Ok(n) => {
-                        reader_obj
-                            .inner
-                            .borrow_mut()
-                            .buffer
-                            .extend_from_slice(&buf[..n]);
-                        should_wakeup = true;
-
-                        // Partial read? Socket drained
-                        if n < BUF_SIZE {
+                    match n {
+                        Ok(0) => {
+                            eof_reached = true;
                             break;
                         }
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        drop(reader_obj);
-                        slf.borrow().reading.store(false, Ordering::Release);
-                        return Err(e.into());
+                        Ok(n) => {
+                            reader_obj
+                                .inner
+                                .borrow_mut()
+                                .buffer
+                                .extend_from_slice(&buf[..n]);
+                            should_wakeup = true;
+
+                            // Partial read — socket drained
+                            if n < RECV_BUF_SIZE {
+                                break;
+                            }
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            drop(reader_obj);
+                            slf.borrow().reading.store(false, Ordering::Release);
+                            return Err(e.into());
+                        }
                     }
                 }
-            }
 
-            // Wake waiters ONCE after all reads (not per read)
-            if should_wakeup {
-                reader_obj._wakeup_waiters(py)?;
-            }
+                // Wake waiters ONCE after all reads (not per read)
+                if should_wakeup {
+                    reader_obj._wakeup_waiters(py)?;
+                }
 
-            // Handle EOF after waking waiters
-            if eof_reached {
-                drop(reader_obj);
-                reader_py.unwrap().bind(py).borrow().feed_eof_native(py)?;
-                Self::close(slf)?;
-            }
+                // Handle EOF after waking waiters
+                if eof_reached {
+                    drop(reader_obj);
+                    reader_py.unwrap().bind(py).borrow().feed_eof_native(py)?;
+                    Self::close(slf)?;
+                }
+
+                Ok(())
+            })?;
         } else {
-            // PROTOCOL PATH: Single read + vectorcall via cached methods
-            let n = unsafe {
-                let stream = &*(stream_ptr.unwrap() as *const std::net::TcpStream);
-                let mut s = stream;
-                std::io::Read::read(&mut s, &mut buf)
-            };
+            // PROTOCOL PATH: Loop with 256KB buffer + vectorcall via cached methods
+            // Reading 100KB in one syscall instead of 7× 16KB = 7× fewer event loop iterations
+            RECV_BUF.with(|buf_cell| -> PyResult<()> {
+                let mut buf = buf_cell.borrow_mut();
 
-            match n {
-                Ok(0) => {
-                    // EOF — call cached eof_received (no attribute lookup)
-                    if let Some(eof_ptr) = cached_eof_ptr {
-                        let result = unsafe { pyo3::ffi::PyObject_CallNoArgs(eof_ptr) };
-                        if !result.is_null() {
-                            let keep_open = unsafe {
-                                let val = pyo3::ffi::PyObject_IsTrue(result);
-                                pyo3::ffi::Py_DECREF(result);
-                                val == 1
-                            };
-                            if !keep_open {
+                loop {
+                    let n = unsafe {
+                        let stream = &*(stream_ptr.unwrap() as *const std::net::TcpStream);
+                        let mut s = stream;
+                        std::io::Read::read(&mut s, &mut buf[..])
+                    };
+
+                    match n {
+                        Ok(0) => {
+                            // EOF — call cached eof_received (no attribute lookup)
+                            if let Some(eof_ptr) = cached_eof_ptr {
+                                let result = unsafe { pyo3::ffi::PyObject_CallNoArgs(eof_ptr) };
+                                if !result.is_null() {
+                                    let keep_open = unsafe {
+                                        let val = pyo3::ffi::PyObject_IsTrue(result);
+                                        pyo3::ffi::Py_DECREF(result);
+                                        val == 1
+                                    };
+                                    if !keep_open {
+                                        Self::close(slf)?;
+                                    }
+                                } else {
+                                    unsafe { pyo3::ffi::PyErr_Clear() };
+                                    Self::close(slf)?;
+                                }
+                            } else {
                                 Self::close(slf)?;
                             }
-                        } else {
-                            unsafe { pyo3::ffi::PyErr_Clear() };
-                            Self::close(slf)?;
+                            break;
                         }
-                    } else {
-                        Self::close(slf)?;
+                        Ok(n) => {
+                            // Zero-copy PyBytes via C API + vectorcall data_received
+                            let py_data =
+                                unsafe { crate::ffi_utils::bytes_from_slice(py, &buf[..n]) };
+                            if let Some(data_ptr) = cached_data_ptr {
+                                unsafe {
+                                    crate::ffi_utils::vectorcall_one_arg(
+                                        py,
+                                        data_ptr,
+                                        py_data.as_ptr(),
+                                    )?;
+                                }
+                            }
+
+                            // Partial read — socket drained, no need to loop
+                            if n < RECV_BUF_SIZE {
+                                break;
+                            }
+                        }
+                        Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            slf.borrow().reading.store(false, Ordering::Release);
+                            return Err(e.into());
+                        }
                     }
                 }
-                Ok(n) => {
-                    // Zero-copy PyBytes via C API + vectorcall data_received
-                    let py_data = unsafe { crate::ffi_utils::bytes_from_slice(py, &buf[..n]) };
-                    if let Some(data_ptr) = cached_data_ptr {
-                        unsafe {
-                            crate::ffi_utils::vectorcall_one_arg(
-                                py,
-                                data_ptr,
-                                py_data.as_ptr(),
-                            )?;
-                        }
-                    }
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                Err(e) => {
-                    slf.borrow().reading.store(false, Ordering::Release);
-                    return Err(e.into());
-                }
-            }
+
+                Ok(())
+            })?;
         }
 
         slf.borrow().reading.store(false, Ordering::Release);
@@ -1322,6 +1364,20 @@ impl TcpTransport {
     ) -> PyResult<Self> {
         stream.set_nonblocking(true)?;
         let fd = stream.as_raw_fd();
+
+        // Set TCP_NODELAY by default — reduces latency for small writes.
+        // The Nagle algorithm buffers small writes to coalesce them, which adds
+        // up to 40ms latency. For an event loop, we always want immediate sends.
+        unsafe {
+            let optval: libc::c_int = 1;
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_NODELAY,
+                &optval as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
 
         // Cache protocol methods at creation time.
         // This avoids a Python attribute lookup (tp_getattr → dict search → descriptor __get__)

@@ -321,6 +321,26 @@ impl VeloxLoop {
         Self::sock_recv(slf, sock, nbytes)
     }
 
+    /// Synchronous recv attempt — returns bytes if ready, None if WouldBlock.
+    #[pyo3(name = "_sock_recv_try")]
+    pub fn py_sock_recv_try(
+        slf: &Bound<'_, Self>,
+        sock: Py<PyAny>,
+        nbytes: usize,
+    ) -> PyResult<Py<PyAny>> {
+        Self::sock_recv_try(slf, sock, nbytes)
+    }
+
+    /// Async recv — registers watcher and returns PendingFuture.
+    #[pyo3(name = "_sock_recv_wait")]
+    pub fn py_sock_recv_wait(
+        slf: &Bound<'_, Self>,
+        sock: Py<PyAny>,
+        nbytes: usize,
+    ) -> PyResult<Py<PyAny>> {
+        Self::sock_recv_wait(slf, sock, nbytes)
+    }
+
     #[pyo3(name = "sendfile", signature = (transport, file, offset=0, count=None, *, _fallback=true))]
     pub fn py_sendfile(
         slf: &Bound<'_, Self>,
@@ -340,6 +360,16 @@ impl VeloxLoop {
         data: &[u8],
     ) -> PyResult<Py<PyAny>> {
         Self::sock_sendall(slf, sock, data)
+    }
+
+    /// Synchronous sendall attempt — returns True if all sent, PendingFuture if async needed.
+    #[pyo3(name = "_sock_sendall_try")]
+    pub fn py_sock_sendall_try(
+        slf: &Bound<'_, Self>,
+        sock: Py<PyAny>,
+        data: &[u8],
+    ) -> PyResult<Py<PyAny>> {
+        Self::sock_sendall_try(slf, sock, data)
     }
 
     #[pyo3(name = "create_connection", signature = (protocol_factory, host=None, port=None, **_kwargs))]

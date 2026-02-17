@@ -19,7 +19,7 @@ pub const STACK_BUF_SIZE: usize = 65536;
 
 pub const POLLER_BATCH_THRESHOLD: usize = 32; // Batch size for processing callbacks poller events
 
-pub const BUF_SIZE: usize = 16384; // 16KB fits in L2 cache
+pub const RECV_BUF_SIZE: usize = 262144; // 256KB — matches uvloop, reads 100KB in one syscall
 
 static ASYNCIO: OnceLock<Py<PyModule>> = OnceLock::new();
 static SOCKET: OnceLock<Py<PyModule>> = OnceLock::new();
